@@ -14,9 +14,15 @@ import Duplicates from "./components/views/Duplicates";
 import SmartFolders from "./components/views/SmartFolders";
 import Storage from "./components/views/Storage";
 import Settings from "./components/views/Settings";
-import { list_directory, create_folder, rename_item, delete_item, move_item, open_item, disk_usage, mapEntry, type DirListing, type DiskUsage } from "./services/filesystem";
+import { getFilesystemProvider, type DiskUsage } from "./services/filesystem";
 import { useStars } from "./services/stars";
 import type { FileItem } from "./types";
+
+/**
+ * Single filesystem provider for the application layer. App code depends on
+ * the FilesystemProvider abstraction only — never on Tauri/Rust directly.
+ */
+const filesystem = getFilesystemProvider();
 
 type View =
   | "home" | "files" | "recent" | "starred" | "trash"
@@ -72,7 +78,8 @@ export default function App() {
   const [diskUsage, setDiskUsage] = useState<DiskUsage | null>(null);
 
   useEffect(() => {
-    disk_usage()
+    filesystem
+      .diskUsage()
       .then(setDiskUsage)
       .catch(() => setDiskUsage(null));
   }, []);
@@ -82,12 +89,12 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const listing: DirListing = await list_directory(path);
+      const listing = await filesystem.listDirectory(path);
       setDirPath(listing.path);
       setParentPath(listing.parentPath);
       setIsHome(listing.isHome);
-      // Map backend entries into the shared FileItem model.
-      setFiles(listing.items.map(mapEntry));
+      // Entries arrive already mapped into the shared FileItem model.
+      setFiles(listing.items);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // Friendly hint when running in a plain browser rather than Tauri.
@@ -142,7 +149,7 @@ export default function App() {
   async function openOnDisk(file: FileItem) {
     if (!file.path) return;
     try {
-      await open_item(file.path);
+      await filesystem.openItem(file.path);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -156,7 +163,7 @@ export default function App() {
   }
   async function createNewFolder(name: string) {
     try {
-      await create_folder(dirPath, name);
+      await filesystem.createFolder(dirPath, name);
       await loadDir(dirPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -165,7 +172,7 @@ export default function App() {
 
   async function doRename(item: FileItem, newName: string) {
     try {
-      if (item.path) await rename_item(item.path, newName);
+      if (item.path) await filesystem.renameItem(item.path, newName);
       await loadDir(dirPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -174,7 +181,7 @@ export default function App() {
 
   async function doMove(item: FileItem, destDir: string) {
     try {
-      if (item.path) await move_item(item.path, destDir);
+      if (item.path) await filesystem.moveItem(item.path, destDir);
       await loadDir(dirPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -183,7 +190,7 @@ export default function App() {
 
   async function doDelete(item: FileItem) {
     try {
-      if (item.path) await delete_item(item.path);
+      if (item.path) await filesystem.deleteItem(item.path);
       if (previewFile?.path === item.path) setPreviewFile(null);
       await loadDir(dirPath);
     } catch (err) {
