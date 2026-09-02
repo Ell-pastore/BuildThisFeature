@@ -1,0 +1,8 @@
+# pnpm settings (pnpm >= 11 no longer reads the "pnpm" field in package.json).
+#
+# Supply-chain guard: dependency postinstall scripts are blocked by default.
+# esbuild (transitive dependency of tsx, used to run TypeScript directly) is
+# the only build script this project allows to run. Anything new must be
+# consciously added here. (Recorded via `pnpm approve-builds esbuild`.)
+allowBuilds:
+  esbuild: true
