@@ -20,3 +20,22 @@ Rules for everything that will live here:
    object storage (`src/storage/`); the database stores metadata and keys.
 3. Configuration comes from the environment; no credentials in source control.
 4. Every query is user-scoped — authorization is enforced before data access.
+
+## Prisma boundary (scaffolded — no database yet)
+
+Prisma 7 is the ORM for this layer, as approved in the Phase 6 implementation
+plan:
+
+- `prisma/schema.prisma` — Prisma schema. Currently generator/datasource only;
+  models are pending (the authoritative data model is `SCHEMA.md`).
+- `prisma.config.ts` — CLI config: schema path, migrations path, and the
+  `DATABASE_URL` datasource URL (`.env` loaded explicitly via dotenv).
+- `client.ts` — lazy `PrismaClient` singleton using the `@prisma/adapter-pg`
+  driver adapter. The only place that constructs PrismaClient.
+- `generated/prisma/` — generated client; never committed (`pnpm db:generate`).
+
+Scripts: `pnpm db:generate` · `pnpm db:validate` · `pnpm db:migrate` ·
+`pnpm db:studio`. No migrations exist and none have been run.
+
+The rules above are unchanged: only this directory imports `prisma`,
+`@prisma/client`, `@prisma/adapter-pg`, or `pg`.

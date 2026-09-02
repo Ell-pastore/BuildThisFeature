@@ -9,6 +9,12 @@ vite.config.*.timestamp-*
 *-debug.log*
 logs/
 *.log
+
+# Commit the env template; real .env files stay ignored via .env* above
+!.env.example
+
+# Prisma generated client (regenerate with: pnpm db:generate)
+backend/src/database/generated/
 .claude-replay.*
 .tmp-*
 

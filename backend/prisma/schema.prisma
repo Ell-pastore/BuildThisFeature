@@ -1,0 +1,18 @@
+// Prisma scaffold — database implementation step 1.
+//
+// Intentionally contains NO models yet. The authoritative data model is
+// ../src/database/SCHEMA.md; models will be added in a dedicated task that
+// mirrors that document (including the raw-SQL constraints listed there).
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/database/generated/prisma"
+  runtime                = "nodejs"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}

@@ -10,14 +10,23 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:validate": "prisma validate",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
-    "hono": "^4.7.0"
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "hono": "^4.7.0",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "dotenv": "^17.4.2",
+    "prisma": "^7.10.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
