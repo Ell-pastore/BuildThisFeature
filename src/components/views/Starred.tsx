@@ -1,14 +1,16 @@
 import { Star } from "../../components/Icons";
-import { sampleFiles } from "../../data/files";
 import FileIcon from "../FileIcon";
-import type { FileItem } from "../../data/files";
+import type { FileItem } from "../../types";
 
 interface StarredProps {
   onOpenFile: (file: FileItem) => void;
+  /** Real starred files (from the app star store). */
+  starredItems?: FileItem[];
 }
 
-export default function Starred({ onOpenFile }: StarredProps) {
-  const starred = sampleFiles.filter((f) => f.starred);
+export default function Starred({ onOpenFile, starredItems }: StarredProps) {
+  // List from the parent's real, persisted star data when available.
+  const starred = (starredItems ?? []);
 
   return (
     <div className="flex-1 overflow-y-auto">

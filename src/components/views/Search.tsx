@@ -1,16 +1,16 @@
 import { Sparkles, Filter } from "../../components/Icons";
-import { sampleFiles } from "../../data/files";
 import FileIcon from "../FileIcon";
-import type { FileItem } from "../../data/files";
+import type { FileItem } from "../../types";
 
 interface SearchProps {
   query: string;
   onOpenFile: (file: FileItem) => void;
+  /** Real results passed from App (currently loaded directory). */
+  results?: FileItem[];
 }
 
 const aiUnderstanding: Record<string, string[]> = {
-  default: ["Documents", "Relevant content", "Recent files"],
-  internship: ["Documents", "Internship/SIWES related content", "Recent or relevant files"],
+  default: ["Relevant files", "Current folder", "Filenames and types"],
   video: ["Video files", "Large media", "All folders"],
   duplicate: ["PDF files", "Duplicate content", "Same file size"],
   week: ["All file types", "Modified in last 7 days", "Any location"],
@@ -18,7 +18,6 @@ const aiUnderstanding: Record<string, string[]> = {
 
 function getUnderstanding(q: string) {
   const l = q.toLowerCase();
-  if (l.includes("internship") || l.includes("siwes")) return aiUnderstanding.internship;
   if (l.includes("video") || l.includes("large")) return aiUnderstanding.video;
   if (l.includes("duplicate")) return aiUnderstanding.duplicate;
   if (l.includes("week") || l.includes("yesterday") || l.includes("recent")) return aiUnderstanding.week;
@@ -30,22 +29,22 @@ function matchScore(file: FileItem, query: string): number {
   const name = file.name.toLowerCase();
   if (name.includes(q)) return 94;
   const words = q.split(" ");
-  const matches = words.filter((w) => name.includes(w) || file.location.toLowerCase().includes(w) || file.type.includes(w));
+  const matches = words.filter(
+    (w) => name.includes(w) || file.location.toLowerCase().includes(w) || file.type.includes(w),
+  );
   return Math.max(40, Math.round((matches.length / words.length) * 80 + Math.random() * 15));
 }
 
 function getReason(file: FileItem, query: string): string {
   const q = query.toLowerCase();
   if (file.name.toLowerCase().includes(q)) return `Filename directly matches "${query}".`;
-  if (q.includes("internship") || q.includes("siwes")) return "Contains internship-related content and references to SIWES.";
-  if (q.includes("university")) return "Located in the University folder, likely coursework.";
-  if (q.includes("pdf")) return "PDF document matching your search criteria.";
-  return `File type and location are relevant to "${query}".`;
+  return `File name and type are relevant to "${query}".`;
 }
 
-export default function Search({ query, onOpenFile }: SearchProps) {
+export default function Search({ query, onOpenFile, results = [] }: SearchProps) {
   const understanding = getUnderstanding(query);
-  const results = sampleFiles
+  // Search runs against the real data provided by the app; never fake files.
+  const displayed = results
     .map((f) => ({ ...f, score: matchScore(f, query), reason: getReason(f, query) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 7);
@@ -98,9 +97,17 @@ export default function Search({ query, onOpenFile }: SearchProps) {
 
         {/* Results */}
         <div>
-          <div className="text-xs text-muted-foreground mb-3">{results.length} results</div>
+          <div className="text-xs text-muted-foreground mb-3">{displayed.length} results</div>
+          {displayed.length === 0 ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
+              <p className="text-sm font-medium text-foreground">No files found</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                No files in the current folder match "{query}".
+              </p>
+            </div>
+          ) : (
           <div className="space-y-2">
-            {results.map((file) => (
+            {displayed.map((file) => (
               <button
                 key={file.id}
                 onClick={() => onOpenFile(file)}
@@ -124,6 +131,7 @@ export default function Search({ query, onOpenFile }: SearchProps) {
               </button>
             ))}
           </div>
+          )}
         </div>
       </div>
     </div>

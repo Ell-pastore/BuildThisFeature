@@ -1,6 +1,9 @@
 import { Sparkles, Plus } from "../../components/Icons";
-import { smartFolders } from "../../data/files";
 
+/**
+ * Smart Folders. AI/rule-based dynamic folders aren't implemented yet, so this
+ * shows a clear placeholder rather than fabricated folders.
+ */
 export default function SmartFolders() {
   return (
     <div className="flex-1 overflow-y-auto">
@@ -19,30 +22,15 @@ export default function SmartFolders() {
           </button>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          {smartFolders.map((folder) => (
-            <button
-              key={folder.id}
-              className="bg-card border border-border rounded-xl p-5 text-left hover:border-accent/40 hover:shadow-sm transition-all group"
-            >
-              <div className="flex items-start justify-between mb-3">
-                <div className="text-2xl">{folder.icon}</div>
-                <div className="text-xs font-mono text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
-                  {folder.count} files
-                </div>
-              </div>
-              <div className="text-sm font-semibold text-foreground" style={{ fontFamily: "Instrument Sans, sans-serif" }}>
-                {folder.name}
-              </div>
-              <p className="text-xs text-muted-foreground mt-1 leading-relaxed">{folder.description}</p>
-              <div className="mt-3 pt-3 border-t border-border">
-                <div className="flex items-center gap-1.5">
-                  <Sparkles size={10} className="text-accent" />
-                  <span className="text-[10px] text-muted-foreground truncate">{folder.rule}</span>
-                </div>
-              </div>
-            </button>
-          ))}
+        <div className="flex flex-col items-center justify-center py-24 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-ai-bg flex items-center justify-center mb-4">
+            <Sparkles size={22} className="text-ai-text" />
+          </div>
+          <div className="text-sm font-medium text-foreground">No smart folders yet</div>
+          <p className="text-xs text-muted-foreground mt-1 max-w-sm">
+            Smart folders require rule or AI-based analysis that isn't implemented
+            yet. Real folders you create with the New button appear in the Files view.
+          </p>
         </div>
       </div>
     </div>

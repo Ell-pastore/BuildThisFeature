@@ -1,8 +1,14 @@
 import { useState } from "react";
 import { Search, Bell, Sparkles, ChevronRight, User } from "./Icons";
 
+/** A breadcrumb segment. `onClick` navigates when present (Files view). */
+export interface Crumb {
+  label: string;
+  onClick?: () => void;
+}
+
 interface TopBarProps {
-  breadcrumb: string[];
+  breadcrumb: Crumb[];
   onSearch: (q: string) => void;
   onOpenAI: () => void;
 }
@@ -23,9 +29,22 @@ export default function TopBar({ breadcrumb, onSearch, onOpenAI }: TopBarProps) 
         {breadcrumb.map((crumb, i) => (
           <span key={i} className="flex items-center gap-1">
             {i > 0 && <ChevronRight size={13} className="text-muted-foreground" />}
-            <span className={i === breadcrumb.length - 1 ? "text-foreground font-medium" : "text-muted-foreground"}>
-              {crumb}
-            </span>
+            {crumb.onClick ? (
+              <button
+                onClick={crumb.onClick}
+                className={
+                  i === breadcrumb.length - 1
+                    ? "text-foreground font-medium hover:underline"
+                    : "text-muted-foreground hover:text-foreground transition-colors"
+                }
+              >
+                {crumb.label}
+              </button>
+            ) : (
+              <span className={i === breadcrumb.length - 1 ? "text-foreground font-medium" : "text-muted-foreground"}>
+                {crumb.label}
+              </span>
+            )}
           </span>
         ))}
       </nav>

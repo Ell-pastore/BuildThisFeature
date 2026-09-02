@@ -13,7 +13,8 @@ const initialMessages: Message[] = [
   {
     id: "0",
     role: "ai",
-    content: "Hi! I'm your Smart File Assistant. I can help you organize files, find duplicates, search with natural language, and analyze your storage.",
+    content:
+      "Hi! I'm your Smart File Assistant.\n\nAI features aren't connected in this build yet, so I can't analyze your files today. In the meantime you can browse, search, sort, star, rename, move, and delete your real files elsewhere in the app.",
     actions: [],
   },
 ];
@@ -24,46 +25,6 @@ const quickPrompts = [
   { label: "Clean Downloads", icon: HardDrive },
   { label: "Find important docs", icon: FileText },
 ];
-
-const canned: Record<string, Message> = {
-  "Can you organize my Downloads folder?": {
-    id: "ai-org",
-    role: "ai",
-    content: "I analyzed your Downloads folder and found 47 files that could be organized. Here's what I found:",
-    suggestions: [
-      { label: "Documents", count: 18 },
-      { label: "Images", count: 12 },
-      { label: "Videos", count: 9 },
-      { label: "Archives", count: 5 },
-      { label: "Other", count: 3 },
-    ],
-    actions: ["Review changes", "Cancel"],
-  },
-  "Find duplicates": {
-    id: "ai-dup",
-    role: "ai",
-    content: "I scanned your files and found 8 duplicate groups totaling 127 MB of duplicate storage. The most common duplicates are PDF documents and images.",
-    actions: ["Review duplicates"],
-  },
-  "Find important docs": {
-    id: "ai-imp",
-    role: "ai",
-    content: 'I found 9 files that appear to be important based on your star ratings and access frequency: SIWES_Report_Final.pdf, Project_Proposal.pdf, Internship_Offer_Letter.pdf, and 6 others.',
-    actions: ["Open folder"],
-  },
-  "Clean Downloads": {
-    id: "ai-clean",
-    role: "ai",
-    content: "Your Downloads folder has 47 files. I suggest:\n• 23 files that belong in other folders\n• 8 duplicate files (127 MB)\n• 5 files older than 6 months you haven't opened\n\nTotal potential cleanup: ~400 MB",
-    actions: ["Review plan", "Cancel"],
-  },
-  "Organize my files": {
-    id: "ai-org2",
-    role: "ai",
-    content: "I'll analyze your entire file system. Found 23 files that appear misplaced, 8 duplicate groups, and 3 suggested new folders to create. Would you like to review the detailed plan?",
-    actions: ["Review changes", "Cancel"],
-  },
-};
 
 interface AIAssistantProps {
   onClose: () => void;
@@ -76,13 +37,16 @@ export default function AIAssistant({ onClose }: AIAssistantProps) {
   function send(text: string) {
     if (!text.trim()) return;
     const userMsg: Message = { id: Date.now().toString(), role: "user", content: text };
-    const aiReply: Message = canned[text] ?? {
-      id: (Date.now() + 1).toString(),
-      role: "ai",
-      content: `Searching for "${text}"… I found relevant files in your Documents and Downloads folders. Would you like me to show the results?`,
-      actions: ["Show results"],
-    };
-    setMessages((prev) => [...prev, userMsg, { ...aiReply, id: (Date.now() + 1).toString() }]);
+    // AI backend isn't wired up yet. Reply honestly instead of inventing
+    // analysis results about files that were never actually scanned.
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: (Date.now() + 1).toString(),
+        role: "ai",
+        content: `I can't answer "${text}" with real results yet — the AI backend isn't connected in this build, and this app doesn't invent file analysis.`,
+      },
+    ]);
     setInput("");
   }
 

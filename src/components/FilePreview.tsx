@@ -1,10 +1,15 @@
-import { X, Download, Share2, Edit2, Move, Star, Trash2, ExternalLink } from "./Icons";
-import type { FileItem } from "../data/files";
+import { X, Edit2, Move, Star, Trash2, ExternalLink } from "./Icons";
+import type { FileItem } from "../types";
 import FileIcon from "./FileIcon";
 
 interface FilePreviewProps {
   file: FileItem;
   onClose: () => void;
+  onOpen?: () => void;
+  onStar?: () => void;
+  onDelete?: () => void;
+  onRename?: (newName: string) => void;
+  onMove?: (destDir: string) => void;
 }
 
 function PreviewArea({ file }: { file: FileItem }) {
@@ -67,7 +72,7 @@ function PreviewArea({ file }: { file: FileItem }) {
   );
 }
 
-export default function FilePreview({ file, onClose }: FilePreviewProps) {
+export default function FilePreview({ file, onClose, onOpen, onStar, onDelete, onRename, onMove }: FilePreviewProps) {
   return (
     <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
       <div className="bg-card rounded-2xl border border-border shadow-2xl w-full max-w-4xl h-[80vh] flex flex-col overflow-hidden">
@@ -95,20 +100,48 @@ export default function FilePreview({ file, onClose }: FilePreviewProps) {
           <div className="w-64 border-l border-border px-5 py-6 flex flex-col gap-6 overflow-y-auto flex-shrink-0">
             {/* Actions */}
             <div className="space-y-2">
-              {[
-                { icon: ExternalLink, label: "Open" },
-                { icon: Download, label: "Download" },
-                { icon: Share2, label: "Share" },
-                { icon: Edit2, label: "Rename" },
-                { icon: Move, label: "Move" },
-                { icon: Star, label: "Star" },
-              ].map(({ icon: Icon, label }) => (
-                <button key={label} className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors">
-                  <Icon size={14} className="text-muted-foreground" />
-                  <span>{label}</span>
-                </button>
-              ))}
-              <button className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-red-600 hover:bg-red-50 transition-colors">
+              <button
+                onClick={() => onOpen && onOpen()}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors"
+              >
+                <ExternalLink size={14} className="text-muted-foreground" />
+                <span>Open</span>
+              </button>
+              <button
+                onClick={() => {
+                  if (!onRename) return;
+                  const name = window.prompt("New name", file.name);
+                  if (name && name.trim()) onRename(name.trim());
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors"
+              >
+                <Edit2 size={14} className="text-muted-foreground" />
+                <span>Rename</span>
+              </button>
+              <button
+                onClick={() => {
+                  if (!onMove) return;
+                  const dest = window.prompt("Destination folder", "");
+                  if (dest && dest.trim()) onMove(dest.trim());
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors"
+              >
+                <Move size={14} className="text-muted-foreground" />
+                <span>Move</span>
+              </button>
+              <button
+                onClick={() => onStar && onStar()}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors"
+              >
+                <Star size={14} className="text-muted-foreground" />
+                <span>{file.starred ? "Unstar" : "Star"}</span>
+              </button>
+              <button
+                onClick={() => {
+                  if (onDelete && window.confirm(`Delete "${file.name}"? This cannot be undone.`)) onDelete();
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-red-600 hover:bg-red-50 transition-colors"
+              >
                 <Trash2 size={14} />
                 <span>Delete</span>
               </button>
