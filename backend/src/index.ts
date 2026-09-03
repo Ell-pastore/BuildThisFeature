@@ -5,6 +5,7 @@
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { config } from "./config.js";
+import { disconnectDatabase } from "./database/client.js";
 
 const app = createApp();
 
@@ -18,7 +19,14 @@ const server = serve(
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     console.log(`[backend] ${signal} received, shutting down`);
-    server.close((error) => {
+    server.close(async (error) => {
+      // Close the database connection pool before exiting — the HTTP server
+      // has stopped accepting new requests, so no in-flight query is interrupted..
+      try {
+        await disconnectDatabase();
+      } catch (disconnectError) {
+        console.error("[backend] error closing database pool:", disconnectError);
+      }
       process.exit(error ? 1 : 0);
     });
   });
