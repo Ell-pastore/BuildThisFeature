@@ -45,8 +45,9 @@ model User {
   // Argon2/bcrypt hash; populated in Phase 7 (§14); never returned by any API.
   passwordHash String   @map("password_hash")
   // text. CHECK (status IN ('active','disabled')) DEFAULT 'active'
-  //   — CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.1.
-  status       String
+  //   — CHECK via CUSTOM SQL (Prisma cannot express CHECK constraints);
+  //   @default covers the documented DEFAULT 'active' — see SCHEMA.md §5.1.
+  status       String   @default("active")
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz
 
