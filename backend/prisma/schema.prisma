@@ -61,6 +61,7 @@ model User {
   aiAnalyses       AiAnalysis[]
   aiInstructions   AiInstruction[]
   aiActions        AiAction[]
+  sessions         Session[]
 
   @@map("users")
 }
@@ -89,6 +90,30 @@ model Device {
   @@unique([userId, deviceUid])
   @@index([userId])
   @@map("devices")
+}
+
+// ---------------------------------------------------------------------------
+// Server-side auth sessions. SCHEMA.md §14 (Phase 7): opaque bearer tokens
+// are stored hashed (SHA-256 of the raw token — the raw token itself never
+// touches the database); expiry is server-enforced by auth middleware. The
+// sessions table ships in Phase 7; registration/login/logout arrive later..
+// ---------------------------------------------------------------------------
+
+model Session {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  // SHA-256 hex of the opaque session token. UNIQUE (case-sensitive is fine:
+  // hashes are random 32-byte values, not login identities).
+  tokenHash  String   @unique @map("token_hash")
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
 }
 
 // ─── Folder / File / FileVersion — SCHEMA.md §5.3–§5.5 ──────────────────────
