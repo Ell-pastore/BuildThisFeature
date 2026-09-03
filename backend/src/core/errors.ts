@@ -31,6 +31,14 @@ export class AppError extends Error {
   static conflict(code: string, message: string): AppError {
     return new AppError(409, code, message);
   }
+
+  static unauthorized(): AppError {
+    return new AppError(
+      401,
+      "auth/unauthorized",
+      "Invalid email or password.",
+    );
+  }
 }
 
 export function isAppError(error: unknown): error is AppError {

@@ -39,4 +39,6 @@ export const config = {
   host: process.env.HOST ?? "127.0.0.1",
   /** Browser/webview origins allowed by CORS. */
   corsOrigins: listFromEnv(process.env.CORS_ORIGINS) ?? DEFAULT_DEV_ORIGINS,
+  /** Session lifetime in hours (Phase 7). Safe production-oriented default. */
+  sessionTtlHours: Math.max(1, intFromEnv(process.env.SESSION_TTL_HOURS) ?? 12),
 };
