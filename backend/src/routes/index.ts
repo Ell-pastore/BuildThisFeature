@@ -7,5 +7,6 @@
  */
 import { Hono } from "hono";
 import { healthRoutes } from "./health.js";
+import { authRoutes } from "./auth.js";
 
-export const apiRoutes = new Hono().route("/health", healthRoutes);
+export const apiRoutes = new Hono().route("/health", healthRoutes).route("/auth", authRoutes);

@@ -27,6 +27,10 @@ export class AppError extends Error {
   static badRequest(message: string): AppError {
     return new AppError(400, "common/bad-request", message);
   }
+
+  static conflict(code: string, message: string): AppError {
+    return new AppError(409, code, message);
+  }
 }
 
 export function isAppError(error: unknown): error is AppError {
