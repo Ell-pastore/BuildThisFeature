@@ -30,6 +30,10 @@ const DEFAULT_DEV_ORIGINS: string[] = [
   "http://127.0.0.1:5173",
   "http://localhost:8443",
   "http://127.0.0.1:8443",
+  // Desktop webview origins (Tauri v2): macOS/Linux use tauri://localhost,
+  // Windows uses http://tauri.localhost — needed when the desktop app calls the API.
+  "tauri://localhost",
+  "http://tauri.localhost",
 ];
 
 export const config = {

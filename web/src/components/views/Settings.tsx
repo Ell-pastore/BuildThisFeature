@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Settings as SettingsIcon } from "../../components/Icons";
+import { API_BASE_URL, fetchHealth } from "../../services/api";
 
 type Section = "General" | "Appearance" | "Storage" | "AI" | "Privacy" | "Notifications" | "Keyboard Shortcuts";
 
@@ -41,6 +42,21 @@ function Select({ label, options, defaultValue }: { label: string; options: stri
 
 export default function Settings() {
   const [activeSection, setActiveSection] = useState<Section>("General");
+  const [backend, setBackend] = useState<{ status: "checking" | "ok" | "error"; time: string | null }>({ status: "checking", time: null });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchHealth()
+      .then(() => {
+        if (!cancelled) setBackend({ status: "ok", time: new Date().toLocaleTimeString() });
+      })
+      .catch(() => {
+        if (!cancelled) setBackend({ status: "error", time: new Date().toLocaleTimeString() });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -74,6 +90,25 @@ export default function Settings() {
                 <Toggle label="Show hidden files" defaultOn={false} />
                 <Toggle label="Confirm before deleting" defaultOn={true} description="Show a confirmation dialog before moving files to Trash." />
                 <Toggle label="Open files on single click" defaultOn={false} />
+                <div className="py-4 border-b border-border last:border-none">
+                  <div className="text-sm font-medium text-foreground">Backend API</div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        backend.status === "ok"
+                          ? "bg-emerald-500"
+                          : backend.status === "error"
+                            ? "bg-red-500"
+                            : "bg-muted-foreground animate-pulse"
+                      }`}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      {backend.status === "ok" ? "Connected" : backend.status === "error" ? "Unreachable" : "Checking…"}
+                    </span>
+                    <span className="text-xs text-muted-foreground">{API_BASE_URL}</span>
+                  </div>
+                  {backend.time && <p className="mt-1 text-xs text-muted-foreground">Checked at {backend.time}</p>}
+                </div>
               </div>
             )}
             {activeSection === "Appearance" && (
