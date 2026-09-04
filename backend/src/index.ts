@@ -2,6 +2,10 @@
  * Server bootstrap — the only entrypoint. All application wiring lives in
  * app.ts; this file reads config, binds the port, and handles shutdown.
  */
+// Load backend/.env into the process BEFORE config is read, so `pnpm dev` /
+// `pnpm start` work with the documented environment (dotenv does not override
+// variables already present in the shell). Backend-only secrets stay in .env.
+import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { config } from "./config.js";

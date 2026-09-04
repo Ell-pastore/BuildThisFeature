@@ -31,13 +31,16 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       host: '0.0.0.0',
-      port: parseInt(process.env.PORT || '5173'),
+      // Web dev port (standalone: pnpm dev in web/ -> 5173 by default).
+      // Tauri's desktop dev server overrides this with 5174 in desktop/tauri.conf.json,
+      // so the two dev environments never collide. (Backend keeps PORT for itself.)
+      port: parseInt(process.env.VITE_DEV_PORT || '5173'),
       strictPort: true,
       watch: { ignored: ['**/.figma/**'] },
     },
     preview: {
       host: '0.0.0.0',
-      port: parseInt(process.env.PORT || '5173'),
+      port: parseInt(process.env.VITE_DEV_PORT || '5173'),
     },
   }
 })
