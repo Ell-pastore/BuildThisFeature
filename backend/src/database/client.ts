@@ -34,6 +34,15 @@ export function getDatabase(): PrismaClient {
   return instance;
 }
 
+/** The database server's current time — used for authoritative expiry comparisons
+  * (session TTL semantics must not depend on client/Node clock accuracy). */
+export async function databaseNow(): Promise<Date> {
+  const rows = (await getDatabase().$queryRaw`SELECT now() AS "now"`) as Array<{ now: Date | string }>;
+  const first = rows[0];
+  if (!first) throw new Error("Database clock query returned no rows.");
+  return first.now instanceof Date ? first.now : new Date(first.now);
+}
+
 /** For graceful shutdown wiring later — not called anywhere yet. */
 export async function disconnectDatabase(): Promise<void> {
   await instance?.$disconnect();

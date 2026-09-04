@@ -8,5 +8,6 @@
 import { Hono } from "hono";
 import { healthRoutes } from "./health.js";
 import { authRoutes } from "./auth.js";
+import type { AppVariables } from "../core/auth.js";
 
-export const apiRoutes = new Hono().route("/health", healthRoutes).route("/auth", authRoutes);
+export const apiRoutes = new Hono<AppVariables>().route("/health", healthRoutes).route("/auth", authRoutes);
