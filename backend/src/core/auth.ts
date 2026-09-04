@@ -34,15 +34,26 @@ function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+/** Strictly parse `Authorization: Bearer <token>` and return the RAW token.
+  * Any failure (missing header, wrong scheme, empty/malformed value) throws the
+  * same generic 401 auth/unauthorized used by every authentication path — the
+  * caller can never distinguish the failure reason. */
+export function getBearerToken(c: {
+  req: { header: (name: string) => string | undefined };
+}): string {
+  const header = c.req.header("authorization");
+  if (!header) throw AppError.unauthorized();
+  const [scheme, token, ...rest] = header.trim().split(/\s+/);
+  if (scheme !== "Bearer" || !token || token.length === 0 || rest.length > 0) {
+    throw AppError.unauthorized();
+  }
+  return token;
+}
+
 /** Hono middleware that authenticates the current request. */
 export const requireAuth = createMiddleware(async (c, next) => {
   try {
-    const header = c.req.header("authorization");
-    if (!header) throw new Error("missing");
-    const [scheme, token, ...rest] = header.trim().split(/\s+/);
-    if (scheme !== "Bearer" || !token || token.length === 0 || rest.length > 0) {
-      throw new Error("malformed");
-    }
+    const token = getBearerToken(c);
 
     const session = await findSessionByTokenHash(sha256(token));
     if (!session) throw new Error("unknown");

@@ -7,8 +7,8 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { AppError } from "../core/errors.js";
-import { getCurrentUser, type AppVariables, requireAuth } from "../core/auth.js";
-import { loginUser, registerUser } from "../services/auth.js";
+import { getCurrentUser, getBearerToken, type AppVariables, requireAuth } from "../core/auth.js";
+import { loginUser, logoutUser, registerUser } from "../services/auth.js";
 
 async function readJsonBody(c: Context): Promise<unknown> {
   try {
@@ -39,4 +39,12 @@ export const authRoutes = new Hono<AppVariables>()
     const { user, token } = await loginUser({ email, password, userAgent });
     return c.json({ user, token }, 200);
   })
-  .get("/me", requireAuth, (c) => c.json({ user: getCurrentUser(c) }, 200));
+  .get("/me", requireAuth, (c) => c.json({ user: getCurrentUser(c) }, 200))
+  .post("/logout", requireAuth, async (c) => {
+    // requireAuth already proved this Bearer token maps to a live session.
+    // Re-extract the RAW token and revoke exactly that session — never by
+    // user id, so other sessions of the same user are unaffected.
+    const rawToken = getBearerToken(c);
+    await logoutUser(rawToken);
+    return c.json({ ok: true });
+  });

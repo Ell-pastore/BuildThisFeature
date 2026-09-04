@@ -53,3 +53,12 @@ export async function updateSessionLastUsedAt(sessionId: string, at: Date) {
     data: { lastUsedAt: at },
   });
 }
+
+/** Delete the session with the given token hash (logout/revocation).
+  * Idempotent by design: an unknown hash matches nothing, deletes nothing,
+  * and succeeds — the caller cannot learn whether the session existed. */
+export async function deleteSessionByTokenHash(tokenHash: string): Promise<void> {
+  await getDatabase().session.deleteMany({
+    where: { tokenHash },
+  });
+}

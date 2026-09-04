@@ -9,7 +9,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { AppError } from "../core/errors.js";
 import { config } from "../config.js";
 import { createUser, findUserByEmail } from "../database/repositories/users.js";
-import { createSession } from "../database/repositories/sessions.js";
+import { createSession, deleteSessionByTokenHash } from "../database/repositories/sessions.js";
 
 /** Safe user representation — never includes password_hash or anything else secret. */
 export interface SafeUser {
@@ -164,4 +164,11 @@ export async function loginUser(input: LoginInput): Promise<LoginResult> {
   });
 
   return { user: toSafeUser(user), token: rawToken };
+}
+
+/** Revoke the session identified by the raw bearer token (logout).
+  * Idempotent: revoking an unknown/already-revoked token is a silent success —
+  * the response must not reveal whether the session existed. */
+export async function logoutUser(rawToken: string): Promise<void> {
+  await deleteSessionByTokenHash(hashToken(rawToken));
 }
