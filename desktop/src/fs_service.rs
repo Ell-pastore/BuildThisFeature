@@ -850,6 +850,67 @@ pub fn read_file(allow_list: &AllowList, path: &str) -> Result<Vec<u8>, String> 
     fs::read(&canonical).map_err(|e| format!("Unable to read this file: {}", map_io_error(&e)))
 }
 
+/// Write raw bytes to a file, creating it or overwriting an existing file.
+///
+/// The single existing AllowList gate is applied in two cases so that no write
+/// can ever land outside an allowed root:
+///
+/// * NEW FILE (final component absent): the parent directory is canonicalized
+///   and gated, then the write lands in that allowed parent under the literal
+///   final name. No symlink is followed, so no escape is possible.
+/// * OVERWRITE (final component present): the full target is canonicalized —
+///   following a final symlink — and the RESOLVED path is gated. A symlink
+///   whose target is outside the allowlist is therefore denied before any
+///   write. A broken symlink fails canonicalization and is never written.
+///
+/// The final filename is validated up front (no `.`, `..`, or empty/trailing
+/// component) so traversal cannot be smuggled through the name itself.
+pub fn write_file(allow_list: &AllowList, path: &str, content: &[u8]) -> Result<(), String> {
+    // String-level final-component validation: reject ".", "..", a trailing
+    // separator, and empty paths. This MUST be done on the raw string
+    // because Path::file_name() normalizes away a trailing ".".
+    let name = path
+        .rsplit_once(std::path::is_separator)
+        .map(|(_, n)| n)
+        .unwrap_or(path);
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("Invalid file path".to_string());
+    }
+
+    let target = Path::new(path);
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "Invalid file path".to_string())?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Unable to write this file: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &parent)?;
+
+    let target = parent.join(name);
+
+    // Inspect the final component WITHOUT following it.
+    match fs::symlink_metadata(&target) {
+        Err(_) => {
+            // Final component is absent: create a fresh file in the allowed
+            // parent. No symlink is followed, so no escape is possible.
+            fs::write(&target, content)
+                .map_err(|e| format!("Unable to write this file: {}", map_io_error(&e)))
+        }
+        Ok(_) => {
+            // Final component exists (file, dir, symlink, or broken link).
+            // Resolve the full target (follows the final symlink) and gate
+            // the resolved location before permitting the overwrite.
+            let resolved = target
+                .canonicalize()
+                .map_err(|e| format!("Unable to write this file: {}", map_io_error(&e)))?;
+            ensure_allowed(allow_list, &resolved)?;
+            fs::write(&target, content)
+                .map_err(|e| format!("Unable to write this file: {}", map_io_error(&e)))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1745,5 +1806,139 @@ mod tests {
         // gracefully with a mapped filesystem error.
         let err = read_file(&allow, &str_of(&tmp.child("sub"))).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    // -- write_file -----------------------------------------------------------
+
+    #[test]
+    fn write_file_creates_new_file() {
+        let tmp = TempDir::new("write_new");
+        let allow = allow_for(&tmp);
+        super::write_file(&allow, &str_of(&tmp.child("note.txt")), b"hello world").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.child("note.txt")).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn write_file_writes_empty_content() {
+        let tmp = TempDir::new("write_empty");
+        let allow = allow_for(&tmp);
+        super::write_file(&allow, &str_of(&tmp.child("empty.txt")), b"").unwrap();
+        let meta = fs::metadata(tmp.child("empty.txt")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn write_file_overwrites_existing() {
+        let tmp = TempDir::new("write_overwrite");
+        let allow = allow_for(&tmp);
+        // local fixture helper, then overwrite via the service
+        write_file(&tmp.child("a.txt"), "original");
+        super::write_file(&allow, &str_of(&tmp.child("a.txt")), b"replaced").unwrap();
+        assert_eq!(fs::read_to_string(tmp.child("a.txt")).unwrap(), "replaced");
+    }
+
+    #[test]
+    fn write_file_denies_outside_root() {
+        let root = TempDir::new("write_root");
+        let outside = TempDir::new("write_outside");
+        let allow = allow_for(&root);
+        let err =
+            super::write_file(&allow, &str_of(&outside.child("secret.txt")), b"x").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!outside.child("secret.txt").exists());
+    }
+
+    #[test]
+    fn write_file_parent_nonexistent() {
+        let tmp = TempDir::new("write_noparent");
+        let allow = allow_for(&tmp);
+        let child = tmp.child("ghost").join("a.txt");
+        let err = super::write_file(&allow, &str_of(&child), b"x").unwrap_err();
+        assert!(err.contains("no longer exists"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn write_file_traversal_escape() {
+        let tmp = TempDir::new("write_trav");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("real")).unwrap();
+        // resolves to the parent of the root once canonicalized -> outside
+        let escape = tmp.child("real").join("..").join("..").join("evil.txt");
+        let err = super::write_file(&allow, &str_of(&escape), b"x").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn write_file_rejects_invalid_name() {
+        let tmp = TempDir::new("write_name");
+        let allow = allow_for(&tmp);
+        // ".", "..", trailing separator, and empty final component are all
+        // rejected with a validation error before any filesystem access.
+        for bad in [
+            ".",
+            "..",
+            &format!("{}/", str_of(&tmp.child("ok"))),
+            &str_of(&tmp.child("ok/.")),
+            &str_of(&tmp.child("ok/..")),
+        ] {
+            let err = super::write_file(&allow, bad, b"x").unwrap_err();
+            assert_eq!(err, "Invalid file path", "for input {bad:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_symlink_final_component_inside() {
+        let tmp = TempDir::new("write_sym_in");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("real.txt"), "before"); // local fixture helper
+        std::os::unix::fs::symlink(tmp.child("real.txt"), tmp.child("link.txt")).unwrap();
+        super::write_file(&allow, &str_of(&tmp.child("link.txt")), b"after").unwrap();
+        assert_eq!(fs::read_to_string(tmp.child("real.txt")).unwrap(), "after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_symlink_final_component_outside() {
+        let root = TempDir::new("write_sym_out");
+        let outside = TempDir::new("write_sym_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "original"); // local fixture helper
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("link.txt")).unwrap();
+
+        let err =
+            super::write_file(&allow, &str_of(&root.child("link.txt")), b"hacked").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+
+        // the outside file's contents must be untouched
+        assert_eq!(
+            fs::read_to_string(outside.child("secret.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_broken_symlink() {
+        let tmp = TempDir::new("write_sym_broken");
+        let allow = allow_for(&tmp);
+        std::os::unix::fs::symlink(tmp.child("nowhere"), tmp.child("link.txt")).unwrap();
+
+        let err = super::write_file(&allow, &str_of(&tmp.child("link.txt")), b"x").unwrap_err();
+        // broken link: canonicalize(target) fails -> mapped fs error, never written
+        assert!(!err.is_empty());
+        assert!(!tmp.child("nowhere").exists());
+    }
+
+    #[test]
+    fn write_file_empty_allowlist() {
+        let tmp = TempDir::new("write_empty_al");
+        let allow = AllowList::empty();
+        let err = super::write_file(&allow, &str_of(&tmp.child("a.txt")), b"x").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
     }
 }

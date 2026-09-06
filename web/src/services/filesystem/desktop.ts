@@ -110,6 +110,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke<Uint8Array>("read_file", { path });
   }
 
+  writeFile(path: string, content: Uint8Array): Promise<void> {
+    return invoke<void>("write_file", { path, content });
+  }
+
   copyItem(source: string, destDir: string): Promise<void> {
     return invoke("copy_item", { source, destDir });
   }

@@ -88,6 +88,9 @@ export interface FilesystemProvider {
   /** Read the raw bytes of a file (text, image, binary). */
   readFile(path: string): Promise<Uint8Array>;
 
+  /** Write raw bytes to a file, creating it or overwriting an existing file. */
+  writeFile(path: string, content: Uint8Array): Promise<void>;
+
   /** Copy an item (file, or folder recursively) into destDir, keeping its name. */
   copyItem(source: string, destDir: string): Promise<void>;
 

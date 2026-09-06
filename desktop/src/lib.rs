@@ -104,6 +104,16 @@ fn read_file(
     fs_service::read_file(allow_list.inner(), &path)
 }
 
+/// Write raw bytes to a file, creating it or overwriting an existing file.
+#[tauri::command]
+fn write_file(
+    path: String,
+    content: Vec<u8>,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::write_file(allow_list.inner(), &path, &content)
+}
+
 /// Real capacity information for the volume containing `path` (defaults to
 /// the user's home directory). Reads filesystem statistics only via
 /// statfs/statvfs; it performs no directory scanning or recursive traversal.
@@ -144,6 +154,7 @@ pub fn run() {
             get_file_metadata,
             copy_item,
             read_file,
+            write_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
