@@ -20,9 +20,10 @@
 //!   leaf keeps its meaning (deleting a symlink removes the link, not its
 //!   target; renaming one renames the link).
 //!
-//! A future scope/allowlist policy (which paths the app — and later an agent —
-//! may touch) will attach at exactly these two seams. None is imposed yet;
-//! this task only centralizes the mechanism.
+//! A root-scoped scope/allowlist policy ([`AllowList`]) is now imposed at
+//! exactly these two seams: every operation gates its canonical result through
+//! [`ensure_allowed`] before touching the filesystem. Membership is based on
+//! canonical filesystem location; an empty registry denies every path.
 
 use serde::Serialize;
 use std::fs;
@@ -35,7 +36,7 @@ use std::time::UNIX_EPOCH;
 // ---------------------------------------------------------------------------
 
 /// A single entry in a directory listing.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub id: String,
@@ -57,7 +58,7 @@ pub struct FileEntry {
 }
 
 /// Result of listing a directory.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryListing {
     pub path: String,
@@ -67,7 +68,7 @@ pub struct DirectoryListing {
 }
 
 /// Real capacity of a storage volume.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskUsage {
     /// Total volume size in bytes.
@@ -166,6 +167,113 @@ fn resolve_in_canonical_parent(path: &Path, error_prefix: &str) -> Result<PathBu
     Ok(parent.join(file_name))
 }
 
+// ---------------------------------------------------------------------------
+// Root-scoped security boundary
+// ---------------------------------------------------------------------------
+
+/// A registry of canonical allowed roots. Membership is component-aware
+/// canonical-path containment — never raw string prefix matching. An empty
+/// registry denies every path (fail closed).
+pub struct AllowList {
+    roots: Vec<PathBuf>,
+}
+
+impl AllowList {
+    /// Fail-closed initialization: the canonicalized user home directory is
+    /// the single allowed root. If the home directory cannot be determined or
+    /// canonicalized, an EMPTY registry is returned so that every path-bearing
+    /// operation is denied — there is never an unrestricted fallback root.
+    pub fn with_default_root() -> Self {
+        match dirs::home_dir() {
+            None => AllowList::empty(),
+            Some(home) => match home.canonicalize() {
+                Err(_) => AllowList::empty(),
+                Ok(canonical) => {
+                    if !canonical.is_dir() {
+                        AllowList::empty()
+                    } else {
+                        AllowList::from_roots(vec![canonical])
+                    }
+                }
+            },
+        }
+    }
+
+    /// Build a registry from a single root path — used by the application on
+    /// startup and by unit tests. The root is canonicalized (and must be an
+    /// existing directory) before it is stored.
+    #[allow(dead_code)]
+    pub fn with_root(root: &str) -> Result<Self, String> {
+        let canonical = canonical_dir(root)?;
+        Ok(AllowList::from_roots(vec![canonical]))
+    }
+
+    /// Register another canonical root. Duplicate registrations are ignored.
+    #[allow(dead_code)]
+    pub fn register_root(&mut self, root: &str) -> Result<(), String> {
+        let canonical = canonical_dir(root)?;
+        for existing in self.roots.iter() {
+            if existing == &canonical {
+                return Ok(());
+            }
+        }
+        self.roots.push(canonical);
+        Ok(())
+    }
+
+    /// Number of registered roots.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// Whether no root is registered (in which case every path is denied).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// Component-aware canonical membership:
+    /// - empty registry → false (fail closed);
+    /// - `canonical` equal to a root → true;
+    /// - `canonical` a descendant of a root (component boundary) → true;
+    /// - otherwise → false.
+    pub fn is_allowed(&self, canonical: &PathBuf) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        for root in self.roots.iter() {
+            if canonical == root || canonical.starts_with(root) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn empty() -> Self {
+        AllowList::from_roots(Vec::new())
+    }
+
+    fn from_roots(roots: Vec<PathBuf>) -> Self {
+        AllowList { roots }
+    }
+}
+
+/// Safe generic denial message returned to the frontend: it never echoes the
+/// rejected filesystem path.
+pub const SECURITY_POLICY_ERROR: &str = "This location is outside your allowed folders.";
+
+/// The SINGLE authoritative security gate. `canonical` must already be a
+/// canonical filesystem path produced by `canonical_dir` or
+/// `resolve_in_canonical_parent` — never a raw input string.
+fn ensure_allowed(allow_list: &AllowList, canonical: &PathBuf) -> Result<(), String> {
+    if allow_list.is_allowed(canonical) {
+        Ok(())
+    } else {
+        Err(SECURITY_POLICY_ERROR.to_string())
+    }
+}
+
 /// Validate an item name so it cannot escape its parent directory.
 pub fn validate_item_name(raw: &str) -> Result<String, String> {
     let name = raw.trim();
@@ -194,7 +302,10 @@ pub fn home_directory() -> Result<String, String> {
 /// If `path` is empty/None the user's home directory is listed instead.
 /// Symbolic links are skipped and only the requested directory is read — we
 /// never recurse into subdirectories.
-pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> {
+pub fn list_directory(
+    allow_list: &AllowList,
+    path: Option<String>,
+) -> Result<DirectoryListing, String> {
     let canonical = match path {
         Some(p) if !p.trim().is_empty() => canonical_dir(&p)?,
         _ => dirs::home_dir()
@@ -202,6 +313,7 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
             .canonicalize()
             .map_err(|e| format!("Unable to open this folder: {}", map_io_error(&e)))?,
     };
+    ensure_allowed(allow_list, &canonical)?;
 
     let read = fs::read_dir(&canonical)
         .map_err(|e| format!("Unable to open this folder: {}", map_io_error(&e)))?;
@@ -288,9 +400,10 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
 }
 
 /// Create a new folder inside `dir`.
-pub fn create_folder(dir: &str, name: &str) -> Result<(), String> {
+pub fn create_folder(allow_list: &AllowList, dir: &str, name: &str) -> Result<(), String> {
     let name = validate_item_name(name)?;
     let parent = canonical_dir(dir)?;
+    ensure_allowed(allow_list, &parent)?;
     let target = parent.join(&name);
     if target.exists() {
         return Err("A file or folder with that name already exists.".to_string());
@@ -299,13 +412,14 @@ pub fn create_folder(dir: &str, name: &str) -> Result<(), String> {
 }
 
 /// Rename a file or folder in place (only the name changes, not location).
-pub fn rename_item(from: &str, new_name: &str) -> Result<(), String> {
+pub fn rename_item(allow_list: &AllowList, from: &str, new_name: &str) -> Result<(), String> {
     let name = validate_item_name(new_name)?;
     let source = PathBuf::from(from);
     if !source.exists() {
         return Err("The file or folder no longer exists.".to_string());
     }
     let source = resolve_in_canonical_parent(&source, "Unable to rename: ")?;
+    ensure_allowed(allow_list, &source)?;
     let destination = source.with_file_name(&name);
     if destination == source {
         return Ok(());
@@ -317,7 +431,7 @@ pub fn rename_item(from: &str, new_name: &str) -> Result<(), String> {
 }
 
 /// Move an item into another directory, keeping its current file name.
-pub fn move_item(source: &str, dest_dir: &str) -> Result<(), String> {
+pub fn move_item(allow_list: &AllowList, source: &str, dest_dir: &str) -> Result<(), String> {
     let source = PathBuf::from(source);
     if !source.exists() {
         return Err("The file or folder no longer exists.".to_string());
@@ -327,6 +441,7 @@ pub fn move_item(source: &str, dest_dir: &str) -> Result<(), String> {
         .ok_or_else(|| "Invalid source item".to_string())?
         .to_owned();
     let source = resolve_in_canonical_parent(&source, "Unable to move: ")?;
+    ensure_allowed(allow_list, &source)?;
 
     let dest_dir = PathBuf::from(dest_dir);
     if !dest_dir.exists() {
@@ -338,6 +453,7 @@ pub fn move_item(source: &str, dest_dir: &str) -> Result<(), String> {
     if !dest_dir.is_dir() {
         return Err("The destination is not a folder".to_string());
     }
+    ensure_allowed(allow_list, &dest_dir)?;
 
     let destination = dest_dir.join(&name);
     if destination == source {
@@ -361,12 +477,13 @@ pub fn move_item(source: &str, dest_dir: &str) -> Result<(), String> {
 }
 
 /// Delete a file or folder. The UI must confirm before calling this.
-pub fn delete_item(path: &str) -> Result<(), String> {
+pub fn delete_item(allow_list: &AllowList, path: &str) -> Result<(), String> {
     let target = PathBuf::from(path);
     if !target.exists() {
         return Err("The file or folder no longer exists.".to_string());
     }
     let target = resolve_in_canonical_parent(&target, "Unable to delete: ")?;
+    ensure_allowed(allow_list, &target)?;
     if !target.exists() {
         return Err("The file or folder no longer exists.".to_string());
     }
@@ -381,12 +498,20 @@ pub fn delete_item(path: &str) -> Result<(), String> {
 }
 
 /// Open a file/folder with the operating system's default application.
-pub fn open_item(path: &str) -> Result<(), String> {
+///
+/// The target is FULLY canonicalized (ancestors and leaf) before the policy
+/// gate: opening a symlink whose canonical target resolves outside the allowed
+/// roots must be rejected before `open::that` is reached.
+pub fn open_item(allow_list: &AllowList, path: &str) -> Result<(), String> {
     let target = Path::new(path);
     if !target.exists() {
         return Err("The file or folder no longer exists.".to_string());
     }
-    open::that(target).map_err(|e| format!("Unable to open this item: {}", e))
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to open this item: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+    open::that(canonical).map_err(|e| format!("Unable to open this item: {}", e))
 }
 
 /// Real capacity information for the volume containing `path` (defaults to
@@ -435,7 +560,7 @@ fn volume_usage(_path: &Path) -> Result<DiskUsage, String> {
     Err("Disk usage is not supported on this platform yet.".to_string())
 }
 
-pub fn disk_usage(path: Option<String>) -> Result<DiskUsage, String> {
+pub fn disk_usage(allow_list: &AllowList, path: Option<String>) -> Result<DiskUsage, String> {
     let target = match &path {
         Some(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => {
@@ -445,7 +570,11 @@ pub fn disk_usage(path: Option<String>) -> Result<DiskUsage, String> {
     if !target.exists() {
         return Err("The file or folder no longer exists.".to_string());
     }
-    volume_usage(&target)
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to read disk usage: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+    volume_usage(&canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +636,11 @@ mod tests {
         path.to_str().expect("utf-8 temp path").to_string()
     }
 
+    /// AllowList rooted at the temp directory (canonicalized on construction).
+    fn allow_for(tmp: &TempDir) -> AllowList {
+        AllowList::with_root(&str_of(tmp.path())).unwrap()
+    }
+
     // -- name validation ----------------------------------------------------
 
     #[test]
@@ -538,28 +672,32 @@ mod tests {
     #[test]
     fn create_folder_creates_directory() {
         let tmp = TempDir::new("create_ok");
-        create_folder(&str_of(tmp.path()), "New Folder").unwrap();
+        let allow = allow_for(&tmp);
+        create_folder(&allow, &str_of(tmp.path()), "New Folder").unwrap();
         assert!(tmp.child("New Folder").is_dir());
     }
 
     #[test]
     fn create_folder_rejects_duplicate() {
         let tmp = TempDir::new("create_dup");
-        create_folder(&str_of(tmp.path()), "dup").unwrap();
-        let err = create_folder(&str_of(tmp.path()), "dup").unwrap_err();
+        let allow = allow_for(&tmp);
+        create_folder(&allow, &str_of(tmp.path()), "dup").unwrap();
+        let err = create_folder(&allow, &str_of(tmp.path()), "dup").unwrap_err();
         assert!(err.contains("already exists"));
     }
 
     #[test]
     fn create_folder_rejects_separators() {
         let tmp = TempDir::new("create_sep");
-        assert!(create_folder(&str_of(tmp.path()), "a/b").is_err());
+        let allow = allow_for(&tmp);
+        assert!(create_folder(&allow, &str_of(tmp.path()), "a/b").is_err());
     }
 
     #[test]
     fn create_folder_rejects_missing_parent() {
         let tmp = TempDir::new("create_missing");
-        assert!(create_folder(&str_of(&tmp.child("ghost")), "x").is_err());
+        let allow = allow_for(&tmp);
+        assert!(create_folder(&allow, &str_of(&tmp.child("ghost")), "x").is_err());
     }
 
     // -- canonicalization / traversal ---------------------------------------
@@ -573,10 +711,11 @@ mod tests {
         // a real, existing parent (the parent must exist; only the new child
         // does not).
         let tmp = TempDir::new("create_traversal");
+        let allow = allow_for(&tmp);
         fs::create_dir_all(tmp.child("real")).unwrap();
         fs::create_dir_all(tmp.child("other")).unwrap();
         let tricky = str_of(&tmp.child("real").join("..").join("other"));
-        create_folder(&tricky, "made").unwrap();
+        create_folder(&allow, &tricky, "made").unwrap();
         assert!(tmp.child("other").join("made").is_dir());
         assert!(!tmp.child("real").join("other").exists());
     }
@@ -587,9 +726,273 @@ mod tests {
         // A symlinked parent must be followed to its canonical target, so an
         // operation cannot be steered by a link that later changes meaning.
         let tmp = TempDir::new("create_symlink");
+        let allow = allow_for(&tmp);
         fs::create_dir_all(tmp.child("real")).unwrap();
         std::os::unix::fs::symlink(tmp.child("real"), tmp.child("link")).unwrap();
-        create_folder(&str_of(&tmp.child("link")), "inside").unwrap();
+        create_folder(&allow, &str_of(&tmp.child("link")), "inside").unwrap();
         assert!(tmp.child("real").join("inside").is_dir());
+    }
+
+    // -- AllowList basics ---------------------------------------------------
+
+    #[test]
+    fn allow_list_allows_inside_root() {
+        let tmp = TempDir::new("al_inside");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("sub")).unwrap();
+        let sub = tmp.child("sub").canonicalize().unwrap();
+        assert!(allow.is_allowed(&sub));
+        let root_canon = tmp.path().canonicalize().unwrap();
+        assert!(allow.is_allowed(&root_canon));
+    }
+
+    #[test]
+    fn allow_list_rejects_outside_root() {
+        let root = TempDir::new("al_inside2");
+        let outside = TempDir::new("al_outside");
+        let allow = allow_for(&root);
+        let out = outside.path().canonicalize().unwrap();
+        assert!(!allow.is_allowed(&out));
+        assert!(!allow.is_allowed(&out.join("x")));
+    }
+
+    #[test]
+    fn allow_list_rejects_traversal_escape() {
+        let tmp = TempDir::new("al_trav");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("real")).unwrap();
+        // tmp/real/../.. canonicalizes to the parent of tmp — outside the root.
+        let escape = tmp
+            .child("real")
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .unwrap();
+        assert!(!allow.is_allowed(&escape));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allow_list_rejects_symlink_escape() {
+        let root = TempDir::new("al_symlink");
+        let outside = TempDir::new("al_symlink_out");
+        let allow = allow_for(&root);
+        fs::create_dir_all(outside.child("secret")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.child("escape")).unwrap();
+        let target = root.child("escape").join("secret").canonicalize().unwrap();
+        assert!(!allow.is_allowed(&target));
+        let link_dir = root.child("escape").canonicalize().unwrap();
+        assert!(!allow.is_allowed(&link_dir));
+    }
+
+    #[test]
+    fn allow_list_multiple_roots() {
+        let a = TempDir::new("al_multi_a");
+        let b = TempDir::new("al_multi_b");
+        let c = TempDir::new("al_multi_c");
+        let mut allow = allow_for(&a);
+        allow.register_root(&str_of(b.path())).unwrap();
+        assert!(allow.is_allowed(&a.path().canonicalize().unwrap()));
+        assert!(allow.is_allowed(&b.path().canonicalize().unwrap()));
+        assert!(!allow.is_allowed(&c.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn allow_list_ignores_duplicate_root() {
+        let a = TempDir::new("al_dup");
+        let mut allow = allow_for(&a);
+        allow.register_root(&str_of(a.path())).unwrap();
+        assert_eq!(allow.len(), 1);
+    }
+
+    #[test]
+    fn allow_list_empty_denies_all() {
+        let tmp = TempDir::new("al_empty");
+        let allow = AllowList::empty();
+        assert_eq!(allow.len(), 0);
+        assert!(!allow.is_allowed(&tmp.path().canonicalize().unwrap()));
+    }
+
+    // -- operation boundary enforcement -------------------------------------
+
+    #[test]
+    fn list_directory_denies_outside_root() {
+        let tmp = TempDir::new("list_root");
+        let allowed = tmp.child("allowed");
+        fs::create_dir_all(&allowed).unwrap();
+        let outside = tmp.child("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let allow = AllowList::with_root(&str_of(&allowed)).unwrap();
+
+        // a sibling directory inside the temp dir but outside the allowed root
+        let err = list_directory(&allow, Some(str_of(&outside))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+
+        // the allowed directory itself works
+        let listing = list_directory(&allow, Some(str_of(&allowed))).unwrap();
+        assert!(listing.items.is_empty());
+
+        // the default home is not the allowed subdir — still gated
+        assert!(list_directory(&allow, None).is_err());
+    }
+
+    #[test]
+    fn create_folder_respects_boundary() {
+        let root = TempDir::new("mk_root");
+        let outside = TempDir::new("mk_outside");
+        let allow = allow_for(&root);
+
+        // inside → allowed
+        create_folder(&allow, &str_of(root.path()), "made").unwrap();
+        assert!(root.child("made").is_dir());
+
+        // outside parent → denied
+        let err = create_folder(&allow, &str_of(outside.path()), "x").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+
+        // nonexistent child inside an allowed parent → allowed (canonical parent)
+        fs::create_dir_all(root.child("sub")).unwrap();
+        create_folder(&allow, &str_of(&root.child("sub")), "kid").unwrap();
+        assert!(root.child("sub").join("kid").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_folder_rejects_symlinked_parent_escape() {
+        let root = TempDir::new("mk_symlink_escape");
+        let outside = TempDir::new("mk_symlink_out");
+        let allow = allow_for(&root);
+        std::os::unix::fs::symlink(outside.path(), root.child("escape")).unwrap();
+        let err = create_folder(&allow, &str_of(&root.child("escape")), "x").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!outside.child("x").exists());
+    }
+
+    #[test]
+    fn rename_item_denies_outside_root() {
+        let root = TempDir::new("rn_root");
+        let outside = TempDir::new("rn_outside");
+        let allow = allow_for(&root);
+
+        write_file(&root.child("a.txt"), "a");
+        rename_item(&allow, &str_of(&root.child("a.txt")), "b.txt").unwrap();
+        assert!(root.child("b.txt").is_file());
+
+        write_file(&outside.child("c.txt"), "c");
+        let err = rename_item(&allow, &str_of(&outside.child("c.txt")), "d.txt").unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("c.txt").is_file());
+    }
+
+    #[test]
+    fn move_item_requires_both_sides_inside() {
+        let root = TempDir::new("mv_root");
+        let outside = TempDir::new("mv_outside");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        // in → in: allowed
+        write_file(&root.child("inside.txt"), "x");
+        move_item(
+            &allow,
+            &str_of(&root.child("inside.txt")),
+            &str_of(&root.child("dest")),
+        )
+        .unwrap();
+        assert!(root.child("dest").join("inside.txt").is_file());
+
+        // in → out: denied
+        write_file(&root.child("in2.txt"), "x");
+        let err = move_item(
+            &allow,
+            &str_of(&root.child("in2.txt")),
+            &str_of(outside.path()),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(root.child("in2.txt").is_file());
+
+        // out → in: denied
+        write_file(&outside.child("o3.txt"), "x");
+        let err = move_item(
+            &allow,
+            &str_of(&outside.child("o3.txt")),
+            &str_of(&root.child("dest")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("o3.txt").is_file());
+
+        // out → out: denied
+        let err = move_item(
+            &allow,
+            &str_of(&outside.child("o3.txt")),
+            &str_of(outside.path()),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("o3.txt").is_file());
+    }
+
+    #[test]
+    fn delete_item_denies_outside_root() {
+        let root = TempDir::new("del_root");
+        let outside = TempDir::new("del_outside");
+        let allow = allow_for(&root);
+
+        write_file(&root.child("a.txt"), "a");
+        delete_item(&allow, &str_of(&root.child("a.txt"))).unwrap();
+        assert!(!root.child("a.txt").exists());
+
+        write_file(&outside.child("b.txt"), "b");
+        let err = delete_item(&allow, &str_of(&outside.child("b.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("b.txt").is_file());
+    }
+
+    #[test]
+    fn open_item_denies_outside_root() {
+        // Only denial paths are exercised — the allowed path would launch an
+        // external application, which unit tests must never do.
+        let root = TempDir::new("open_root");
+        let outside = TempDir::new("open_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+
+        let err = open_item(&allow, &str_of(&outside.child("secret.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_item_rejects_symlink_escape() {
+        // A symlink whose canonical target resolves outside the root must be
+        // rejected BEFORE `open::that` is reached.
+        let root = TempDir::new("open_symlink_escape");
+        let outside = TempDir::new("open_symlink_out");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("leak")).unwrap();
+        let err = open_item(&allow, &str_of(&root.child("leak"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn disk_usage_denies_outside_root() {
+        let tmp = TempDir::new("du_root");
+        let allowed = tmp.child("allowed");
+        fs::create_dir_all(&allowed).unwrap();
+        let outside = tmp.child("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let allow = AllowList::with_root(&str_of(&allowed)).unwrap();
+
+        let err = disk_usage(&allow, Some(str_of(&outside))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+
+        // allowed path returns real statfs/statvfs data
+        disk_usage(&allow, Some(str_of(&allowed))).unwrap();
+
+        // default home is not the allowed subdir — still gated
+        assert!(disk_usage(&allow, None).is_err());
     }
 }

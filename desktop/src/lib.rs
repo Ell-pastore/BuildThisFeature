@@ -10,6 +10,8 @@
 
 mod fs_service;
 
+use tauri::Manager;
+
 /// Return the user's home directory.
 #[tauri::command]
 fn home_directory() -> Result<String, String> {
@@ -22,46 +24,67 @@ fn home_directory() -> Result<String, String> {
 /// Symbolic links are skipped and only the requested directory is read — we
 /// never recurse into subdirectories.
 #[tauri::command]
-fn list_directory(path: Option<String>) -> Result<fs_service::DirectoryListing, String> {
-    fs_service::list_directory(path)
+fn list_directory(
+    path: Option<String>,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<fs_service::DirectoryListing, String> {
+    fs_service::list_directory(allow_list.inner(), path)
 }
 
 /// Create a new folder inside `dir` named `name`.
 #[tauri::command]
-fn create_folder(dir: String, name: String) -> Result<(), String> {
-    fs_service::create_folder(&dir, &name)
+fn create_folder(
+    dir: String,
+    name: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::create_folder(allow_list.inner(), &dir, &name)
 }
 
 /// Rename a file or folder in place (only the name changes, not location).
 #[tauri::command]
-fn rename_item(from: String, new_name: String) -> Result<(), String> {
-    fs_service::rename_item(&from, &new_name)
+fn rename_item(
+    from: String,
+    new_name: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::rename_item(allow_list.inner(), &from, &new_name)
 }
 
 /// Move an item into another directory, keeping its current file name.
 #[tauri::command]
-fn move_item(source: String, dest_dir: String) -> Result<(), String> {
-    fs_service::move_item(&source, &dest_dir)
+fn move_item(
+    source: String,
+    dest_dir: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::move_item(allow_list.inner(), &source, &dest_dir)
 }
 
 /// Delete a file or folder. The UI must confirm before calling this.
 #[tauri::command]
-fn delete_item(path: String) -> Result<(), String> {
-    fs_service::delete_item(&path)
+fn delete_item(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::delete_item(allow_list.inner(), &path)
 }
 
 /// Open a file/folder with the operating system's default application.
 #[tauri::command]
-fn open_item(path: String) -> Result<(), String> {
-    fs_service::open_item(&path)
+fn open_item(path: String, allow_list: tauri::State<fs_service::AllowList>) -> Result<(), String> {
+    fs_service::open_item(allow_list.inner(), &path)
 }
 
 /// Real capacity information for the volume containing `path` (defaults to
 /// the user's home directory). Reads filesystem statistics only via
 /// statfs/statvfs; it performs no directory scanning or recursive traversal.
 #[tauri::command]
-fn disk_usage(path: Option<String>) -> Result<fs_service::DiskUsage, String> {
-    fs_service::disk_usage(path)
+fn disk_usage(
+    path: Option<String>,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<fs_service::DiskUsage, String> {
+    fs_service::disk_usage(allow_list.inner(), path)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -75,6 +98,10 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Root-scoped security boundary: initialize the AllowList once from
+            // the canonicalized user home directory (fail-closed on any error)
+            // and expose it to commands via Tauri managed state.
+            app.manage(fs_service::AllowList::with_default_root());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
