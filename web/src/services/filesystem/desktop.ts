@@ -106,6 +106,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke<FileMetadata>("get_file_metadata", { path });
   }
 
+  readFile(path: string): Promise<Uint8Array> {
+    return invoke<Uint8Array>("read_file", { path });
+  }
+
   copyItem(source: string, destDir: string): Promise<void> {
     return invoke("copy_item", { source, destDir });
   }

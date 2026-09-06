@@ -95,6 +95,15 @@ fn copy_item(
     fs_service::copy_item(allow_list.inner(), &source, &dest_dir)
 }
 
+/// Read the raw bytes of a file (text, image, binary).
+#[tauri::command]
+fn read_file(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<Vec<u8>, String> {
+    fs_service::read_file(allow_list.inner(), &path)
+}
+
 /// Real capacity information for the volume containing `path` (defaults to
 /// the user's home directory). Reads filesystem statistics only via
 /// statfs/statvfs; it performs no directory scanning or recursive traversal.
@@ -134,6 +143,7 @@ pub fn run() {
             disk_usage,
             get_file_metadata,
             copy_item,
+            read_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

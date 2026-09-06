@@ -85,6 +85,9 @@ export interface FilesystemProvider {
   /** Read metadata for a file or directory without touching its contents. */
   getFileMetadata(path: string): Promise<FileMetadata>;
 
+  /** Read the raw bytes of a file (text, image, binary). */
+  readFile(path: string): Promise<Uint8Array>;
+
   /** Copy an item (file, or folder recursively) into destDir, keeping its name. */
   copyItem(source: string, destDir: string): Promise<void>;
 

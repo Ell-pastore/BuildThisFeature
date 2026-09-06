@@ -834,6 +834,22 @@ pub fn copy_item(allow_list: &AllowList, source: &str, dest_dir: &str) -> Result
     Ok(())
 }
 
+/// Read the raw bytes of a file (text, image, binary) without interpretation.
+///
+/// The path is fully canonicalized (ancestors and the final symlink) before the
+/// policy gate, exactly like [`get_file_metadata`]: a symlink is resolved to its
+/// target, so a link that escapes the allowed root is denied before any content
+/// is read. `std::fs::read` happens only after authorization, so no bytes of an
+/// out-of-root file ever leak.
+pub fn read_file(allow_list: &AllowList, path: &str) -> Result<Vec<u8>, String> {
+    let target = Path::new(path);
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to read this file: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+    fs::read(&canonical).map_err(|e| format!("Unable to read this file: {}", map_io_error(&e)))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1636,5 +1652,98 @@ mod tests {
         // No destructive change: the source is intact and no new item exists.
         assert_eq!(fs::read(tmp.child("a.txt")).unwrap(), b"original");
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    // -- read_file ------------------------------------------------------------
+
+    #[test]
+    fn read_file_reads_text_file() {
+        let tmp = TempDir::new("read_text");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("notes.txt"), "hello world");
+
+        let bytes = read_file(&allow, &str_of(&tmp.child("notes.txt"))).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn read_file_reads_binary_file() {
+        let tmp = TempDir::new("read_binary");
+        let allow = allow_for(&tmp);
+        // Non-UTF-8 raw bytes, including values that are not valid in UTF-8.
+        let payload: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE];
+        std::fs::write(tmp.child("image.png"), &payload).unwrap();
+
+        let bytes = read_file(&allow, &str_of(&tmp.child("image.png"))).unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn read_file_denies_outside_root() {
+        let root = TempDir::new("read_root");
+        let outside = TempDir::new("read_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+
+        let err = read_file(&allow, &str_of(&outside.child("secret.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn read_file_traversal_escape() {
+        let tmp = TempDir::new("read_trav");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("real")).unwrap();
+        // tmp/real/../.. canonicalizes to the parent of tmp — outside the root.
+        let escape = tmp.child("real").join("..").join("..");
+
+        let err = read_file(&allow, &str_of(&escape)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn read_file_nonexistent() {
+        let tmp = TempDir::new("read_missing");
+        let allow = allow_for(&tmp);
+
+        let err = read_file(&allow, &str_of(&tmp.child("ghost"))).unwrap_err();
+        assert!(err.contains("no longer exists"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_symlink_inside() {
+        let tmp = TempDir::new("read_symlink_in");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("real.txt"), "target content");
+        std::os::unix::fs::symlink(tmp.child("real.txt"), tmp.child("alias")).unwrap();
+
+        let bytes = read_file(&allow, &str_of(&tmp.child("alias"))).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "target content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_symlink_outside() {
+        let root = TempDir::new("read_symlink_out");
+        let outside = TempDir::new("read_symlink_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("leak")).unwrap();
+
+        let err = read_file(&allow, &str_of(&root.child("leak"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn read_file_rejects_directory() {
+        let tmp = TempDir::new("read_dir");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("sub")).unwrap();
+
+        // Reading a directory path is not a security bypass; it must fail
+        // gracefully with a mapped filesystem error.
+        let err = read_file(&allow, &str_of(&tmp.child("sub"))).unwrap_err();
+        assert!(!err.is_empty());
     }
 }
