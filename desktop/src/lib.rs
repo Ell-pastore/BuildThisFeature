@@ -85,6 +85,16 @@ fn get_file_metadata(
     fs_service::get_file_metadata(allow_list.inner(), &path)
 }
 
+/// Copy a file/folder into a destination directory, keeping its name.
+#[tauri::command]
+fn copy_item(
+    source: String,
+    dest_dir: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::copy_item(allow_list.inner(), &source, &dest_dir)
+}
+
 /// Real capacity information for the volume containing `path` (defaults to
 /// the user's home directory). Reads filesystem statistics only via
 /// statfs/statvfs; it performs no directory scanning or recursive traversal.
@@ -123,6 +133,7 @@ pub fn run() {
             open_item,
             disk_usage,
             get_file_metadata,
+            copy_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

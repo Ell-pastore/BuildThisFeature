@@ -702,6 +702,138 @@ fn accessed_secs(_meta: &fs::Metadata) -> Option<i64> {
     None
 }
 
+/// Whether the entry `name` inside `dir` is a symbolic link.
+///
+/// On Unix the directory entry's own type is inspected via `symlink_metadata`
+/// so a link is never followed. On non-Unix platforms there is no standard
+/// portable symlink primitive; treat nothing as a link (the copy will use the
+/// platform's ordinary file/dir path on those platforms).
+#[cfg(unix)]
+fn entry_is_symlink(dir: &Path, name: &str) -> bool {
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => meta.file_type().is_symlink(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn entry_is_symlink(_dir: &Path, _name: &str) -> bool {
+    false
+}
+
+/// Recursively copy the directory `src` into the existing directory `dest_root`
+/// under the name `name` (which must not already exist under `dest_root`).
+///
+/// Child symlinks are NEVER followed: on Unix they are recreated as symlinks
+/// preserving their target text, which makes cycles and escapes through child
+/// links impossible. Only `src`'s own contents are read.
+fn copy_dir_recursive(src: &Path, dest_root: &Path, name: &str) -> Result<(), String> {
+    let dest = dest_root.join(name);
+    fs::create_dir(&dest).map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+
+    let entries = fs::read_dir(src)
+        .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?
+        .flatten();
+
+    for entry in entries {
+        let child_name = entry.file_name().to_string_lossy().to_string();
+        let child_path = entry.path();
+
+        if entry_is_symlink(src, &child_name) {
+            // Recreate the link verbatim; never follow it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs as unix_fs;
+                let target = fs::read_link(&child_path)
+                    .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+                let dest_link = dest.join(&child_name);
+                unix_fs::symlink(&target, &dest_link)
+                    .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+            }
+            #[cfg(not(unix))]
+            {
+                // No portable symlink primitive; skip the child rather than
+                // ever following it.
+            }
+            continue;
+        }
+
+        match fs::metadata(&child_path) {
+            Ok(meta) if meta.is_dir() => copy_dir_recursive(&child_path, &dest, &child_name)?,
+            _ => {
+                fs::copy(&child_path, dest.join(&child_name))
+                    .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy a file or folder into a destination directory, keeping its name.
+///
+/// Both the source (fully canonicalized — ancestors and final symlink) and the
+/// destination directory (fully canonicalized, must be an existing directory)
+/// are checked against the AllowList before anything is read or written.
+/// Recursive folder copies never follow child symlinks. An existing
+/// destination item is never overwritten, and a folder is never copied into
+/// its own subtree.
+pub fn copy_item(allow_list: &AllowList, source: &str, dest_dir: &str) -> Result<(), String> {
+    // Resolve and authorize the source (follows the final symlink).
+    let source = Path::new(source);
+    let source = source
+        .canonicalize()
+        .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &source)?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| "Invalid source item".to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    // Resolve and authorize the destination directory.
+    let dest_dir = PathBuf::from(dest_dir);
+    if !dest_dir.exists() {
+        return Err("The destination is not a folder".to_string());
+    }
+    let dest_dir = dest_dir
+        .canonicalize()
+        .map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+    if !dest_dir.is_dir() {
+        return Err("The destination is not a folder".to_string());
+    }
+    ensure_allowed(allow_list, &dest_dir)?;
+
+    let destination = dest_dir.join(&name);
+    if destination.exists() {
+        return Err("A file or folder with that name already exists.".to_string());
+    }
+
+    let meta =
+        fs::metadata(&source).map_err(|e| format!("Unable to copy: {}", map_io_error(&e)))?;
+
+    // A folder must never be copied into its own subtree — that would read
+    // while writing into the same tree and loop without bound.
+    if meta.is_dir() && destination.starts_with(&source) {
+        return Err("Cannot copy a folder into itself".to_string());
+    }
+
+    if meta.is_dir() {
+        if let Err(e) = copy_dir_recursive(&source, &dest_dir, &name) {
+            // Do not leave a misleading partially-copied tree behind. Safe:
+            // the own-subtree guard above already rejected any case where
+            // `destination` could contain `source`.
+            let _ = fs::remove_dir_all(&destination);
+            return Err(e);
+        }
+    } else if let Err(e) = fs::copy(&source, &destination) {
+        // Remove a partially copied file, if one was created.
+        let _ = fs::remove_file(&destination);
+        return Err(format!("Unable to copy: {}", map_io_error(&e)));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1256,5 +1388,253 @@ mod tests {
 
         let err = get_file_metadata(&allow, &str_of(&tmp.child("a.txt"))).unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- copy_item ------------------------------------------------------------
+
+    #[test]
+    fn copy_item_copies_file() {
+        let tmp = TempDir::new("copy_file");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("notes.txt"), "hello world");
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+
+        copy_item(
+            &allow,
+            &str_of(&tmp.child("notes.txt")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap();
+
+        let copied = tmp.child("dest").join("notes.txt");
+        assert!(copied.is_file());
+        assert_eq!(fs::read(&copied).unwrap(), b"hello world");
+        // original remains unchanged
+        assert_eq!(fs::read(tmp.child("notes.txt")).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn copy_item_copies_directory_recursively() {
+        let tmp = TempDir::new("copy_dir");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("source/nested")).unwrap();
+        write_file(&tmp.child("source/file.txt"), "top");
+        write_file(&tmp.child("source/nested/nested.txt"), "deep");
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+
+        copy_item(
+            &allow,
+            &str_of(&tmp.child("source")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap();
+
+        let copied = tmp.child("dest").join("source");
+        assert!(copied.is_dir());
+        assert_eq!(fs::read(copied.join("file.txt")).unwrap(), b"top");
+        assert!(copied.join("nested").is_dir());
+        assert_eq!(fs::read(copied.join("nested/nested.txt")).unwrap(), b"deep");
+        // original remains intact
+        assert!(tmp.child("source/file.txt").is_file());
+        assert!(tmp.child("source/nested/nested.txt").is_file());
+    }
+
+    #[test]
+    fn copy_item_rejects_existing_destination() {
+        let tmp = TempDir::new("copy_dup");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.txt"), "a");
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+        write_file(&tmp.child("dest/a.txt"), "existing");
+
+        let err = copy_item(
+            &allow,
+            &str_of(&tmp.child("a.txt")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "A file or folder with that name already exists.");
+        // destination item was not overwritten
+        assert_eq!(fs::read(tmp.child("dest/a.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn copy_item_rejects_nonexistent_source() {
+        let tmp = TempDir::new("copy_missing");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+
+        let err = copy_item(
+            &allow,
+            &str_of(&tmp.child("ghost")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap_err();
+        assert!(err.contains("no longer exists"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn copy_item_rejects_nonexistent_destination() {
+        let tmp = TempDir::new("copy_nodest");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.txt"), "a");
+
+        let err = copy_item(
+            &allow,
+            &str_of(&tmp.child("a.txt")),
+            &str_of(&tmp.child("ghost")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "The destination is not a folder");
+    }
+
+    #[test]
+    fn copy_item_denies_source_outside_root() {
+        let root = TempDir::new("copy_root");
+        let outside = TempDir::new("copy_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        let err = copy_item(
+            &allow,
+            &str_of(&outside.child("secret.txt")),
+            &str_of(&root.child("dest")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        // nothing was copied
+        assert!(!root.child("dest/secret.txt").exists());
+    }
+
+    #[test]
+    fn copy_item_denies_destination_outside_root() {
+        let root = TempDir::new("copy_dest_out");
+        let outside = TempDir::new("copy_dest_outside");
+        let allow = allow_for(&root);
+        write_file(&root.child("a.txt"), "a");
+
+        let err = copy_item(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(outside.path()),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        // nothing was written outside
+        assert!(!outside.child("a.txt").exists());
+    }
+
+    #[test]
+    fn copy_item_rejects_own_subtree() {
+        let tmp = TempDir::new("copy_subtree");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("folder/child")).unwrap();
+
+        let err = copy_item(
+            &allow,
+            &str_of(&tmp.child("folder")),
+            &str_of(&tmp.child("folder/child")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Cannot copy a folder into itself");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_item_symlink_source_escape() {
+        let root = TempDir::new("copy_symlink_out");
+        let outside = TempDir::new("copy_symlink_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("leak")).unwrap();
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        let err = copy_item(
+            &allow,
+            &str_of(&root.child("leak")),
+            &str_of(&root.child("dest")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        // no copied outside content inside the destination
+        assert!(!root.child("dest/leak").exists());
+        assert!(!root.child("dest/secret.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_item_symlink_source_inside() {
+        let tmp = TempDir::new("copy_symlink_in");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("real.txt"), "target content");
+        std::os::unix::fs::symlink(tmp.child("real.txt"), tmp.child("alias")).unwrap();
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+
+        copy_item(
+            &allow,
+            &str_of(&tmp.child("alias")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap();
+
+        // The copy is named after the resolved target ("real.txt") and its
+        // content matches the target.
+        let copied = tmp.child("dest").join("real.txt");
+        assert!(copied.is_file());
+        assert_eq!(fs::read(&copied).unwrap(), b"target content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_item_child_symlink_not_followed() {
+        let tmp = TempDir::new("copy_child_link");
+        let outside = TempDir::new("copy_child_outside");
+        let allow = allow_for(&tmp);
+
+        fs::create_dir_all(tmp.child("source")).unwrap();
+        write_file(&tmp.child("source/inside.txt"), "kept");
+        write_file(&outside.child("secret.txt"), "outside");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), tmp.child("source/link")).unwrap();
+        fs::create_dir_all(tmp.child("dest")).unwrap();
+
+        copy_item(
+            &allow,
+            &str_of(&tmp.child("source")),
+            &str_of(&tmp.child("dest")),
+        )
+        .unwrap();
+
+        let copied_link = tmp.child("dest/source/link");
+        // The child link was recreated, not followed: it is still a symlink
+        // with its target text preserved, and no outside content was copied.
+        let link_meta = fs::symlink_metadata(&copied_link).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&copied_link).unwrap(),
+            outside.child("secret.txt")
+        );
+        // the in-root regular file was still copied
+        assert_eq!(
+            fs::read(tmp.child("dest/source/inside.txt")).unwrap(),
+            b"kept"
+        );
+    }
+
+    #[test]
+    fn copy_item_source_is_destination() {
+        let tmp = TempDir::new("copy_self");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.txt"), "original");
+
+        // Copying an item into its own directory resolves the destination to
+        // the source itself — an existing destination item, which must fail
+        // with the contract error rather than silently doing nothing.
+        let err = copy_item(&allow, &str_of(&tmp.child("a.txt")), &str_of(tmp.path())).unwrap_err();
+        assert_eq!(err, "A file or folder with that name already exists.");
+
+        // No destructive change: the source is intact and no new item exists.
+        assert_eq!(fs::read(tmp.child("a.txt")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }
