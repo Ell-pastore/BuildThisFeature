@@ -32,6 +32,34 @@ export interface DirListing {
   items: FileItem[];
 }
 
+/** Metadata of a single file or directory (no content is ever read). */
+export interface FileMetadata {
+  /** Last path component of the resolved (canonical) target. */
+  name: string;
+  /** Canonical absolute path of the resolved target. */
+  path: string;
+  isFile: boolean;
+  isFolder: boolean;
+  /** Size in bytes (0 for directories). */
+  sizeBytes: number;
+  /** Lowercased extension without the dot, or null for folders/extension-less files. */
+  extension: string | null;
+  /** Whether the name begins with a dot (the app's hidden-file convention). */
+  isHidden: boolean;
+  /** Human readable modified date, e.g. "Aug 24, 2026". */
+  modified: string;
+  /** Raw modification time in epoch seconds. */
+  modifiedTs: number;
+  /** Human readable creation date. */
+  created: string;
+  /** Raw creation time in epoch seconds. */
+  createdTs: number;
+  /** Human readable accessed date, when the platform provides one. */
+  accessed: string | null;
+  /** Raw accessed time in epoch seconds, when the platform provides one. */
+  accessedTs: number | null;
+}
+
 export interface FilesystemProvider {
   /** The provider's default directory (user's home locally, account root in the cloud). */
   homeDirectory(): Promise<string>;
@@ -53,6 +81,9 @@ export interface FilesystemProvider {
 
   /** Open an item with its default application/handler. */
   openItem(path: string): Promise<void>;
+
+  /** Read metadata for a file or directory without touching its contents. */
+  getFileMetadata(path: string): Promise<FileMetadata>;
 
   /** Free/total space of the volume containing `path` (defaults to home). */
   diskUsage(path?: string): Promise<DiskUsage>;

@@ -76,6 +76,15 @@ fn open_item(path: String, allow_list: tauri::State<fs_service::AllowList>) -> R
     fs_service::open_item(allow_list.inner(), &path)
 }
 
+/// Read metadata for a file or directory without touching its contents.
+#[tauri::command]
+fn get_file_metadata(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<fs_service::FileMetadata, String> {
+    fs_service::get_file_metadata(allow_list.inner(), &path)
+}
+
 /// Real capacity information for the volume containing `path` (defaults to
 /// the user's home directory). Reads filesystem statistics only via
 /// statfs/statvfs; it performs no directory scanning or recursive traversal.
@@ -113,6 +122,7 @@ pub fn run() {
             delete_item,
             open_item,
             disk_usage,
+            get_file_metadata,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

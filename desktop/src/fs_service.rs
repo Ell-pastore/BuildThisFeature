@@ -77,6 +77,39 @@ pub struct DiskUsage {
     pub free_bytes: u64,
 }
 
+/// Metadata for a single file or directory.
+///
+/// Collects filesystem metadata only — the item's contents are never read.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetadata {
+    /// Last path component of the resolved (canonical) target.
+    pub name: String,
+    /// Canonical absolute path of the resolved target.
+    pub path: String,
+    pub is_file: bool,
+    pub is_folder: bool,
+    /// Size in bytes (0 for directories).
+    pub size_bytes: u64,
+    /// Lowercased file extension without the dot, or None for folders and
+    /// extension-less files.
+    pub extension: Option<String>,
+    /// Whether the name begins with a dot (the app's hidden-file convention).
+    pub is_hidden: bool,
+    /// Human readable modified date, e.g. "Aug 24, 2026".
+    pub modified: String,
+    /// Raw modification time in epoch seconds (for numeric sorting).
+    pub modified_ts: i64,
+    /// Human readable creation date.
+    pub created: String,
+    /// Raw creation time in epoch seconds.
+    pub created_ts: i64,
+    /// Human readable accessed date, when the platform provides one.
+    pub accessed: Option<String>,
+    /// Raw accessed time in epoch seconds, when the platform provides one.
+    pub accessed_ts: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -577,6 +610,98 @@ pub fn disk_usage(allow_list: &AllowList, path: Option<String>) -> Result<DiskUs
     volume_usage(&canonical)
 }
 
+/// Read structured metadata for a file or directory without touching its contents.
+///
+/// The target is FULLY canonicalized (ancestors and leaf) before the policy
+/// gate, exactly like [`open_item`]: `..` traversal, symlinked ancestors and
+/// the final symlink all resolve first, so `..`/symlink escapes are denied
+/// before any metadata is read. `symlink_metadata` is intentionally NOT used —
+/// the returned metadata describes the resolved target object.
+pub fn get_file_metadata(allow_list: &AllowList, path: &str) -> Result<FileMetadata, String> {
+    let target = Path::new(path);
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to get metadata: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| format!("Unable to get metadata: {}", map_io_error(&e)))?;
+
+    let name = canonical
+        .file_name()
+        .ok_or_else(|| "Unable to get metadata.".to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    let is_folder = meta.is_dir();
+    let is_file = meta.is_file();
+
+    // Folders (and extension-less files) have no extension.
+    let extension = if is_folder {
+        None
+    } else {
+        canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+    };
+
+    // Same dotfile convention used across the app: a leading dot marks hidden.
+    let is_hidden = name.starts_with('.');
+
+    let modified_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Creation time is not reliably available everywhere; fall back to the
+    // modification time so the UI always has a value (same as list_directory).
+    let created_secs = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(modified_secs);
+
+    let accessed_ts = accessed_secs(&meta);
+    let accessed = accessed_ts.map(format_date);
+
+    // Directories always report 0 bytes, matching the FileEntry convention.
+    let size_bytes = if is_file { meta.len() } else { 0 };
+
+    Ok(FileMetadata {
+        name,
+        path: canonical.to_string_lossy().into_owned(),
+        is_file,
+        is_folder,
+        size_bytes,
+        extension,
+        is_hidden,
+        modified: format_date(modified_secs),
+        modified_ts: modified_secs,
+        created: format_date(created_secs),
+        created_ts: created_secs,
+        accessed,
+        accessed_ts,
+    })
+}
+
+/// Best-effort last-access time.
+///
+/// Unix exposes it via `MetadataExt::atime`; other platforms report `None`
+/// for now (the field is optional).
+#[cfg(unix)]
+fn accessed_secs(meta: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.atime())
+}
+
+#[cfg(not(unix))]
+fn accessed_secs(_meta: &fs::Metadata) -> Option<i64> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -994,5 +1119,142 @@ mod tests {
 
         // default home is not the allowed subdir — still gated
         assert!(disk_usage(&allow, None).is_err());
+    }
+
+    // -- get_file_metadata --------------------------------------------------
+
+    #[test]
+    fn get_file_metadata_existing_file() {
+        let tmp = TempDir::new("meta_file");
+        let allow = allow_for(&tmp);
+        let file = tmp.child("notes.txt");
+        write_file(&file, "hello world"); // exactly 11 bytes
+
+        let meta = get_file_metadata(&allow, &str_of(&file)).unwrap();
+        assert_eq!(meta.name, "notes.txt");
+        assert_eq!(
+            meta.path,
+            file.canonicalize().unwrap().to_string_lossy().to_string()
+        );
+        assert!(meta.is_file);
+        assert!(!meta.is_folder);
+        assert_eq!(meta.size_bytes, 11);
+        assert_eq!(meta.extension.as_deref(), Some("txt"));
+        assert!(!meta.is_hidden);
+        assert!(meta.modified_ts > 0);
+        assert!(meta.created_ts > 0);
+    }
+
+    #[test]
+    fn get_file_metadata_existing_directory() {
+        let tmp = TempDir::new("meta_dir");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("pics")).unwrap();
+
+        let meta = get_file_metadata(&allow, &str_of(&tmp.child("pics"))).unwrap();
+        assert_eq!(meta.name, "pics");
+        assert!(meta.is_folder);
+        assert!(!meta.is_file);
+        assert_eq!(meta.size_bytes, 0);
+        assert_eq!(meta.extension, None);
+    }
+
+    #[test]
+    fn get_file_metadata_no_extension() {
+        let tmp = TempDir::new("meta_noext");
+        let allow = allow_for(&tmp);
+        let file = tmp.child("Makefile");
+        write_file(&file, "");
+
+        let meta = get_file_metadata(&allow, &str_of(&file)).unwrap();
+        assert_eq!(meta.extension, None);
+    }
+
+    #[test]
+    fn get_file_metadata_nonexistent() {
+        let tmp = TempDir::new("meta_missing");
+        let allow = allow_for(&tmp);
+
+        let err = get_file_metadata(&allow, &str_of(&tmp.child("ghost"))).unwrap_err();
+        assert!(err.contains("no longer exists"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn get_file_metadata_outside_root() {
+        let root = TempDir::new("meta_root");
+        let outside = TempDir::new("meta_outside");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "s");
+
+        let err = get_file_metadata(&allow, &str_of(&outside.child("secret.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[test]
+    fn get_file_metadata_traversal_escape() {
+        let tmp = TempDir::new("meta_trav");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("real")).unwrap();
+        // tmp/real/../.. canonicalizes to the parent of tmp — outside the
+        // allowed root. The path EXISTS, so this exercises the security
+        // boundary rather than merely producing NotFound.
+        let escape = tmp.child("real").join("..").join("..");
+
+        let err = get_file_metadata(&allow, &str_of(&escape)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_file_metadata_symlink_escape() {
+        let root = TempDir::new("meta_symlink");
+        let outside = TempDir::new("meta_symlink_out");
+        let allow = allow_for(&root);
+
+        // in-root symlink → outside file: denied, no outside metadata leaks
+        write_file(&outside.child("secret.txt"), "s");
+        std::os::unix::fs::symlink(outside.child("secret.txt"), root.child("leak")).unwrap();
+        let err = get_file_metadata(&allow, &str_of(&root.child("leak"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+
+        // in-root symlink → in-root file: allowed, and describes the resolved
+        // target (the final symlink is followed, not reported as the link).
+        write_file(&root.child("real.txt"), "x");
+        std::os::unix::fs::symlink(root.child("real.txt"), root.child("alias")).unwrap();
+        let meta = get_file_metadata(&allow, &str_of(&root.child("alias"))).unwrap();
+        assert_eq!(meta.name, "real.txt");
+        assert!(meta.is_file);
+        assert_eq!(
+            meta.path,
+            root.child("real.txt")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn get_file_metadata_hidden() {
+        let tmp = TempDir::new("meta_hidden");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child(".env"), "x");
+        write_file(&tmp.child("visible.txt"), "x");
+
+        let hidden = get_file_metadata(&allow, &str_of(&tmp.child(".env"))).unwrap();
+        assert!(hidden.is_hidden);
+
+        let visible = get_file_metadata(&allow, &str_of(&tmp.child("visible.txt"))).unwrap();
+        assert!(!visible.is_hidden);
+    }
+
+    #[test]
+    fn get_file_metadata_empty_allowlist() {
+        let tmp = TempDir::new("meta_empty");
+        let allow = AllowList::empty();
+        write_file(&tmp.child("a.txt"), "x");
+
+        let err = get_file_metadata(&allow, &str_of(&tmp.child("a.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
     }
 }

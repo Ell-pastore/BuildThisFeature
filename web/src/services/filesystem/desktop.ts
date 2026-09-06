@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileItem } from "../../types";
-import type { DirListing, DiskUsage, FilesystemProvider } from "./provider";
+import type { DirListing, DiskUsage, FileMetadata, FilesystemProvider } from "./provider";
 
 /**
  * DesktopFilesystemProvider — local filesystem access in the native desktop app.
@@ -100,6 +100,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
 
   openItem(path: string): Promise<void> {
     return invoke("open_item", { path });
+  }
+
+  getFileMetadata(path: string): Promise<FileMetadata> {
+    return invoke<FileMetadata>("get_file_metadata", { path });
   }
 
   diskUsage(path?: string): Promise<DiskUsage> {
