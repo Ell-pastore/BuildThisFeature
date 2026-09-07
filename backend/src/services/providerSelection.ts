@@ -34,21 +34,23 @@
  *     name that is not a known provider id is rejected the same way.
  *
  * The default registry pre-registers the built-in Grok (Phase 10.9), Gemini
- * (Phase 10.14), and OpenRouter (Phase 10.15) adapters backed by
- * `config.grok` / `config.gemini` / `config.openrouter`, so an operator needs
- * only to set the relevant API key (plus optional `AI_PROVIDER` to pick a
- * non-default provider). Future providers register next to them without
- * touching agent code.
+ * (Phase 10.14), OpenRouter (Phase 10.15), and Ollama (Phase 10.16) adapters
+ * backed by `config.grok` / `config.gemini` / `config.openrouter` /
+ * `config.ollama`, so an operator needs only to set the relevant settings
+ * (plus optional `AI_PROVIDER` to pick a non-default provider). Local Ollama
+ * needs no credential and stays out of the credential pool. Future providers
+ * register next to them without touching agent code.
  */
 import { config } from "../config.js";
 import type { AgentProvider } from "./provider.js";
 import { createGrokProvider } from "./grokProvider.js";
 import { createGeminiProvider } from "./geminiProvider.js";
 import { createOpenRouterProvider } from "./openrouterProvider.js";
+import { createOllamaProvider } from "./ollamaProvider.js";
 
 /**
  * The typed identifier for every provider the selection layer knows about.
- * Extend this const object (and nothing else) to add `ollama`, ... — the
+ * Extend this const object (and nothing else) to add future providers — the
  * agent contracts remain untouched.
  */
 export const ProviderId = {
@@ -58,6 +60,8 @@ export const ProviderId = {
   Gemini: "gemini",
   /** OpenRouter — served by the OpenAI-compatible chat completions API through the Phase 10.15 adapter. */
   OpenRouter: "openrouter",
+  /** Ollama — served by the local /api/chat endpoint through the Phase 10.16 adapter (no credential). */
+  Ollama: "ollama",
 } as const;
 
 /** The string union of every known provider id. */
@@ -215,9 +219,10 @@ export class ProviderRegistry {
 
 /**
  * Register every built-in provider adapter. Currently Grok (Phase 10.9),
- * Gemini (Phase 10.14), and OpenRouter (Phase 10.15), each built from server
- * configuration at resolution time. Future adapters (Ollama) register here —
- * no agent code changes.
+ * Gemini (Phase 10.14), OpenRouter (Phase 10.15), and Ollama (Phase 10.16),
+ * each built from server configuration at resolution time. Local Ollama has
+ * no credential, so its factory never touches the credential pool. Future
+ * adapters register here — no agent code changes.
  */
 export function registerBuiltinProviders(registry: ProviderRegistry): void {
   registry.register(ProviderId.Grok, () =>
@@ -242,6 +247,13 @@ export function registerBuiltinProviders(registry: ProviderRegistry): void {
       model: config.openrouter.model ?? "",
       baseUrl: config.openrouter.baseUrl,
       timeoutMs: config.openrouter.timeoutMs,
+    }),
+  );
+  registry.register(ProviderId.Ollama, () =>
+    createOllamaProvider({
+      model: config.ollama.model ?? "",
+      baseUrl: config.ollama.baseUrl,
+      timeoutMs: config.ollama.timeoutMs,
     }),
   );
 }

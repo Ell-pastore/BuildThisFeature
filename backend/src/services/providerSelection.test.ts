@@ -243,7 +243,9 @@ describe("ProviderId — typed identifiers", () => {
     expect(isProviderId("gemini")).toBe(true);
     expect(KNOWN_PROVIDER_IDS).toContain("openrouter");
     expect(isProviderId("openrouter")).toBe(true);
-    expect(isProviderId("ollama")).toBe(false);
+    expect(KNOWN_PROVIDER_IDS).toContain("ollama");
+    expect(isProviderId("ollama")).toBe(true);
+    expect(isProviderId("anthropic")).toBe(false);
     expect(isProviderId("")).toBe(false);
   });
 });
@@ -253,15 +255,17 @@ describe("ProviderId — typed identifiers", () => {
 // ---------------------------------------------------------------------------
 
 describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
-  it("pre-registers the built-in Grok, Gemini, and OpenRouter providers", () => {
+  it("pre-registers the built-in providers", () => {
     const registry = createDefaultProviderRegistry();
     expect(registry.has(ProviderId.Grok)).toBe(true);
     expect(registry.has(ProviderId.Gemini)).toBe(true);
     expect(registry.has(ProviderId.OpenRouter)).toBe(true);
+    expect(registry.has(ProviderId.Ollama)).toBe(true);
     expect(registry.registeredProviderIds).toEqual([
       "grok",
       "gemini",
       "openrouter",
+      "ollama",
     ]);
   });
 
@@ -303,6 +307,24 @@ describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
     ).toThrowError(
       expect.objectContaining({
         code: ProviderErrorCode.Authentication,
+        retryable: false,
+      }),
+    );
+  });
+
+  it("resolves Ollama without a credential but fails clearly without a model", () => {
+    // Local Ollama requires NO API key, so the built-in factory cannot fail on
+    // credentials. Instead it surfaces a permanent typing error (Internal)
+    // when no `OLLAMA_MODEL` is configured — the adapter never assumes a model.
+    const registry = createDefaultProviderRegistry();
+    expect(() =>
+      registry.resolve({ provider: ProviderId.Ollama }),
+    ).toThrowError(ProviderError);
+    expect(() =>
+      registry.resolve({ provider: ProviderId.Ollama }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: ProviderErrorCode.Internal,
         retryable: false,
       }),
     );

@@ -116,6 +116,25 @@ export const config = {
     ),
   },
   /**
+   * Ollama (local) provider settings (Phase 10.16).
+   *
+   * Local Ollama needs NO credential, so there is no key here — the adapter
+   * talks to the local HTTP API with no authentication (and is therefore
+   * never routed through the credential pool). The model is an operator
+   * choice (`OLLAMA_MODEL`): we never assume a specific model is installed.
+   */
+  ollama: {
+    /** Model sent to the local Ollama API. None by default — configuring one is required. */
+    model: envStringOrUndefined(process.env.OLLAMA_MODEL),
+    /** Local Ollama API base URL. */
+    baseUrl: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/api",
+    /** Request timeout in milliseconds (Phase 10.16 HTTP client). */
+    timeoutMs: Math.max(
+      1000,
+      intFromEnv(process.env.OLLAMA_TIMEOUT_MS) ?? 60_000,
+    ),
+  },
+  /**
    * The name of the AI provider requested via configuration (Phase 10.10).
    * Operators set `AI_PROVIDER` to choose among the providers registered in
    * the provider-selection layer; the value is validated against the known
