@@ -22,9 +22,11 @@ import {
 } from "./types.js";
 import { ToolError, ToolErrorCode, isToolError } from "./errors.js";
 import {
+  authenticatedAiAgent,
   defaultToolPolicy,
   enforcePolicy,
   type ToolActor,
+  type ToolActorIdentity,
   type ToolExecutionContext,
   type ToolPolicy,
 } from "./policy.js";
@@ -60,7 +62,25 @@ function destructiveTool(name: string): ToolDefinition {
   };
 }
 
-const AI_AGENT: ToolActor = { kind: "ai-agent" };
+/**
+ * A canonical "active" authenticated user, used by the default
+ * `aiContext()` fixture. Matches the shape the auth layer's
+ * `AuthUser` produces so tests exercise the same path a future
+ * HTTP route would.
+ */
+const ACTIVE_USER = {
+  id: "00000000-0000-0000-0000-000000000001",
+  email: "test@example.com",
+  displayName: "Test User",
+  status: "active",
+};
+
+/**
+ * Default ai-agent actor for the tests. Built through the canonical
+ * builder so the tests exercise the same code path a future caller
+ * would.
+ */
+const AI_AGENT: ToolActor = authenticatedAiAgent(ACTIVE_USER);
 const USER: ToolActor = { kind: "user" };
 
 function aiContext(): ToolExecutionContext {

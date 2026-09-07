@@ -53,6 +53,8 @@ export const ToolErrorCode = {
   // security
   PermissionDenied: "tools/permission-denied",
   PolicyContextMissing: "tools/policy-context-missing",
+  IdentityMissing: "tools/identity-missing",
+  IdentityInvalid: "tools/identity-invalid",
   FilesystemPermissionDenied: "filesystem/permission-denied",
   FilesystemNotAllowed: "filesystem/not-allowed",
   // internal

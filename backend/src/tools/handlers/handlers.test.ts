@@ -31,6 +31,7 @@ import {
   toToolError,
 } from "../errors.js";
 import { mapExecutorError } from "./executorErrors.js";
+import { authenticatedAiAgent } from "../policy.js";
 import type { FilesystemExecutor } from "../executor.js";
 import type {
   DirectoryListing,
@@ -126,7 +127,18 @@ function makeContext() {
 }
 
 function makeExecutionContext() {
-  return { actor: { kind: "ai-agent" as const } };
+  // Use the canonical Phase 9.6 builder so the test exercises the
+  // real path a future HTTP route or AI agent would take to
+  // construct a context. The user is "active" so the default policy
+  // allows the call.
+  return {
+    actor: authenticatedAiAgent({
+      id: "00000000-0000-0000-0000-000000000001",
+      email: "test@example.com",
+      displayName: "Test User",
+      status: "active",
+    }),
+  };
 }
 
 beforeEach(() => {

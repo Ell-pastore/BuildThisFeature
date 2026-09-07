@@ -1,5 +1,5 @@
 /**
- * Tool Permission / Policy layer (Phase 9.5).
+ * Tool Permission / Policy layer (Phase 9.5 + 9.6).
  *
  * Sits between the Tool Registry and the Tool Handler:
  *
@@ -16,41 +16,128 @@
  * `PolicyDecision`. It performs no I/O and depends on no AI provider,
  * no LLM, no HTTP, no Tauri runtime.
  *
- * The Phase 9.5 default policy is intentionally minimal:
+ * # Phase 9.6: real execution context
  *
- *   - The execution context MUST be present and identify an AI-agent
- *     actor. A missing context, an unknown actor kind, or a non-actor
- *     field is a `security` failure (we cannot reason about a request
- *     whose identity we do not know).
- *   - The tool's `permission` MUST be `Read` for Phase 9.5. Write and
- *     destructive tools are not yet implemented; they are denied
- *     explicitly so the policy is the single source of "is this allowed?"
- *     truth, not the handler.
+ * The context carries the authenticated application identity:
  *
- * Future phases can add additional policies (per-user ACLs, time-bound
- * grants, etc.) by composing `ToolPolicy` functions. The default
- * policy stays the same — a tool that is denied by the default is
- * denied; a tool that passes may still be denied by an additional
- * policy.
+ *   - `actor.kind` is the actor TYPE (currently `ai-agent` or `user`).
+ *   - `actor.identity` (only for `ai-agent`) carries the authenticated
+ *     user and a future extension point (deviceId, sessionId).
+ *   - The default policy verifies that the identity is present, that
+ *     the user is `active`, and that the actor kind is `ai-agent`.
+ *
+ * Future phases can compose additional policies that read
+ * `actor.identity` for per-user ACLs, per-device limits, etc., without
+ * coupling the tool layer to a specific AI provider or auth
+ * implementation.
  */
 import { ToolError, ToolErrorCode, type ToolErrorCategory } from "./errors.js";
 import { ToolPermission, type ToolDefinition } from "./types.js";
 
 /**
+ * The authenticated identity carried by an `ai-agent` actor.
+ *
+ * This is the SHAPE the tool layer reads, NOT an import of the auth
+ * layer's `AuthUser`. The shape is intentionally parallel (id/email/
+ * displayName/status) so a builder at the auth/tool boundary can
+ * convert an `AuthUser` to a `ToolActorIdentity` without the tool
+ * layer having to depend on `core/auth.ts`.
+ *
+ * `deviceId` and `sessionId` are reserved for future use (per-device
+ * policy, audit correlation). They are NOT enforced in Phase 9.6 but
+ * the fields are present so callers do not have to extend the type
+ * later when those features arrive.
+ */
+export interface ToolActorIdentity {
+  /** Authenticated user id (matches the auth layer's `AuthUser.id`). */
+  userId: string;
+  /** Authenticated user email. */
+  email: string;
+  /** Authenticated user display name. */
+  displayName: string;
+  /**
+   * Authenticated user account status. The Phase 9.6 default policy
+   * allows only `"active"`. Disabled / pending accounts are denied.
+   */
+  status: string;
+  /**
+   * Optional device / client id (e.g. the registered Tauri device).
+   * Reserved for future per-device policy; not enforced in Phase 9.6.
+   */
+  deviceId?: string;
+  /**
+   * Optional session id. Reserved for future audit correlation; not
+   * enforced in Phase 9.6.
+   */
+  sessionId?: string;
+}
+
+/**
  * Who is making the tool call.
  *
- * Phase 9.5 supports exactly one actor kind: `ai-agent`. The actor kind
- * is intentionally a closed union so adding a new kind (e.g. `user`,
- * `system`) is a type-level change reviewed in code review, not a
- * silent runtime fallthrough.
+ * Phase 9.6 supports two actor kinds:
+ *   - `ai-agent` — an AI agent acting on behalf of an authenticated
+ *     user. The `identity` field carries the user and (future)
+ *     device/session metadata.
+ *   - `user` — a direct user invocation. Not yet supported; included
+ *     so the type is closed and the policy can deny it explicitly
+ *     rather than silently accepting it.
  *
- * Future phases may extend this to include a per-user identity. The
- * Phase 9.5 design is a discriminated union so adding a richer actor
- * shape later does not break callers that pattern-match exhaustively.
+ * The discriminated union guarantees that consumers pattern-match
+ * exhaustively: adding a new actor kind is a type-level change
+ * reviewed in code review, not a silent runtime fallthrough.
  */
 export type ToolActor =
-  | { kind: "ai-agent" }
+  | { kind: "ai-agent"; identity: ToolActorIdentity }
   | { kind: "user" };
+
+/**
+ * The shape the tool layer needs to build a `ToolActorIdentity` from
+ * an `AuthUser`-shaped object. We do not import the `AuthUser` type
+ * from `core/auth.ts` — that would couple the tool layer to the
+ * transport's auth representation. Instead, the auth layer (or
+ * whatever the future caller is) is expected to pass an object that
+ * is structurally compatible with this shape.
+ */
+export interface AuthenticatedUserLike {
+  id: string;
+  email: string;
+  displayName: string;
+  status: string;
+}
+
+
+/**
+ * Build the canonical `ai-agent` actor for a known-authenticated user.
+ *
+ * This is the ONE place in the tool layer that knows how an
+ * authenticated user turns into a tool-call context. It accepts any
+ * object with the four `AuthUser`-shaped fields (id/email/displayName/
+ * status) and returns a `ToolActor` with `kind: "ai-agent"` and the
+ * full `ToolActorIdentity` (including optional deviceId / sessionId
+ * when supplied).
+ *
+ * Callers — the future HTTP route, the future AI agent, tests —
+ * are expected to call this with the authenticated user they have in
+ * hand, NOT to construct the actor shape themselves. This keeps the
+ * identity-bearing shape private to the tool layer.
+ */
+export function authenticatedAiAgent(
+  user: AuthenticatedUserLike,
+  options: { deviceId?: string; sessionId?: string } = {},
+): ToolActor {
+  return {
+    kind: "ai-agent",
+    identity: {
+      userId: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      status: user.status,
+      deviceId: options.deviceId,
+      sessionId: options.sessionId,
+    },
+  };
+}
 
 /**
  * Per-call execution context the policy reads. This is distinct from
@@ -92,7 +179,7 @@ export type PolicyDecision =
  * A `ToolPolicy` is intentionally `(definition, context) => decision`
  * — it does NOT take the input or the handler. A policy that depends
  * on the input is a per-handler check, not a tool-level policy; the
- * Phase 9.5 design keeps the two concerns separate.
+ * design keeps the two concerns separate.
  */
 export type ToolPolicy = (
   definition: ToolDefinition,
@@ -101,21 +188,15 @@ export type ToolPolicy = (
 
 
 /**
- * Default Phase 9.5 policy. See the module header for the rules.
+ * Default policy. See the module header for the rules.
  *
  * - Reject any missing/malformed context as a `security` failure with
- *   code `tools/policy-context-missing`. A dispatcher that calls
- *   without a context is itself a programming bug, but the policy
- *   treats it as a security failure rather than letting execution
- *   proceed with a half-formed identity.
- * - Reject any actor whose `kind` is not `ai-agent`. Today the
- *   only allowed kind is `ai-agent`; user-driven tools are out of
- *   scope and must not be added without an explicit policy change.
+ *   code `tools/policy-context-missing`.
+ * - Reject any `ai-agent` actor whose identity is missing or whose
+ *   user status is not `"active"`. A `user` actor is rejected as
+ *   `tools/permission-denied` (the actor kind is not authorized in
+ *   Phase 9.6).
  * - Reject any tool whose `permission` is not `Read`.
- *
- * The function is exported as a factory so it can be composed with
- * additional policies in the future (e.g. per-tool allowlists,
- * rate limits, time-bound grants).
  */
 export function defaultToolPolicy(): ToolPolicy {
   return function policy(definition, context) {
@@ -128,11 +209,16 @@ export function defaultToolPolicy(): ToolPolicy {
       );
     }
 
-    // 2. Only the AI-agent actor is allowed to invoke tools in Phase 9.5.
-    //    User-driven tools will be added in a later phase with its own
-    //    policy rule; the explicit `else if` here is intentional —
-    //    adding a new actor kind is a code change reviewed in review.
-    if (context.actor.kind !== "ai-agent") {
+    // 2. The ai-agent actor must carry a valid identity.
+    if (context.actor.kind === "ai-agent") {
+      const identity = context.actor.identity;
+      const idCheck = validateAiAgentIdentity(identity);
+      if (idCheck !== null) {
+        return idCheck;
+      }
+    } else {
+      // The only other kind in Phase 9.6 is "user", which is not
+      // supported by any tool. Deny with the actor-kind code.
       return deny(
         "security",
         ToolErrorCode.PermissionDenied,
@@ -140,7 +226,7 @@ export function defaultToolPolicy(): ToolPolicy {
       );
     }
 
-    // 3. Only read tools exist in Phase 9.5. Write and destructive
+    // 3. Only read tools exist in Phase 9.6. Write and destructive
     //    tools are not yet wired; deny them explicitly so a future
     //    tool author who registers a write tool gets a clear
     //    "permission denied" instead of a silent success.
@@ -157,6 +243,56 @@ export function defaultToolPolicy(): ToolPolicy {
 }
 
 /**
+ * Validate the identity subshape of an `ai-agent` actor. Returns
+ * `null` when the identity is acceptable, or a `PolicyDecision`
+ * denial when it is not. Extracted as a helper so the rules are
+ * easy to test in isolation.
+ *
+ * Identity is acceptable iff:
+ *   - `identity` is a non-null object,
+ *   - `userId`, `email`, `displayName` are non-empty strings,
+ *   - `status === "active"`.
+ *
+ * The `deviceId` and `sessionId` fields are optional in Phase 9.6
+ * and are NOT validated here; they are reserved for future policies.
+ */
+function validateAiAgentIdentity(
+  identity: unknown,
+): PolicyDecision | null {
+  if (identity === null || identity === undefined || typeof identity !== "object") {
+    return deny(
+      "security",
+      ToolErrorCode.IdentityMissing,
+      "Tool execution requires an authenticated identity.",
+    );
+  }
+  const id = identity as Record<string, unknown>;
+  if (
+    typeof id.userId !== "string" ||
+    id.userId.length === 0 ||
+    typeof id.email !== "string" ||
+    id.email.length === 0 ||
+    typeof id.displayName !== "string" ||
+    id.displayName.length === 0
+  ) {
+    return deny(
+      "security",
+      ToolErrorCode.IdentityMissing,
+      "The authenticated identity is incomplete.",
+    );
+  }
+  if (id.status !== "active") {
+    return deny(
+      "security",
+      ToolErrorCode.IdentityInvalid,
+      "The authenticated user is not active.",
+    );
+  }
+  return null;
+}
+
+
+/**
  * Convenience: enforce a policy against a tool definition. Returns
  * `null` if the policy allows the call, or a `ToolError` if the policy
  * denies it. The dispatcher (or any other caller) uses this to wire
@@ -164,8 +300,8 @@ export function defaultToolPolicy(): ToolPolicy {
  * the `if (!decision.allowed) return { ok: false, error: ... }`
  * boilerplate at every site.
  *
- * `policy` defaults to the Phase 9.5 default policy. Callers can
- * pass a custom policy for tests or for future composition.
+ * `policy` defaults to the default policy. Callers can pass a custom
+ * policy for tests or for future composition.
  */
 export function enforcePolicy(
   definition: ToolDefinition,
