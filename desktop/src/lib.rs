@@ -125,6 +125,17 @@ fn disk_usage(
     fs_service::disk_usage(allow_list.inner(), path)
 }
 
+/// Recursively search for files and directories by name across all allowed
+/// roots. Returns both files and directories whose names contain the
+/// (case-insensitive) query substring.
+#[tauri::command]
+fn search_files(
+    query: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<Vec<fs_service::FileEntry>, String> {
+    fs_service::search_files(allow_list.inner(), &query)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -155,6 +166,7 @@ pub fn run() {
             copy_item,
             read_file,
             write_file,
+            search_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

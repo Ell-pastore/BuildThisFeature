@@ -96,4 +96,8 @@ export interface FilesystemProvider {
 
   /** Free/total space of the volume containing `path` (defaults to home). */
   diskUsage(path?: string): Promise<DiskUsage>;
+
+  /** Recursively search filenames across all allowed roots. Returns both files and directories
+   * whose names contain the (case-insensitive) query. Empty query returns an empty array. */
+  searchFiles(query: string): Promise<FileItem[]>;
 }

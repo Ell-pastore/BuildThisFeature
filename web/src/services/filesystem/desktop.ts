@@ -121,4 +121,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
   diskUsage(path?: string): Promise<DiskUsage> {
     return invoke<DiskUsage>("disk_usage", { path });
   }
+
+  searchFiles(query: string): Promise<FileItem[]> {
+    return invoke<DirEntryResponse[]>("search_files", { query }).then((entries) =>
+      entries.map(mapEntry),
+    );
+  }
 }

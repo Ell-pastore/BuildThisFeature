@@ -260,6 +260,11 @@ impl AllowList {
         self.roots.len()
     }
 
+    /// Read-only access to the canonical allowed roots.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
     /// Whether no root is registered (in which case every path is denied).
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
@@ -909,6 +914,171 @@ pub fn write_file(allow_list: &AllowList, path: &str, content: &[u8]) -> Result<
                 .map_err(|e| format!("Unable to write this file: {}", map_io_error(&e)))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recursive file search
+// ---------------------------------------------------------------------------
+
+/// Build a [`FileEntry`] from a canonical entry path and its pre-fetched
+/// metadata. Shares the exact field calculations used by [`list_directory`]
+/// so search results match the listing contract one-to-one.
+fn build_file_entry(path: &Path, meta: &fs::Metadata) -> FileEntry {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let modified_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let created_secs = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(modified_secs);
+
+    let is_folder = meta.is_dir();
+
+    let item_count = if is_folder {
+        path.read_dir().ok().map(|r| r.count() as u64)
+    } else {
+        None
+    };
+
+    let file_type = if is_folder {
+        "folder".to_string()
+    } else {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_else(|| "file".to_string())
+    };
+
+    FileEntry {
+        id: path.to_string_lossy().into_owned(),
+        name,
+        path: path.to_string_lossy().into_owned(),
+        is_folder,
+        size_bytes: if meta.is_file() { meta.len() } else { 0 },
+        item_count,
+        file_type,
+        size: if is_folder {
+            "—".to_string()
+        } else {
+            format_size(meta.len())
+        },
+        created: format_date(created_secs),
+        modified: format_date(modified_secs),
+        modified_ts: modified_secs,
+        created_ts: created_secs,
+    }
+}
+
+/// Recurse into `dir`, collecting entries whose name contains `query_lower`.
+/// Only the already-authorized subtree rooted at the AllowList root is visited.
+///
+/// Symlinks are never followed (detected via `entry.metadata()` which, like
+/// [`list_directory`], does not resolve the final link). Cycle detection uses
+/// canonical inode identity on Unix to defend against hardlink-based directory
+/// loops and bind mounts. Per-branch errors (permission denied, I/O error)
+/// are tolerated and do not abort the overall search.
+fn search_recursive(
+    dir: &Path,
+    query_lower: &str,
+    results: &mut Vec<FileEntry>,
+    visited: &mut std::collections::HashSet<(u64, u64)>,
+) {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return, // unreadable directory — skip silently
+    };
+
+    for entry in read_dir.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue, // skip entries we cannot stat
+        };
+
+        // Do not follow symbolic links — skip them entirely.
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let entry_path = entry.path();
+
+        // Cycle detection on Unix: if this directory has already been visited
+        // (same device + inode), skip it to avoid infinite recursion.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.is_dir() {
+                let key = (meta.dev(), meta.ino());
+                if !visited.insert(key) {
+                    continue; // already visited this directory inode
+                }
+            }
+        }
+
+        // Case-insensitive substring match on the entry's final component.
+        if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+            if name.to_lowercase().contains(query_lower) {
+                results.push(build_file_entry(&entry_path, &meta));
+            }
+        }
+
+        // Recurse into subdirectories.
+        if meta.is_dir() {
+            search_recursive(&entry_path, query_lower, results, visited);
+        }
+    }
+}
+
+/// Search recursively through every root in the [`AllowList`] for files and
+/// directories whose names contain the (case-insensitive) `query` substring.
+///
+/// # Security
+///
+/// - The AllowList remains the sole authorization boundary: only canonicalized
+///   roots registered in the AllowList are traversed via [`AllowList::roots`].
+///   `search_files` never re-derives or re-canonicalizes roots independently.
+/// - Symbolic links are never followed, so a symlink cannot expose a target
+///   outside an allowed root.
+/// - Cycle detection (Unix inode tracking) prevents infinite loops from
+///   hardlink-based directory cycles or bind mounts.
+/// - Traversal errors are handled per-branch: a single unreadable subdirectory
+///   is skipped without aborting the search or exposing unauthorized data.
+/// - An empty or whitespace-only query returns an empty result set without
+///   touching the filesystem.
+/// - Results are sorted by path for deterministic output.
+///
+/// # Matching
+///
+/// Filenames are matched using a case-insensitive substring search. Both files
+/// and directories are returned when their name contains the query.
+pub fn search_files(allow_list: &AllowList, query: &str) -> Result<Vec<FileEntry>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_lower = trimmed.to_lowercase();
+    let mut results: Vec<FileEntry> = Vec::new();
+
+    for root in allow_list.roots() {
+        ensure_allowed(allow_list, root)?;
+        search_recursive(root, &query_lower, &mut results, &mut Default::default());
+    }
+
+    // Deterministic ordering: sort by canonical path.
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,5 +2110,202 @@ mod tests {
         let allow = AllowList::empty();
         let err = super::write_file(&allow, &str_of(&tmp.child("a.txt")), b"x").unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- search_files -------------------------------------------------------
+
+    #[test]
+    fn search_empty_query_returns_empty() {
+        let tmp = TempDir::new("search_empty");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("anything.txt"), "data");
+
+        let results = super::search_files(&allow, "").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_whitespace_only_query_returns_empty() {
+        let tmp = TempDir::new("search_whitespace");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("anything.txt"), "data");
+
+        let results = super::search_files(&allow, "   \t  ").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_case_insensitive_filename() {
+        let tmp = TempDir::new("search_case");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("README.TXT"), "hello");
+        write_file(&tmp.child("notes.txt"), "world");
+
+        let results = super::search_files(&allow, "readme").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "README.TXT");
+    }
+
+    #[test]
+    fn search_substring_match() {
+        let tmp = TempDir::new("search_substring");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("annual_report.pdf"), "data");
+        write_file(&tmp.child("my-report.txt"), "data");
+        write_file(&tmp.child("budget.xlsx"), "data");
+
+        let results = super::search_files(&allow, "report").unwrap();
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"annual_report.pdf"));
+        assert!(names.contains(&"my-report.txt"));
+    }
+
+    #[test]
+    fn search_matches_files() {
+        let tmp = TempDir::new("search_files");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("target.txt"), "data");
+
+        let results = super::search_files(&allow, "target").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_folder);
+    }
+
+    #[test]
+    fn search_matches_directories() {
+        let tmp = TempDir::new("search_dirs");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("projects")).unwrap();
+        write_file(&tmp.child("projects").join("file.txt"), "data");
+
+        let results = super::search_files(&allow, "projects").unwrap();
+        assert!(results.iter().any(|e| e.is_folder && e.name == "projects"));
+    }
+
+    #[test]
+    fn search_recursive_nested() {
+        let tmp = TempDir::new("search_nested");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("deep").join("nested").join("path")).unwrap();
+        write_file(
+            &tmp.child("deep")
+                .join("nested")
+                .join("path")
+                .join("found.txt"),
+            "data",
+        );
+
+        let results = super::search_files(&allow, "found").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "found.txt");
+    }
+
+    #[test]
+    fn search_multiple_roots() {
+        let tmp1 = TempDir::new("search_multi_r1");
+        let tmp2 = TempDir::new("search_multi_r2");
+        let mut allow = AllowList::with_root(&str_of(tmp1.path())).unwrap();
+        allow.register_root(&str_of(tmp2.path())).unwrap();
+
+        write_file(&tmp1.child("alpha.txt"), "data");
+        write_file(&tmp2.child("beta.txt"), "data");
+
+        let results = super::search_files(&allow, "alpha").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "alpha.txt");
+
+        let results = super::search_files(&allow, "beta").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "beta.txt");
+    }
+
+    #[test]
+    fn search_results_remain_inside_allowed_roots() {
+        let tmp = TempDir::new("search_inside");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("sub")).unwrap();
+        write_file(&tmp.child("sub").join("match.txt"), "data");
+
+        let results = super::search_files(&allow, "match").unwrap();
+        assert!(!results.is_empty());
+        // Use the canonical AllowList root with component-aware Path comparison
+        // (not string-prefix matching) to verify containment.
+        let root = &allow.roots()[0];
+        for entry in &results {
+            let entry_path = Path::new(&entry.path);
+            assert!(entry_path.starts_with(root));
+        }
+    }
+
+    #[test]
+    fn search_outside_paths_never_returned() {
+        let root = TempDir::new("search_outside_r");
+        let outside = TempDir::new("search_outside_o");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "data");
+
+        let results = super::search_files(&allow, "secret").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_symlink_outside_not_followed() {
+        let root = TempDir::new("search_sym_out_r");
+        let outside = TempDir::new("search_sym_out_o");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.txt"), "data");
+
+        // Create a symlink inside the allowed root pointing to a file outside.
+        std::os::unix::fs::symlink(&outside.child("secret.txt"), &root.child("link.txt")).unwrap();
+
+        let results = super::search_files(&allow, "secret").unwrap();
+        // The symlink itself is skipped; the target outside is never reached.
+        assert!(results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_symlink_cycle_does_not_loop_forever() {
+        let tmp = TempDir::new("search_cycle");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("cycle")).unwrap();
+
+        // Create a symlink cycle: cycle/loop -> cycle (itself).
+        std::os::unix::fs::symlink(tmp.child("cycle"), tmp.child("cycle").join("loop")).unwrap();
+
+        // Should complete without hanging.
+        let results = super::search_files(&allow, "anything").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_deterministic_ordering() {
+        let tmp = TempDir::new("search_order");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("zebra.txt"), "data");
+        write_file(&tmp.child("apple.txt"), "data");
+        write_file(&tmp.child("mango.txt"), "data");
+
+        let results = super::search_files(&allow, "").unwrap();
+        assert!(results.is_empty());
+
+        let results = super::search_files(&allow, "txt").unwrap();
+        assert_eq!(results.len(), 3);
+        // Results must be sorted by path.
+        for i in 1..results.len() {
+            assert!(results[i - 1].path <= results[i].path);
+        }
+    }
+
+    #[test]
+    fn search_empty_allowlist_returns_no_results() {
+        let tmp = TempDir::new("search_empty_al");
+        let allow = AllowList::empty();
+        write_file(&tmp.child("hidden.txt"), "data");
+
+        let results = super::search_files(&allow, "hidden").unwrap();
+        assert!(results.is_empty());
     }
 }
