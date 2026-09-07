@@ -18,7 +18,7 @@
  *   user message + tool metadata
  *   → provider.generate()                     (ANY provider; no coupling here)
  *   → AgentResponse { text?, toolCalls? }
- *   → runAgentTurn                            (agent layer — the ONLY caller)
+ *   → routeAgentResponse / runAgentTurn        (agent layer — the ONLY callers)
  *   → runAgentRequest() → invokeTool()         (Phase 10.1 / 9.8 — authenticated)
  *   → dispatchTool (registry → policy → handler → executor)
  *
@@ -52,6 +52,13 @@ export interface AgentProviderRequest {
   message: string;
   /** Provider-agnostic metadata for the tools the agent may call. */
   tools: readonly ToolDefinition[];
+  /**
+   * Structured results of tool calls executed in previous rounds of a
+   * bounded tool loop, in execution order. Present from the second
+   * provider turn onward; omitted on the first turn. Used only as
+   * context — the provider has no execution capability of its own.
+   */
+  toolResults?: AgentToolResult[];
 }
 
 /**
@@ -161,6 +168,34 @@ export interface AgentTurnOutput {
 }
 
 /**
+ * Validate a provider response's tool-call intents and route them through
+ * the authenticated pipeline (`runAgentRequest()` → `invokeTool()`).
+ *
+ * This is the routing half of `runAgentTurn()`, split out so the bounded
+ * agent loop (Phase 10.4) can reuse the exact same authenticated,
+ * policy-gated execution path on every round.
+ *
+ * - Executes nothing from inside the provider.
+ * - Re-validates provider output through `parseAgentRequest`.
+ * - Returns an empty array when the response requested no tools.
+ *
+ * @throws `AppError.badRequest` when the provider returned malformed intents.
+ * @throws `AppError.unauthorized()` when `c` has no session identity.
+ */
+export async function routeAgentResponse(
+  c: { get: (key: string) => unknown },
+  response: AgentResponse,
+  options: InvokeToolOptions,
+): Promise<AgentToolResult[]> {
+  if (!response.toolCalls || response.toolCalls.length === 0) {
+    return [];
+  }
+  const request = parseAgentRequest({ calls: response.toolCalls });
+  const result = await runAgentRequest(c, request, options);
+  return result.results;
+}
+
+/**
  * Run one agent turn: ask the provider for a reply, then route any
  * tool-call intents it returned through the authenticated pipeline.
  *
@@ -186,11 +221,6 @@ export async function runAgentTurn(
     tools: turn.tools,
   });
 
-  if (!response.toolCalls || response.toolCalls.length === 0) {
-    return { text: response.text, results: [] };
-  }
-
-  const request = parseAgentRequest({ calls: response.toolCalls });
-  const result = await runAgentRequest(c, request, options);
-  return { text: response.text, results: result.results };
+  const results = await routeAgentResponse(c, response, options);
+  return { text: response.text, results };
 }
