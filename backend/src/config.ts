@@ -71,4 +71,11 @@ export const config = {
       intFromEnv(process.env.GROK_TIMEOUT_MS) ?? 60_000,
     ),
   },
+  /**
+   * The name of the AI provider requested via configuration (Phase 10.10).
+   * Operators set `AI_PROVIDER` to choose among the providers registered in
+   * the provider-selection layer; the value is validated against the known
+   * provider ids at resolution time. Defaults to the built-in Grok adapter.
+   */
+  aiProvider: process.env.AI_PROVIDER ?? "grok",
 };
