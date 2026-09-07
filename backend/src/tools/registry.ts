@@ -67,6 +67,14 @@ export class ToolRegistry {
     return tool;
   }
 
+  /**
+   * Whether a tool with the given name is registered (available). Unlike
+   * `get`, this never throws — it is for filtering/availability checks.
+   */
+  has(name: string): boolean {
+    return this.tools.has(name);
+  }
+
   /** Number of registered tools. */
   get size(): number {
     return this.tools.size;

@@ -507,6 +507,31 @@ describe("ToolRegistry — isolation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 11. Availability check (has) — used by agent context tool filtering
+// ---------------------------------------------------------------------------
+
+describe("ToolRegistry — has (availability)", () => {
+  it("is false for an absent name and never throws", () => {
+    const registry = new ToolRegistry();
+    expect(registry.has("read_file")).toBe(false);
+  });
+
+  it("is true for a registered name and false for an unknown one", () => {
+    const registry = new ToolRegistry();
+    registry.register(makeTool({ name: "read_file" }));
+    expect(registry.has("read_file")).toBe(true);
+    expect(registry.has("write_file")).toBe(false);
+  });
+
+  it("matches names exactly (case-sensitive) like get()", () => {
+    const registry = new ToolRegistry();
+    registry.register(makeTool({ name: "read_file" }));
+    expect(registry.has("Read_File")).toBe(false);
+    expect(registry.has(" read_file")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
