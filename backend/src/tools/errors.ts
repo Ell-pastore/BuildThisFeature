@@ -51,6 +51,8 @@ export const ToolErrorCode = {
   // not_found
   FilesystemNotFound: "filesystem/not-found",
   // security
+  PermissionDenied: "tools/permission-denied",
+  PolicyContextMissing: "tools/policy-context-missing",
   FilesystemPermissionDenied: "filesystem/permission-denied",
   FilesystemNotAllowed: "filesystem/not-allowed",
   // internal

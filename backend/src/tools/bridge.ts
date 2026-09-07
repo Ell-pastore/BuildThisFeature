@@ -54,6 +54,17 @@ export {
 } from "./errors.js";
 export type { ToolErrorCategory, ToolErrorCode as ToolErrorCodeType } from "./errors.js";
 
+export {
+  defaultToolPolicy,
+  enforcePolicy,
+} from "./policy.js";
+export type {
+  ToolActor,
+  ToolExecutionContext,
+  ToolPolicy,
+  PolicyDecision,
+} from "./policy.js";
+
 export type {
   DirectoryListing,
   FileEntry,

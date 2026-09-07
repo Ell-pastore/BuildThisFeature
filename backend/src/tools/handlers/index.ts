@@ -1,14 +1,16 @@
 /**
- * Tool handler registry + dispatch (Phase 9.3 + Phase 9.4).
+ * Tool handler registry + dispatch (Phase 9.3 + 9.4 + 9.5).
  *
  * The map and the dispatch function form the bridge's outward surface:
  * given a registered tool name and an untrusted input, the dispatch
  * function:
  *
  *   1. Verifies the tool is registered (registry gate, Phase 9.1).
- *   2. Validates the input against the tool's schema (handler).
- *   3. Delegates to the FilesystemExecutor (the bridge to the desktop).
- *   4. Projects any failure into a `ToolError` with an explicit category
+ *   2. Enforces the permission/policy gate (Phase 9.5). Denied tools
+ *      never reach the handler.
+ *   3. Validates the input against the tool's schema (handler).
+ *   4. Delegates to the FilesystemExecutor (the bridge to the desktop).
+ *   5. Projects any failure into a `ToolError` with an explicit category
  *      (Phase 9.4 execution contract).
  *
  * The dispatch surface is provider-independent. The default
@@ -23,6 +25,12 @@ import type {
   FileMetadata,
 } from "../tauriShapes.js";
 import { ToolError, ToolErrorCode } from "../errors.js";
+import {
+  defaultToolPolicy,
+  enforcePolicy,
+  type ToolExecutionContext,
+  type ToolPolicy,
+} from "../policy.js";
 import {
   runHandler,
   type RawToolInput,
@@ -63,15 +71,16 @@ export const handledToolNames: readonly string[] = Object.freeze(
 
 /**
  * Dispatch a tool call. Looks the tool up in the registry (proving it is
- * a known, registered tool) then runs the matching handler. Unknown tools
- * return an `ok: false` result — dispatch is expected to fail predictably
- * for caller-supplied tool names.
+ * a known, registered tool), runs the permission/policy gate, then runs
+ * the matching handler. Unknown tools return an `ok: false` result;
+ * denied tools return an `ok: false` result with `category: "security"`.
  *
  * The returned `error` (when `ok` is false) is always a public
  * `ToolError` with an explicit `category`. Every code path through
  * dispatch terminates with a categorized error:
  *
  *   - "unknown_tool"  — registry has no such tool
+ *   - "security"      — policy denied the call (or context is missing)
  *   - "internal"      — registry has the tool but no handler is wired
  *   - any category the handler's own throws produce (validation, etc.)
  */
@@ -80,10 +89,24 @@ export async function dispatchTool(
   toolName: string,
   input: RawToolInput,
   context: ToolHandlerContext,
+  /**
+   * The execution context the policy reads. Required for the policy
+   * gate; if absent, the dispatch returns a `security` error and the
+   * handler is never called.
+   */
+  executionContext: ToolExecutionContext,
+  /**
+   * Override policy for tests. Defaults to the Phase 9.5 default
+   * policy (`defaultToolPolicy()`). Future phases may compose
+   * additional policies here.
+   */
+  policy: ToolPolicy = defaultToolPolicy(),
 ): Promise<ToolExecutionResult> {
-  // Gate 1: prove the tool is registered before running any handler.
+  // Gate 1: prove the tool is registered before running any policy
+  // or handler. A registry miss cannot be authorized by the policy.
+  let definition;
   try {
-    registry.get(toolName);
+    definition = registry.get(toolName);
   } catch (error) {
     if (isToolRegistryError(error)) {
       // Registry miss: category "unknown_tool" so callers can branch
@@ -103,9 +126,18 @@ export async function dispatchTool(
     return { ok: false, error: ToolError.internal() };
   }
 
-  // Gate 2: the registry has the tool — look up the handler.
-  // The cast widens the exact-keys object to a string-key lookup so the
-  // runtime gate (`!handler`) still produces a precise error path.
+  // Gate 2: the policy. Denied tools NEVER reach the handler. The
+  // policy is the only thing that can produce a `security` result
+  // before the handler runs; the handler's own `ToolError` throws
+  // are passed through unchanged.
+  const policyError = enforcePolicy(definition, executionContext, policy);
+  if (policyError !== null) {
+    return { ok: false, error: policyError };
+  }
+
+  // Gate 3: the registry has the tool — look up the handler.
+  // The cast widens the exact-keys object to a string-key lookup so
+  // the runtime gate (`!handler`) still produces a precise error path.
   const handler = (handlers as unknown as Record<string, ToolHandler | undefined>)[
     toolName
   ];

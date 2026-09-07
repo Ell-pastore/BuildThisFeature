@@ -125,6 +125,10 @@ function makeContext() {
   return { filesystem: fake };
 }
 
+function makeExecutionContext() {
+  return { actor: { kind: "ai-agent" as const } };
+}
+
 beforeEach(() => {
   fake = makeFake();
   registry = new ToolRegistry();
@@ -636,7 +640,7 @@ describe("dispatchTool", () => {
       "list_directory",
       { path: "/home" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(true);
     expect(fake.calls.listDirectory).toEqual(["/home"]);
   });
@@ -647,7 +651,7 @@ describe("dispatchTool", () => {
       "search_files",
       { query: "notes" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(true);
     expect(fake.calls.searchFiles).toEqual(["notes"]);
   });
@@ -658,7 +662,7 @@ describe("dispatchTool", () => {
       "get_file_metadata",
       { path: "/home/notes.txt" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(true);
     expect(fake.calls.getFileMetadata).toEqual(["/home/notes.txt"]);
   });
@@ -669,7 +673,7 @@ describe("dispatchTool", () => {
       "read_file",
       { path: "/home/notes.txt" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(true);
     expect(fake.calls.readFile).toEqual(["/home/notes.txt"]);
   });
@@ -680,7 +684,7 @@ describe("dispatchTool", () => {
       "non_existent_tool",
       {},
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.category).toBe("unknown_tool");
@@ -708,7 +712,7 @@ describe("dispatchTool", () => {
       "list_directory",
       { path: "/home" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(true);
     if (!result.ok) throw result.error;
     // The exact structured payload is preserved through dispatch.
@@ -725,7 +729,7 @@ describe("dispatchTool", () => {
       "read_file",
       { path: "/home" },
       makeContext(),
-    );
+      makeExecutionContext(),);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.category).toBe("validation");
