@@ -46,6 +46,14 @@ export type {
   ToolSuccessResult,
 } from "./handlers/handler.js";
 
+export {
+  ToolError,
+  ToolErrorCode,
+  isToolError,
+  toToolError,
+} from "./errors.js";
+export type { ToolErrorCategory, ToolErrorCode as ToolErrorCodeType } from "./errors.js";
+
 export type {
   DirectoryListing,
   FileEntry,

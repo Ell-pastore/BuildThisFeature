@@ -1,27 +1,28 @@
 /**
- * Tool handler registry + dispatch (Phase 9.3).
+ * Tool handler registry + dispatch (Phase 9.3 + Phase 9.4).
  *
  * The map and the dispatch function form the bridge's outward surface:
  * given a registered tool name and an untrusted input, the dispatch
  * function:
  *
  *   1. Verifies the tool is registered (registry gate, Phase 9.1).
- *   2. Validates the input against the tool's schema (handler, this phase).
- *   3. Delegates to the FilesystemExecutor (this phase).
- *   4. Projects any failure into the project's AppError envelope.
+ *   2. Validates the input against the tool's schema (handler).
+ *   3. Delegates to the FilesystemExecutor (the bridge to the desktop).
+ *   4. Projects any failure into a `ToolError` with an explicit category
+ *      (Phase 9.4 execution contract).
  *
  * The dispatch surface is provider-independent. The default
  * `FilesystemExecutor` is the Tauri/Rust bridge, but any other
  * implementation (e.g. a future CloudFilesystemExecutor) can be
  * substituted without changing this code.
  */
-import { AppError } from "../../core/errors.js";
 import { ToolRegistry, isToolRegistryError } from "../registry.js";
 import type {
   DirectoryListing,
   FileEntry,
   FileMetadata,
 } from "../tauriShapes.js";
+import { ToolError, ToolErrorCode } from "../errors.js";
 import {
   runHandler,
   type RawToolInput,
@@ -66,8 +67,13 @@ export const handledToolNames: readonly string[] = Object.freeze(
  * return an `ok: false` result — dispatch is expected to fail predictably
  * for caller-supplied tool names.
  *
- * The returned error is always a public `AppError` suitable for projecting
- * into an HTTP response.
+ * The returned `error` (when `ok` is false) is always a public
+ * `ToolError` with an explicit `category`. Every code path through
+ * dispatch terminates with a categorized error:
+ *
+ *   - "unknown_tool"  — registry has no such tool
+ *   - "internal"      — registry has the tool but no handler is wired
+ *   - any category the handler's own throws produce (validation, etc.)
  */
 export async function dispatchTool(
   registry: ToolRegistry,
@@ -80,21 +86,21 @@ export async function dispatchTool(
     registry.get(toolName);
   } catch (error) {
     if (isToolRegistryError(error)) {
-      // Map the registry error to a public-safe AppError. The status is
-      // 400 (malformed request — caller asked for a non-existent tool)
-      // and the code is the registry's own stable code so clients can
-      // branch on it.
-      const status = error.code === "tools/unknown-tool" ? 400 : 409;
+      // Registry miss: category "unknown_tool" so callers can branch
+      // without inspecting the code. The duplicate-tool case (409) is
+      // a server-side wiring bug, but we still surface it as a
+      // structured error rather than letting it crash dispatch.
       return {
         ok: false,
-        error: new AppError(
-          status,
+        error: new ToolError(
+          "unknown_tool",
           error.code,
-          "The requested tool is not available.",
+          `The requested tool "${toolName}" is not available.`,
         ),
       };
     }
-    throw error;
+    // An unexpected non-registry error here is a programming bug.
+    return { ok: false, error: ToolError.internal() };
   }
 
   // Gate 2: the registry has the tool — look up the handler.
@@ -107,14 +113,14 @@ export async function dispatchTool(
     // Registry claim + no handler = wiring bug (not a user error).
     return {
       ok: false,
-      error: new AppError(
-        500,
-        "tools/handler-missing",
-        "The requested tool has no registered handler.",
+      error: new ToolError(
+        "internal",
+        ToolErrorCode.HandlerMissing,
+        `The requested tool "${toolName}" has no registered handler.`,
       ),
     };
   }
 
-  return runHandler(handler, input, context);
+  return handler(input, context);
 }
 

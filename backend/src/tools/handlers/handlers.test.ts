@@ -1,11 +1,10 @@
 /**
- * Tool handler / dispatch / bridge tests (Phase 9.3).
+ * Tool handler / dispatch / contract tests (Phase 9.4).
  *
- * Every test runs with a FakeFilesystemExecutor — no LLM, no Tauri, no
- * Node `fs`. The fake records every call so we can assert the bridge
+ * Every test runs with a `FakeFilesystemExecutor` — no LLM, no Tauri,
+ * no Node `fs`. The fake records every call so we can assert the bridge
  * passes inputs through unchanged and returns the executor's data
- * unchanged. Errors thrown by the executor are projected through the
- * bridge's `toAppError` so we can assert the public envelope.
+ * unchanged.
  *
  * The full chain under test:
  *
@@ -14,6 +13,7 @@
  *     -> handlers[name](input, ctx)                   [Phase 9.3 bridge]
  *     -> requireString(input, field)                  [Phase 9.3 validation]
  *     -> fake.listDirectory|searchFiles|...           [Phase 9.3 executor]
+ *     -> mapExecutorError -> ToolError(category=...)  [Phase 9.4 contract]
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,6 +24,13 @@ import {
 } from "../definitions/readTools.js";
 import { dispatchTool, handlers, handledToolNames } from "./index.js";
 import { requireString } from "./handler.js";
+import {
+  ToolError,
+  ToolErrorCode,
+  isToolError,
+  toToolError,
+} from "../errors.js";
+import { mapExecutorError } from "./executorErrors.js";
 import type { FilesystemExecutor } from "../executor.js";
 import type {
   DirectoryListing,
@@ -130,7 +137,149 @@ afterEach(() => {
 
 
 // ---------------------------------------------------------------------------
-// requireString (input validation)
+// Phase 9.4 contract: ToolError and mapExecutorError
+// ---------------------------------------------------------------------------
+
+describe("ToolError", () => {
+  it("preserves category, code, and message", () => {
+    const err = new ToolError("validation", "tools/invalid-input", "bad");
+    expect(err.category).toBe("validation");
+    expect(err.code).toBe("tools/invalid-input");
+    expect(err.message).toBe("bad");
+    expect(err.status).toBe(400);
+  });
+
+  it("maps each category to the expected default status", () => {
+    expect(new ToolError("validation", "x", "x").status).toBe(400);
+    expect(new ToolError("unknown_tool", "x", "x").status).toBe(400);
+    expect(new ToolError("not_found", "x", "x").status).toBe(404);
+    expect(new ToolError("security", "x", "x").status).toBe(403);
+    expect(new ToolError("internal", "x", "x").status).toBe(500);
+  });
+
+  it("factory methods produce the right category", () => {
+    expect(ToolError.validation("x", "x").category).toBe("validation");
+    expect(ToolError.unknownTool("x").category).toBe("unknown_tool");
+    expect(ToolError.notFound("x", "x").category).toBe("not_found");
+    expect(ToolError.security("x", "x").category).toBe("security");
+    expect(ToolError.internal().category).toBe("internal");
+  });
+
+  it("unknownTool embeds the missing tool name in the message", () => {
+    expect(ToolError.unknownTool("nope").message).toContain("nope");
+    expect(ToolError.unknownTool("nope").code).toBe(ToolErrorCode.UnknownTool);
+  });
+
+  it("isToolError narrows correctly", () => {
+    expect(isToolError(ToolError.internal())).toBe(true);
+    expect(isToolError(new Error("x"))).toBe(false);
+    expect(isToolError("string")).toBe(false);
+    expect(isToolError(null)).toBe(false);
+  });
+
+  it("toToolError passes a ToolError through unchanged", () => {
+    const original = ToolError.internal("specific");
+    expect(toToolError(original)).toBe(original);
+  });
+
+  it("toToolError projects an AppError using its status", async () => {
+    const { AppError } = await import("../../core/errors.js");
+    const appErr = new AppError(404, "filesystem/not-found", "missing");
+    const projected = toToolError(appErr);
+    expect(projected.category).toBe("not_found");
+    expect(projected.code).toBe("filesystem/not-found");
+    expect(projected.message).toBe("missing");
+  });
+
+  it("toToolError returns a public-safe internal for unknown errors", () => {
+    const projected = toToolError(new Error("ENOENT /etc/shadow"));
+    expect(projected.category).toBe("internal");
+    expect(projected.code).toBe(ToolErrorCode.Internal);
+    expect(projected.message).not.toContain("/etc/shadow");
+    expect(projected.message).not.toContain("ENOENT");
+  });
+
+  it("toToolError respects a supplied defaultCategory", () => {
+    const projected = toToolError(new Error("weird"), "not_found");
+    expect(projected.category).toBe("not_found");
+  });
+
+  it("toToolError handles non-Error throws", () => {
+    expect(toToolError("string").category).toBe("internal");
+    expect(toToolError(undefined).category).toBe("internal");
+    expect(toToolError(null).category).toBe("internal");
+  });
+});
+
+
+describe("mapExecutorError", () => {
+  it("returns the same ToolError when one is passed in", () => {
+    const err = ToolError.notFound("x", "x");
+    expect(mapExecutorError(err)).toBe(err);
+  });
+
+  it("maps 'does not exist' to not_found", () => {
+    const mapped = mapExecutorError(
+      new Error("The file or folder does not exist."),
+    );
+    expect(mapped.category).toBe("not_found");
+    expect(mapped.code).toBe(ToolErrorCode.FilesystemNotFound);
+  });
+
+  it("maps 'no longer exists' to not_found", () => {
+    const mapped = mapExecutorError(new Error("The file no longer exists."));
+    expect(mapped.category).toBe("not_found");
+  });
+
+  it("maps 'permission denied' to security", () => {
+    const mapped = mapExecutorError(new Error("Permission denied."));
+    expect(mapped.category).toBe("security");
+    expect(mapped.code).toBe(ToolErrorCode.FilesystemPermissionDenied);
+  });
+
+  it("maps 'access not permitted' to security", () => {
+    const mapped = mapExecutorError(
+      new Error("Access to this path is not permitted."),
+    );
+    expect(mapped.category).toBe("security");
+    expect(mapped.code).toBe(ToolErrorCode.FilesystemNotAllowed);
+  });
+
+  it("maps 'not a folder' to validation (filesystem/not-a-directory)", () => {
+    const mapped = mapExecutorError(new Error("The path is not a folder."));
+    expect(mapped.category).toBe("validation");
+    expect(mapped.code).toBe("filesystem/not-a-directory");
+  });
+
+  it("maps 'not a file' to validation (filesystem/not-a-file)", () => {
+    const mapped = mapExecutorError(
+      new Error("The selected path is a folder, not a file."),
+    );
+    expect(mapped.category).toBe("validation");
+    expect(mapped.code).toBe("filesystem/not-a-file");
+  });
+
+  it("falls back to public-safe internal for unknown shapes", () => {
+    const mapped = mapExecutorError(
+      new Error("ENOENT: no such file or directory, open '/etc/shadow'"),
+    );
+    expect(mapped.category).toBe("internal");
+    expect(mapped.message).not.toContain("/etc/shadow");
+    expect(mapped.message).not.toContain("ENOENT");
+  });
+
+  it("uses the supplied fallback message", () => {
+    const mapped = mapExecutorError(
+      new Error("anything weird"),
+      "Custom fallback.",
+    );
+    expect(mapped.category).toBe("internal");
+    expect(mapped.message).toBe("Custom fallback.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requireString (input validation) — Phase 9.4 contract
 // ---------------------------------------------------------------------------
 
 describe("requireString", () => {
@@ -140,29 +289,36 @@ describe("requireString", () => {
     if (result.ok) expect(result.value).toBe("/tmp");
   });
 
-  it("rejects missing fields", () => {
+  it("rejects missing fields with category=validation", () => {
     const result = requireString({}, "path");
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.code).toBe("common/bad-request");
+      expect(result.error.category).toBe("validation");
+      expect(result.error.code).toBe(ToolErrorCode.InvalidInput);
       expect(result.error.status).toBe(400);
     }
   });
 
-  it("rejects non-string values", () => {
-    expect(requireString({ path: 42 }, "path").ok).toBe(false);
-    expect(requireString({ path: [] }, "path").ok).toBe(false);
-    expect(requireString({ path: {} }, "path").ok).toBe(false);
-    expect(requireString({ path: null }, "path").ok).toBe(false);
+  it("rejects non-string values with category=validation", () => {
+    for (const value of [42, [], {}, null]) {
+      const result = requireString({ path: value }, "path");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.category).toBe("validation");
+      }
+    }
   });
 
-  it("rejects empty strings", () => {
-    expect(requireString({ path: "" }, "path").ok).toBe(false);
+  it("rejects empty strings with category=validation", () => {
+    const result = requireString({ path: "" }, "path");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.category).toBe("validation");
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// list_directory
+// list_directory handler
 // ---------------------------------------------------------------------------
 
 describe("list_directory handler", () => {
@@ -199,26 +355,28 @@ describe("list_directory handler", () => {
     expect(fake.calls.listDirectory).toEqual(["/home"]);
   });
 
-  it("rejects a missing path field", async () => {
+  it("rejects a missing path field with category=validation", async () => {
     const result = await handlers.list_directory({}, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidInput);
     expect(fake.calls.listDirectory).toEqual([]);
   });
 
-  it("rejects a non-string path", async () => {
+  it("rejects a non-string path with category=validation", async () => {
     const result = await handlers.list_directory(
       { path: 42 },
       makeContext(),
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidInput);
     expect(fake.calls.listDirectory).toEqual([]);
   });
 
-  it("projects an executor 'not found' error to the public envelope", async () => {
+  it("projects an executor 'not found' to category=not_found", async () => {
     fake.throwFor.listDirectory = new Error(
       "The file or folder does not exist.",
     );
@@ -228,11 +386,11 @@ describe("list_directory handler", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/not-found");
+    expect(result.error.category).toBe("not_found");
     expect(result.error.status).toBe(404);
   });
 
-  it("projects an executor 'permission denied' error", async () => {
+  it("projects an executor 'permission denied' to category=security", async () => {
     fake.throwFor.listDirectory = new Error("Permission denied.");
     const result = await handlers.list_directory(
       { path: "/locked" },
@@ -240,33 +398,25 @@ describe("list_directory handler", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/permission-denied");
+    expect(result.error.category).toBe("security");
     expect(result.error.status).toBe(403);
   });
 
-  it("projects an unknown executor error without leaking internals", async () => {
-    // Production-shaped error: the Rust service returns user-safe English
-    // strings on failure. We project the "does not exist" shape to
-    // filesystem/not-found and the public message is the same user-safe
-    // text. Any internal detail would be a regression.
-    fake.throwFor.listDirectory = new Error(
-      "The file or folder does not exist.",
-    );
+  it("projects an executor 'not a directory' to category=validation", async () => {
+    fake.throwFor.listDirectory = new Error("The path is not a folder.");
     const result = await handlers.list_directory(
-      { path: "/etc" },
+      { path: "/file.txt" },
       makeContext(),
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/not-found");
-    // No internal detail leaks.
-    expect(result.error.message).not.toContain("ENOENT");
-    expect(result.error.message).not.toContain("/etc/shadow");
+    expect(result.error.category).toBe("validation");
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// search_files
+// search_files handler
 // ---------------------------------------------------------------------------
 
 describe("search_files handler", () => {
@@ -298,29 +448,29 @@ describe("search_files handler", () => {
     expect(fake.calls.searchFiles).toEqual(["notes"]);
   });
 
-  it("rejects a missing query field", async () => {
+  it("rejects a missing query field with category=validation", async () => {
     const result = await handlers.search_files({}, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
-    expect(fake.calls.searchFiles).toEqual([]);
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidInput);
   });
 
-  it("rejects an empty query", async () => {
+  it("rejects an empty query with category=validation", async () => {
     const result = await handlers.search_files({ query: "" }, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("rejects a non-string query", async () => {
+  it("rejects a non-string query with category=validation", async () => {
     const result = await handlers.search_files({ query: 42 }, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("projects an executor 'not allowed' error", async () => {
+  it("projects an executor 'access not permitted' to category=security", async () => {
     fake.throwFor.searchFiles = new Error(
       "Access to this path is not permitted.",
     );
@@ -330,13 +480,14 @@ describe("search_files handler", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/not-allowed");
+    expect(result.error.category).toBe("security");
     expect(result.error.status).toBe(403);
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// get_file_metadata
+// get_file_metadata handler
 // ---------------------------------------------------------------------------
 
 describe("get_file_metadata handler", () => {
@@ -367,24 +518,24 @@ describe("get_file_metadata handler", () => {
     expect(fake.calls.getFileMetadata).toEqual(["/home/notes.txt"]);
   });
 
-  it("rejects a missing path field", async () => {
+  it("rejects a missing path field with category=validation", async () => {
     const result = await handlers.get_file_metadata({}, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("rejects a non-string path", async () => {
+  it("rejects a non-string path with category=validation", async () => {
     const result = await handlers.get_file_metadata(
       { path: 42 },
       makeContext(),
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("projects an executor 'not found' error", async () => {
+  it("projects an executor 'not found' to category=not_found", async () => {
     fake.throwFor.getFileMetadata = new Error(
       "The file or folder does not exist.",
     );
@@ -394,12 +545,23 @@ describe("get_file_metadata handler", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/not-found");
+    expect(result.error.category).toBe("not_found");
+  });
+
+  it("projects an executor 'permission denied' to category=security", async () => {
+    fake.throwFor.getFileMetadata = new Error("Permission denied.");
+    const result = await handlers.get_file_metadata(
+      { path: "/locked" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("security");
   });
 });
 
 // ---------------------------------------------------------------------------
-// read_file
+// read_file handler
 // ---------------------------------------------------------------------------
 
 describe("read_file handler", () => {
@@ -421,28 +583,44 @@ describe("read_file handler", () => {
     expect(fake.calls.readFile).toEqual(["/home/notes.txt"]);
   });
 
-  it("rejects a missing path field", async () => {
+  it("rejects a missing path field with category=validation", async () => {
     const result = await handlers.read_file({}, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("rejects a non-string path", async () => {
+  it("rejects a non-string path with category=validation", async () => {
     const result = await handlers.read_file({ path: [] }, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("common/bad-request");
+    expect(result.error.category).toBe("validation");
   });
 
-  it("projects an executor 'not a file' error", async () => {
+  it("projects an executor 'not a file' to category=validation", async () => {
     fake.throwFor.readFile = new Error(
       "The selected path is a folder, not a file.",
     );
     const result = await handlers.read_file({ path: "/home" }, makeContext());
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("filesystem/not-a-file");
+    expect(result.error.category).toBe("validation");
+  });
+
+  it("projects an executor 'not found' to category=not_found", async () => {
+    fake.throwFor.readFile = new Error("The file or folder does not exist.");
+    const result = await handlers.read_file({ path: "/nope" }, makeContext());
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("not_found");
+  });
+
+  it("projects an executor 'permission denied' to category=security", async () => {
+    fake.throwFor.readFile = new Error("Permission denied.");
+    const result = await handlers.read_file({ path: "/x" }, makeContext());
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("security");
   });
 });
 
@@ -496,7 +674,7 @@ describe("dispatchTool", () => {
     expect(fake.calls.readFile).toEqual(["/home/notes.txt"]);
   });
 
-  it("returns a structured failure for an unknown tool name", async () => {
+  it("returns category=unknown_tool for an unknown tool name", async () => {
     const result = await dispatchTool(
       registry,
       "non_existent_tool",
@@ -505,14 +683,52 @@ describe("dispatchTool", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.code).toBe("tools/unknown-tool");
+    expect(result.error.category).toBe("unknown_tool");
+    expect(result.error.code).toBe(ToolErrorCode.UnknownTool);
     expect(result.error.status).toBe(400);
+    expect(result.error.message).toContain("non_existent_tool");
     expect(fake.calls).toEqual({
       listDirectory: [],
       searchFiles: [],
       getFileMetadata: [],
       readFile: [],
     });
+  });
+
+  it("preserves structured success data end-to-end", async () => {
+    const canned: DirectoryListing = {
+      path: "/home",
+      parentPath: null,
+      isHome: true,
+      items: [],
+    };
+    fake.respondWith.listDirectory = canned;
+    const result = await dispatchTool(
+      registry,
+      "list_directory",
+      { path: "/home" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw result.error;
+    // The exact structured payload is preserved through dispatch.
+    expect(result.data).toEqual(canned);
+  });
+
+  it("propagates handler-thrown ToolError categories through dispatch", async () => {
+    // Read_file on a directory → handler throws validation ToolError.
+    fake.throwFor.readFile = new Error(
+      "The selected path is a folder, not a file.",
+    );
+    const result = await dispatchTool(
+      registry,
+      "read_file",
+      { path: "/home" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
   });
 });
 
