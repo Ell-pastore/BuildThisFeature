@@ -72,6 +72,28 @@ export const config = {
     ),
   },
   /**
+   * Gemini (Google AI) provider settings (Phase 10.14).
+   *
+   * The API key is a production secret: read from the environment only,
+   * never committed. Model, base URL, and timeout mirror the Grok block —
+   * all operators can change them via `GEMINI_*` without a code change.
+   */
+  gemini: {
+    /** Gemini API key. `undefined` until `GEMINI_API_KEY` is set in env/.env. */
+    apiKey: envStringOrUndefined(process.env.GEMINI_API_KEY),
+    /** Model sent to the Gemini API. Default via configuration. */
+    model: process.env.GEMINI_MODEL ?? "gemini-3.5-flash",
+    /** Google AI Studio API base URL. */
+    baseUrl:
+      process.env.GEMINI_BASE_URL ??
+      "https://generativelanguage.googleapis.com/v1beta",
+    /** Request timeout in milliseconds (Phase 10.14 HTTP client). */
+    timeoutMs: Math.max(
+      1000,
+      intFromEnv(process.env.GEMINI_TIMEOUT_MS) ?? 60_000,
+    ),
+  },
+  /**
    * The name of the AI provider requested via configuration (Phase 10.10).
    * Operators set `AI_PROVIDER` to choose among the providers registered in
    * the provider-selection layer; the value is validated against the known

@@ -15,9 +15,9 @@
  *
  *   - NAMED REGISTRY ONLY: providers are registered under a typed
  *     `ProviderId` (from the `ProviderId` map — extend the map to add future
- *     providers such as `gemini`, `openrouter`, or `ollama`). Agent
- *     contracts (Phase 10.2 `AgentProvider`, Phase 10.4 loop, Phase 10.8
- *     persistence) are NEVER touched when a provider is added.
+ *     providers such as `openrouter` or `ollama`). Agent contracts (Phase 10.2
+ *     `AgentProvider`, Phase 10.4 loop, Phase 10.8 persistence) are NEVER
+ *     touched when a provider is added.
  *   - CONSTRUCTION IS SEPARATE FROM ORCHESTRATION: the registry produces
  *     providers through injectable factories. Orchestration (the agent loop,
  *     persistent turns) receives a ready `AgentProvider` and never imports
@@ -33,23 +33,27 @@
  *     typed `ProviderRegistryError` listing the registered ids; a configured
  *     name that is not a known provider id is rejected the same way.
  *
- * The default registry pre-registers the built-in Grok adapter (Phase 10.9)
- * backed by `config.grok`, so an operator needs only to set `GROK_API_KEY`
- * (and optional `AI_PROVIDER`). Future providers register next to it without
- * touching agent code.
+ * The default registry pre-registers the built-in Grok (Phase 10.9) and Gemini
+ * (Phase 10.14) adapters backed by `config.grok` / `config.gemini`, so an
+ * operator needs only to set the relevant API key (plus optional `AI_PROVIDER`
+ * to pick Gemini). Future providers register next to them without touching
+ * agent code.
  */
 import { config } from "../config.js";
 import type { AgentProvider } from "./provider.js";
 import { createGrokProvider } from "./grokProvider.js";
+import { createGeminiProvider } from "./geminiProvider.js";
 
 /**
  * The typed identifier for every provider the selection layer knows about.
- * Extend this const object (and nothing else) to add `gemini`,
- * `openrouter`, `ollama`, ... — the agent contracts remain untouched.
+ * Extend this const object (and nothing else) to add `openrouter`, `ollama`,
+ * ... — the agent contracts remain untouched.
  */
 export const ProviderId = {
   /** Grok — served by the xAI API through the Phase 10.9 adapter. */
   Grok: "grok",
+  /** Gemini — served by the Google AI Studio API through the Phase 10.14 adapter. */
+  Gemini: "gemini",
 } as const;
 
 /** The string union of every known provider id. */
@@ -206,9 +210,10 @@ export class ProviderRegistry {
 // ---------------------------------------------------------------------------
 
 /**
- * Register every built-in provider adapter. Currently only Grok (Phase 10.9),
- * built from the server's `config.grok` at resolution time. Future adapters
- * (Gemini, OpenRouter, Ollama) register here — no agent code changes.
+ * Register every built-in provider adapter. Currently Grok (Phase 10.9) and
+ * Gemini (Phase 10.14), each built from server configuration at resolution
+ * time. Future adapters (OpenRouter, Ollama) register here — no agent code
+ * changes.
  */
 export function registerBuiltinProviders(registry: ProviderRegistry): void {
   registry.register(ProviderId.Grok, () =>
@@ -217,6 +222,14 @@ export function registerBuiltinProviders(registry: ProviderRegistry): void {
       model: config.grok.model,
       baseUrl: config.grok.baseUrl,
       timeoutMs: config.grok.timeoutMs,
+    }),
+  );
+  registry.register(ProviderId.Gemini, () =>
+    createGeminiProvider({
+      apiKey: config.gemini.apiKey ?? "",
+      model: config.gemini.model,
+      baseUrl: config.gemini.baseUrl,
+      timeoutMs: config.gemini.timeoutMs,
     }),
   );
 }
@@ -235,7 +248,7 @@ export function createDefaultProviderRegistry(): ProviderRegistry {
  * @throws `ProviderRegistryError` (unknown) when the configured name is not
  *   a known provider id or has no registered factory.
  * @throws `ProviderError` (Authentication) when the selected provider is
- *   Grok but no `GROK_API_KEY` is configured.
+ *   Grok or Gemini but no `GROK_API_KEY` / `GEMINI_API_KEY` is configured.
  */
 export function resolveConfiguredProvider(
   registry: ProviderRegistry = createDefaultProviderRegistry(),
