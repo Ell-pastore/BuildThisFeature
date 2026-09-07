@@ -331,6 +331,7 @@ The AI layer is a first-class product surface, so its data model is explicit rat
 | `user_id` | uuid | required | FK → `users` **ON DELETE CASCADE** |
 | `title` | text | nullable | Auto-derived from the first message; user-renamable |
 | `created_at` / `updated_at` | timestamptz | required | `updated_at` bumps on new messages |
+| `max_tool_rounds` | int | required | DEFAULT `1`. Loop bound for the bounded agent tool loop (Phase 10.6 `maxToolRounds`), persisted so turn progress is reconstructible across sessions. |
 
 **Constraints & rules**
 
@@ -347,6 +348,9 @@ The AI layer is a first-class product surface, so its data model is explicit rat
 | `content` | text | required | Message text |
 | `metadata` | jsonb | nullable | Non-semantic data: model, token usage, latency |
 | `created_at` | timestamptz | required | |
+| `tool_calls` | jsonb | nullable | Structured tool-call intents for a provider round (Phase 10.7). Raw data only — never file contents. |
+| `tool_results` | jsonb | nullable | Structured results of the round's tool-call intents (Phase 10.7). |
+| `is_final` | boolean | required | DEFAULT `false`. `true` = the terminal agent response (final message). |
 
 **Constraints & rules**
 

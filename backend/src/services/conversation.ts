@@ -130,6 +130,16 @@ function assertText(text: unknown): string | undefined {
   return text;
 }
 
+/**
+ * Validate an untrusted value into the `AgentToolCall[]` contract. Returns a
+ * frozen copy, or `undefined` when the value is `undefined`. Throws `TypeError`
+ * on any malformed shape. Exported so persistence can gate writes with the same
+ * validators the state transitions use.
+ */
+export function validateToolCalls(toolCalls: unknown): readonly AgentToolCall[] | undefined {
+  return assertToolCalls(toolCalls);
+}
+
 function assertToolCalls(toolCalls: unknown): readonly AgentToolCall[] | undefined {
   if (toolCalls === undefined) return undefined;
   if (!Array.isArray(toolCalls)) {
@@ -157,6 +167,16 @@ function assertToolCalls(toolCalls: unknown): readonly AgentToolCall[] | undefin
     }
   }
   return freeze(toolCalls as AgentToolCall[]) as readonly AgentToolCall[];
+}
+
+/**
+ * Validate an untrusted value into the `AgentToolResult[]` contract. Returns a
+ * frozen copy. Throws `TypeError` on any malformed shape. Exported so
+ * persistence can gate writes with the same validators the state transitions
+ * use.
+ */
+export function validateToolResults(results: unknown): readonly AgentToolResult[] {
+  return assertToolResults(results);
 }
 
 function assertToolResults(results: unknown): readonly AgentToolResult[] {

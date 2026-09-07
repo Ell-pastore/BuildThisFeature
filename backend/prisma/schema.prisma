@@ -365,8 +365,12 @@ model AiConversation {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId    String   @map("user_id") @db.Uuid
   title     String? // auto-derived from the first message; user-renamable
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz // bumps on new messages
+  // Phase 10.7: strict bound for the bounded agent tool loop, so a persisted
+  // conversation can reconstruct its turn progress without re-implementing
+  // the loop. Enduring per-conversation, not per-turn.
+  maxToolRounds Int      @default(1) @map("max_tool_rounds")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @default(now()) @map("updated_at") @db.Timestamptz // bumps on new messages
 
   user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages       AiMessage[]
@@ -391,7 +395,16 @@ model AiMessage {
   content        String
   // jsonb. Non-semantic data: model, token usage, latency.
   metadata       Json?
-  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  // Phase 10.7: structured turn data for the bounded agent tool loop
+  // (Phase 10.6 state). One ai_messages row per recorded step (instruction =
+  // role 'user'; provider round = role 'assistant' with tool_calls and its
+  // tool_results; terminal reply = role 'assistant' with is_final = true).
+  // Raw tool data is JSONB: intents, structured results, exact
+  // file_id/version_id references — never file contents.
+  toolCalls   Json?   @map("tool_calls")
+  toolResults Json?   @map("tool_results")
+  isFinal     Boolean @default(false) @map("is_final")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   conversation   AiConversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   fileReferences AiFileReference[]
