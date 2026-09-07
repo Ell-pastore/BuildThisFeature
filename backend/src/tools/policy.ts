@@ -140,6 +140,55 @@ export function authenticatedAiAgent(
 }
 
 /**
+ * Build a `ToolExecutionContext` from the authenticated application
+ * user established by `requireAuth` (Phase 7).
+ *
+ * This is the single bridge between the session layer (`core/auth.ts`)
+ * and the tool execution layer. It is called at the START of any
+ * request that will run tool dispatch, immediately after `getCurrentUser`
+ * has verified the session is valid.
+ *
+ * The actor kind defaults to `"ai-agent"`. The `deviceId` and
+ * `sessionId` options are available for future per-device / audit
+ * policies that Phase 9.6 does not yet enforce.
+ *
+ * # Phase 9.7 scope
+ *
+ * This function creates the context — it does NOT validate the user's
+ * status. That is the job of `defaultToolPolicy()`, which reads the
+ * `status` field from the identity and denies inactive users. The
+ * two functions are separate by design: context creation and context
+ * policy are distinct concerns.
+ *
+ * # Trust model
+ *
+ * The identity fields (`userId`, `email`, `displayName`, `status`) come
+ * from the database (via `requireAuth`). They are NOT read from the
+ * incoming request body. A caller cannot supply fake identity data
+ * through this function.
+ *
+ * @param user — an `AuthUser` (from `getCurrentUser(c)`) or any value
+ *               that satisfies `AuthenticatedUserLike`.
+ * @param actorKind — the actor kind. Defaults to `"ai-agent"`. The
+ *                    `user` kind is not yet supported; the policy
+ *                    will deny it until tool handlers exist for it.
+ * @param options — optional `deviceId` / `sessionId` for future
+ *                  per-device and audit-correlation policies.
+ */
+export function createToolExecutionContext(
+  user: AuthenticatedUserLike,
+  actorKind: "ai-agent" | "user" = "ai-agent",
+  options: { deviceId?: string; sessionId?: string } = {},
+): ToolExecutionContext {
+  return {
+    actor:
+      actorKind === "user"
+        ? { kind: "user" }
+        : authenticatedAiAgent(user, options),
+  };
+}
+
+/**
  * Per-call execution context the policy reads. This is distinct from
  * `ToolHandlerContext` (the handler's per-call context, which carries
  * the FilesystemExecutor) — the policy needs identity / actor
