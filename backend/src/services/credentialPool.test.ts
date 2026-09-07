@@ -318,3 +318,132 @@ describe("CredentialPool — separation from provider selection", () => {
     expect(JSON.stringify(provider)).not.toContain("secret");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. Rotation (Phase 10.12)
+// ---------------------------------------------------------------------------
+
+function poolWithTwo(): { pool: CredentialPool } {
+  const pool = new CredentialPool();
+  pool.register(ProviderId.Grok, "grok-a", "a");
+  pool.register(ProviderId.Grok, "grok-b", "b");
+  return { pool };
+}
+
+describe("CredentialPool — rotation", () => {
+  function poolWithThree(): { pool: CredentialPool } {
+    const pool = new CredentialPool();
+    pool.register(ProviderId.Grok, "grok-a", "a");
+    pool.register(ProviderId.Grok, "grok-b", "b");
+    pool.register(ProviderId.Grok, "grok-c", "c");
+    return { pool };
+  }
+
+  it("round-robins through credentials in deterministic registration order", () => {
+    const { pool } = poolWithThree();
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("grok-a");
+
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-b");
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("grok-b");
+
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-c");
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("grok-c");
+  });
+
+  it("advances only on an explicit rotate, never on obtain", () => {
+    const { pool } = poolWithThree();
+    const before = pool.obtain(ProviderId.Grok);
+    pool.obtain(ProviderId.Grok);
+    pool.obtain(ProviderId.Grok);
+    expect(pool.reveal(before)).toBe("grok-a");
+
+    pool.rotate(ProviderId.Grok);
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("grok-b");
+  });
+
+  it("cycles back to the first credential after a full round", () => {
+    const { pool } = poolWithThree();
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-b");
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-c");
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-a");
+  });
+
+  it("keeps repeated rotation cycling deterministically", () => {
+    const { pool } = poolWithTwo();
+    const revealed = (handle: OpaqueCredential) => pool.reveal(handle);
+    expect(revealed(pool.rotate(ProviderId.Grok))).toBe("grok-b");
+    expect(revealed(pool.rotate(ProviderId.Grok))).toBe("grok-a");
+    expect(revealed(pool.rotate(ProviderId.Grok))).toBe("grok-b");
+    expect(revealed(pool.rotate(ProviderId.Grok))).toBe("grok-a");
+  });
+
+  it("isolates rotation state per provider", () => {
+    const pool = new CredentialPool();
+    pool.register(ProviderId.Grok, "grok-a", "a");
+    pool.register(ProviderId.Grok, "grok-b", "b");
+    pool.register("gemini" as ProviderId, "gemini-x", "x");
+    pool.register("gemini" as ProviderId, "gemini-y", "y");
+
+    // Rotating grok must not touch gemini's pointer.
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("grok-b");
+    expect(pool.reveal(pool.obtain("gemini" as ProviderId))).toBe("gemini-x");
+
+    expect(pool.reveal(pool.rotate("gemini" as ProviderId))).toBe("gemini-y");
+    expect(pool.reveal(pool.obtain("gemini" as ProviderId))).toBe("gemini-y");
+
+    // grok stayed where rotation left it.
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("grok-b");
+  });
+
+  it("handles a single-credential provider by staying on it", () => {
+    const pool = new CredentialPool();
+    pool.register(ProviderId.Grok, "only-one", "only");
+
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("only-one");
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("only-one");
+    expect(pool.reveal(pool.rotate(ProviderId.Grok))).toBe("only-one");
+    expect(pool.reveal(pool.obtain(ProviderId.Grok))).toBe("only-one");
+  });
+
+  it("fails like obtain for a provider with no credentials", () => {
+    const pool = new CredentialPool();
+    try {
+      pool.rotate(ProviderId.Grok);
+      expect.unreachable("rotate on empty provider must throw");
+    } catch (error) {
+      expect(isCredentialPoolError(error)).toBe(true);
+      const err = error as CredentialPoolError;
+      expect(err.code).toBe("credential-pool/missing-credentials");
+    }
+  });
+
+  it("returns genuine handles that reveal and stay opaque", () => {
+    const { pool } = poolWithThree();
+    const handle = pool.rotate(ProviderId.Grok);
+
+    expect(pool.reveal(handle)).toBe("grok-b");
+    expect(Object.keys(handle)).toEqual(["id", "provider"]);
+    expect(JSON.stringify(handle)).not.toContain("grok-b");
+    expect(JSON.stringify(handle)).not.toContain("grok-a");
+  });
+
+  it("still rejects forged handles after rotation", () => {
+    const { pool } = poolWithThree();
+    pool.rotate(ProviderId.Grok);
+    const forged = {
+      id: "b",
+      provider: ProviderId.Grok,
+    } as unknown as OpaqueCredential;
+    expect(() => pool.reveal(forged)).toThrowError(CredentialPoolError);
+  });
+
+  it("never leaks secret values through rotation errors", () => {
+    const pool = new CredentialPool();
+    pool.register(ProviderId.Grok, FAKE_SECRET, "primary");
+    try {
+      pool.rotate("gemini" as ProviderId);
+    } catch (error) {
+      expectNoSecret(error);
+    }
+  });
+});

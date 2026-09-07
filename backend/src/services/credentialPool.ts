@@ -24,15 +24,21 @@
  *   - OPAQUE: the values a caller sees are branded handles carrying only an
  *     `id` and a `provider`. The secret itself is retrievable solely through
  *     `reveal()`, which requires a genuine handle produced by THIS pool.
- *   - DETERMINISTIC: selection is stable — `obtain()` always returns the
- *     first registered credential for the provider; `all()` exposes every
- *     handle in registration order so future rotation / fallback logic can
- *     iterate without touching `AgentProvider`.
+ *   - DETERMINISTIC: selection is stable — `obtain()` returns the CURRENT
+ *     credential (the first registered until rotation advances), and
+ *     `rotate()` advances a per-provider round-robin pointer EXPLICITLY —
+ *     nothing auto-rotates. `all()` exposes every handle in registration
+ *     order so future fallback logic can iterate without touching
+ *     `AgentProvider`.
  *   - NEVER LOGGED: this module never logs anything, and error messages and
  *     tests carry only provider ids and credential IDs — never values.
  *
- * The pool itself performs no network I/O, no key rotation, and no
- * automatic fallback — those are future hooks on top of `all()`.
+ * Rotation (Phase 10.12) is a PURE SELECTION concern: round-robin order over
+ * the registration list, an explicitly requested advance, per-provider
+ * isolated state. The pool decides nothing about WHEN to rotate — that
+ * decision (e.g. reacting to HTTP/provider errors) stays entirely outside
+ * this module. The pool performs no network I/O, no automatic fallback, and
+ * no rotation unless `rotate()` is called.
  */
 import { ProviderId } from "./providerSelection.js";
 import type { ProviderId as ProviderIdType } from "./providerSelection.js";
@@ -161,13 +167,18 @@ export function isCredentialPoolError(
 /**
  * A pool of opaque credentials keyed by provider. Registration is exclusive
  * per provider+id, and selection is deterministic: `obtain()` returns the
- * first registered credential for the provider.
+ * CURRENT credential (first registered until `rotate()` advances to the
+ * next, round-robin). Rotation state is isolated per provider and advances
+ * only when explicitly requested.
  */
 export class CredentialPool {
   private readonly credentials = new Map<
     ProviderIdType,
     RegisteredCredential[]
   >();
+
+  /** Per-provider rotation pointer: index into the registration list. */
+  private readonly rotation = new Map<ProviderIdType, number>();
 
   /** The provider ids that currently have at least one credential. */
   get registeredProviders(): readonly ProviderIdType[] {
@@ -216,17 +227,49 @@ export class CredentialPool {
   }
 
   /**
-   * Deterministically select a credential for the provider: the first one
-   * registered. Repeated calls return the same handle until the set changes.
+   * Deterministically select the CURRENT credential for the provider —
+   * the first registered until `rotate()` is called. `obtain()` NEVER
+   * advances rotation; repeated calls return the same handle until an
+   * explicit `rotate()`.
    *
    * @throws `CredentialPoolError` (missing) when the provider has none.
    */
   obtain(provider: ProviderIdType): OpaqueCredential {
-    const first = this.credentials.get(provider)?.[0];
-    if (first === undefined) {
+    const list = this.credentials.get(provider);
+    if (list === undefined || list.length === 0) {
       throw CredentialPoolError.missing(provider);
     }
-    return toHandle(first);
+    const index = (this.rotation.get(provider) ?? 0) % list.length;
+    const entry = list[index];
+    if (entry === undefined) {
+      throw CredentialPoolError.missing(provider);
+    }
+    return toHandle(entry);
+  }
+
+  /**
+   * Explicitly advance the provider's round-robin pointer to the NEXT
+   * credential and return it (already advanced — the caller need not call
+   * `obtain()` again). With one credential the pointer cycles back onto the
+   * same credential; with zero it behaves exactly like `obtain()`.
+   *
+   * Rotation state is per provider and NEVER advances implicitly — nothing
+   * in this module decides when a credential should rotate.
+   *
+   * @throws `CredentialPoolError` (missing) when the provider has none.
+   */
+  rotate(provider: ProviderIdType): OpaqueCredential {
+    const list = this.credentials.get(provider);
+    if (list === undefined || list.length === 0) {
+      throw CredentialPoolError.missing(provider);
+    }
+    const next = ((this.rotation.get(provider) ?? 0) + 1) % list.length;
+    this.rotation.set(provider, next);
+    const entry = list[next];
+    if (entry === undefined) {
+      throw CredentialPoolError.missing(provider);
+    }
+    return toHandle(entry);
   }
 
   /**
