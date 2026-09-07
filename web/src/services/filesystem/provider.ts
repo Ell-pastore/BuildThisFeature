@@ -100,4 +100,13 @@ export interface FilesystemProvider {
   /** Recursively search filenames across all allowed roots. Returns both files and directories
    * whose names contain the (case-insensitive) query. Empty query returns an empty array. */
   searchFiles(query: string): Promise<FileItem[]>;
+
+  /** Move an authorized file or folder into the application-managed trash. */
+  trashItem(path: string): Promise<void>;
+
+  /** Restore a genuine trash entry to its recorded original location. Resolves to the restored path. */
+  restoreItem(trashedPath: string): Promise<string>;
+
+  /** Duplicate an item into the same parent with a collision-safe name: `name (copy).ext`, then `name (copy 2).ext`, etc. */
+  duplicateItem(path: string): Promise<string>;
 }

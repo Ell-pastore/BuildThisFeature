@@ -127,4 +127,16 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
       entries.map(mapEntry),
     );
   }
+
+  trashItem(path: string): Promise<void> {
+    return invoke<void>("trash_item", { path });
+  }
+
+  restoreItem(trashedPath: string): Promise<string> {
+    return invoke<string>("restore_item", { trashedPath });
+  }
+
+  duplicateItem(path: string): Promise<string> {
+    return invoke<string>("duplicate_item", { path });
+  }
 }

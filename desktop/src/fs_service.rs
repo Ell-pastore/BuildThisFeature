@@ -25,7 +25,7 @@
 //! [`ensure_allowed`] before touching the filesystem. Membership is based on
 //! canonical filesystem location; an empty registry denies every path.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1079,6 +1079,341 @@ pub fn search_files(allow_list: &AllowList, query: &str) -> Result<Vec<FileEntry
     results.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate
+// ---------------------------------------------------------------------------
+
+/// Compute a collision-safe duplicate name inside `parent` for `name`.
+///
+/// Produces `name (copy).ext`, then `name (copy 2).ext`, `name (copy 3).ext`, …
+/// Never overwrites an existing item. Component-aware Path comparison.
+fn unique_duplicate_name(parent: &Path, name: &str) -> PathBuf {
+    let dot_pos = name.rfind('.');
+    let (stem, ext) = match dot_pos {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+
+    let first = parent.join(format!("{} (copy){}", stem, ext));
+    if !first.exists() {
+        return first;
+    }
+
+    let mut n = 2u32;
+    loop {
+        let candidate = parent.join(format!("{} (copy {}){}", stem, n, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+        if n > 1_000_000 {
+            panic!("Unable to allocate a unique duplicate name");
+        }
+    }
+}
+
+/// Duplicate a file or folder into the same parent directory with a
+/// collision-safe name: `name (copy).ext`, then `name (copy 2).ext`, etc.
+///
+/// # Security order
+///
+/// 1. canonicalize the source,
+/// 2. `ensure_allowed` on the canonical source,
+/// 3. compute a collision-safe destination in the same parent,
+/// 4. copy (files via `fs::copy`, directories recursively),
+/// 5. return the canonical new path.
+pub fn duplicate_item(allow_list: &AllowList, source: &str) -> Result<String, String> {
+    let target = Path::new(source);
+    if !target.exists() {
+        return Err("The file or folder no longer exists.".to_string());
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to duplicate: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+
+    let parent = canonical
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "Unable to duplicate: the source has no parent".to_string())?;
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "Invalid source item".to_string())?;
+
+    let destination = unique_duplicate_name(parent, &name);
+
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| format!("Unable to duplicate: {}", map_io_error(&e)))?;
+
+    if meta.is_dir() {
+        let dest_name = destination.file_name().unwrap().to_string_lossy();
+        copy_dir_recursive(&canonical, parent, &dest_name)?;
+    } else {
+        fs::copy(&canonical, &destination)
+            .map_err(|e| format!("Unable to duplicate: {}", map_io_error(&e)))?;
+    }
+
+    Ok(destination.to_string_lossy().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Trash and restore
+// ---------------------------------------------------------------------------
+
+/// The directory name of the application-managed trash inside the user's home.
+pub const TRASH_DIR_NAME: &str = ".trash-smart-file-manager";
+
+/// The configured location of the application's trash directory.
+///
+/// This is configuration/location state ONLY — it is NOT an authorization
+/// mechanism. [`AllowList`] remains the sole filesystem authorization boundary.
+pub struct TrashRoot {
+    root: PathBuf,
+}
+
+impl TrashRoot {
+    /// Read-only access to the configured trash root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// An empty-root tombstone used when the trash cannot be configured.
+    /// Every trash/restore operation on it is denied (fail closed).
+    pub fn empty() -> Self {
+        TrashRoot {
+            root: PathBuf::from(""),
+        }
+    }
+}
+
+/// Sidecar metadata recording a trashed item's original location.
+///
+/// Serialized as a small JSON object into a file placed next to the trashed
+/// entry. `original_path` is the canonical path the item was moved from.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashSidecar {
+    original_path: String,
+}
+
+/// Compute the canonical application trash root under the user's home directory
+/// and create it if it does not exist yet.
+///
+/// Returns `None` when the home directory cannot be determined or the trash
+/// directory cannot be created/canonicalized — the caller must manage a
+/// fail-closed placeholder so every trash operation is denied.
+pub fn make_canonical_trash_root() -> Option<TrashRoot> {
+    let home = dirs::home_dir();
+    match home {
+        None => None,
+        Some(home_path) => {
+            let canonical_home = home_path.canonicalize().ok();
+            match canonical_home {
+                None => None,
+                Some(canonical_home) => {
+                    let trash_path: PathBuf = canonical_home.join(TRASH_DIR_NAME);
+                    let _ = fs::create_dir_all(&trash_path);
+                    match trash_path.canonicalize() {
+                        Ok(canonical_trash) => Some(TrashRoot {
+                            root: canonical_trash,
+                        }),
+                        Err(_) => None,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compute the sidecar file path sitting next to a trashed item.
+fn sidecar_path_for(item: &Path) -> PathBuf {
+    let name = item
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "item".to_string());
+    item.with_file_name(format!("{}.trash.json", name))
+}
+
+/// Write the sidecar metadata for a trashed item.
+fn write_sidecar(sidecar: &Path, original_path: &Path) -> Result<(), String> {
+    let meta = TrashSidecar {
+        original_path: original_path.to_string_lossy().to_string(),
+    };
+    let json = serde_json::to_string(&meta)
+        .map_err(|_| "Unable to trash: failed to serialize metadata".to_string())?;
+    fs::write(sidecar, json.as_bytes())
+        .map_err(|e| format!("Unable to trash: {}", map_io_error(&e)))
+}
+
+/// Read and validate the sidecar metadata for a trashed item.
+fn read_sidecar(sidecar: &Path) -> Result<TrashSidecar, String> {
+    let bytes =
+        fs::read(sidecar).map_err(|e| format!("Unable to restore: {}", map_io_error(&e)))?;
+    let text = String::from_utf8(bytes).map_err(|_| "Trash metadata is corrupt".to_string())?;
+    serde_json::from_str::<TrashSidecar>(text.as_str())
+        .map_err(|_| "Trash metadata is corrupt".to_string())
+}
+
+/// Allocate a collision-safe destination name inside `trash_root` for `name`.
+///
+/// If the bare name is already taken (by an existing trash entry or sidecar),
+/// append " (1)", " (2)", ... until a free slot is found. Never overwrites.
+fn unique_trash_destination(trash_root: &Path, name: &str) -> Result<PathBuf, String> {
+    let first: PathBuf = trash_root.join(name);
+    if !first.exists() {
+        let sidecar = sidecar_path_for(&first);
+        if !sidecar.exists() {
+            return Ok(first);
+        }
+    }
+    for i in 1..100_000 {
+        let alt_name = format!("{} ({})", name, i);
+        let candidate: PathBuf = trash_root.join(&alt_name);
+        if !candidate.exists() {
+            let sidecar = sidecar_path_for(&candidate);
+            if !sidecar.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("Unable to allocate a unique trash name".to_string())
+}
+
+/// Move an authorized file or folder into the configured trash root.
+///
+/// # Security order
+///
+/// 1. canonicalize the source (resolves `..` and symlinked ancestors/leaf),
+/// 2. `ensure_allowed` on the canonical source (AllowList is the boundary),
+/// 3. reject the trash root itself,
+/// 4. reject any source that CONTAINS the trash root (component-aware),
+/// 5. collision-safe destination inside the trash,
+/// 6. move, then write the sidecar (rolling the move back if it fails).
+pub fn trash_item(trash: &TrashRoot, allow_list: &AllowList, path: &str) -> Result<(), String> {
+    if trash.root().as_os_str().is_empty() {
+        return Err("Trash is not configured".to_string());
+    }
+    let target = Path::new(path);
+    if !target.exists() {
+        return Err("The file or folder no longer exists.".to_string());
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to trash: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+
+    let trash_root = trash.root();
+
+    // Never trash the trash directory itself.
+    if canonical == trash_root {
+        return Err("Cannot trash the trash directory".to_string());
+    }
+    // Never trash a source that contains the trash directory (e.g. the user's
+    // home). Component-aware Path comparison — NOT string prefix matching.
+    if trash_root.starts_with(&canonical) {
+        return Err("Cannot trash a folder that contains the trash".to_string());
+    }
+
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "Invalid source item".to_string())?;
+    let destination = unique_trash_destination(trash_root, &name)?;
+
+    match fs::rename(&canonical, &destination) {
+        Ok(_) => (),
+        Err(e) => return Err(format!("Unable to trash: {}", map_io_error(&e))),
+    }
+
+    // Write the sidecar. If it fails, roll the move back so no item is left
+    // in an unexplained half-trashed state.
+    let sidecar = sidecar_path_for(&destination);
+    match write_sidecar(&sidecar, &canonical) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::rename(&destination, &canonical);
+            Err(e)
+        }
+    }
+}
+
+/// Restore a genuine trash entry to its recorded original location.
+///
+/// # Security order
+///
+/// 1. canonicalize the trashed path,
+/// 2. `ensure_allowed` (AllowList is the boundary),
+/// 3. PRIMARY CHECK: the canonical path must be inside the configured trash
+///    root (component-aware) — otherwise `Err("Not a trash entry")`,
+/// 4. only then read and validate the sidecar metadata,
+/// 5. canonicalize the original destination parent and `ensure_allowed` it,
+/// 6. the destination must not already exist,
+/// 7. rename back, remove the sidecar, return the restored canonical path.
+pub fn restore_item(
+    trash: &TrashRoot,
+    allow_list: &AllowList,
+    trashed_path: &str,
+) -> Result<String, String> {
+    if trash.root().as_os_str().is_empty() {
+        return Err("Trash is not configured".to_string());
+    }
+    let target = Path::new(trashed_path);
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to restore: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+
+    let trash_root = trash.root();
+    // PRIMARY CHECK: is this actually a trash entry? An arbitrary allowed
+    // path must never masquerade as a restore target.
+    let inside = canonical != trash_root && canonical.starts_with(trash_root);
+    if !inside {
+        return Err("Not a trash entry".to_string());
+    }
+
+    // Only after containment is established do we touch sidecar metadata.
+    let sidecar = sidecar_path_for(&canonical);
+    let meta = read_sidecar(&sidecar)?;
+
+    // Resolve and authorize the recorded original destination.
+    let original = Path::new(&meta.original_path);
+    let original_name = original
+        .file_name()
+        .ok_or_else(|| "Trash metadata is corrupt".to_string())?;
+    let original_parent = original
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "Trash metadata is corrupt".to_string())?
+        .canonicalize()
+        .map_err(|e| format!("Unable to restore: {}", map_io_error(&e)))?;
+    if !original_parent.is_dir() {
+        return Err("Unable to restore: the original folder is missing".to_string());
+    }
+    ensure_allowed(allow_list, &original_parent)?;
+
+    let destination = original_parent.join(original_name);
+    if destination.exists() {
+        return Err("A file or folder with that name already exists.".to_string());
+    }
+
+    match fs::rename(&canonical, &destination) {
+        Ok(()) => (),
+        Err(e) => return Err(format!("Unable to restore: {}", map_io_error(&e))),
+    }
+
+    // Clean up the sidecar. If cleanup fails, the item is already restored —
+    // report the failure clearly instead of pretending full success.
+    if let Err(e) = fs::remove_file(&sidecar) {
+        return Err(format!(
+            "The item was restored but its metadata could not be removed: {}",
+            map_io_error(&e)
+        ));
+    }
+
+    Ok(destination.to_string_lossy().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,5 +2642,562 @@ mod tests {
 
         let results = super::search_files(&allow, "hidden").unwrap();
         assert!(results.is_empty());
+    }
+
+    // -- trash / restore helpers -------------------------------------------
+
+    /// AllowList rooted at a temp dir, with a canonical `.trash` subdirectory
+    /// as the root (mirrors the canonical root computed at Tauri setup).
+    fn trash_for(tmp: &TempDir) -> TrashRoot {
+        let trash_path = tmp.child(".trash");
+        fs::create_dir_all(&trash_path).expect("create trash root");
+        let canonical = trash_path.canonicalize().expect("canonicalize trash root");
+        TrashRoot { root: canonical }
+    }
+
+    /// Canonical string form of a path (the temp dir may differ from its
+    /// canonical path on macOS, e.g. `/var` vs `/private/var`).
+    fn canonical_str(path: &Path) -> String {
+        path.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    // -- trash_item --------------------------------------------------------
+
+    #[test]
+    fn trash_a_file() {
+        let tmp = TempDir::new("trash_file");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        assert!(!tmp.child("foo.txt").exists());
+        assert!(tmp.child(".trash").join("foo.txt").is_file());
+        assert!(tmp.child(".trash").join("foo.txt.trash.json").is_file());
+    }
+
+    #[test]
+    fn trash_a_directory() {
+        let tmp = TempDir::new("trash_dir");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("proj").join("src")).unwrap();
+        write_file(&tmp.child("proj").join("src").join("a.txt"), "a");
+
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("proj"))).unwrap();
+
+        assert!(!tmp.child("proj").exists());
+        let moved = tmp.child(".trash").join("proj");
+        assert!(moved.is_dir());
+        assert!(moved.join("src").join("a.txt").is_file());
+        assert!(tmp.child(".trash").join("proj.trash.json").is_file());
+    }
+
+    #[test]
+    fn trash_collision_safe_naming() {
+        let tmp = TempDir::new("trash_collision");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "one");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        write_file(&tmp.child("foo.txt"), "two");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        assert!(tmp.child(".trash").join("foo.txt").is_file());
+        assert!(tmp.child(".trash").join("foo.txt (1)").is_file());
+        // The first item's bytes must remain intact (never overwritten).
+        let first = fs::read(&tmp.child(".trash").join("foo.txt")).unwrap();
+        assert_eq!(String::from_utf8(first).unwrap(), "one");
+    }
+
+    #[test]
+    fn trash_sidecar_records_original_path() {
+        let tmp = TempDir::new("trash_sidecar");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        let expected = canonical_str(&tmp.child("foo.txt"));
+
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        let sidecar_json =
+            String::from_utf8(fs::read(&tmp.child(".trash").join("foo.txt.trash.json")).unwrap())
+                .unwrap();
+        assert!(sidecar_json.contains(&expected));
+    }
+
+    #[test]
+    fn trash_missing_source() {
+        let tmp = TempDir::new("trash_missing");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::trash_item(&trash, &allow, &str_of(&tmp.child("ghost.txt"))).unwrap_err();
+        assert!(err.contains("no longer exists"));
+    }
+
+    #[test]
+    fn trash_source_outside_allowlist() {
+        let tmp = TempDir::new("trash_outside_r");
+        let outside = TempDir::new("trash_outside_o");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&outside.child("secret.txt"), "data");
+
+        let err =
+            super::trash_item(&trash, &allow, &str_of(&outside.child("secret.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("secret.txt").is_file());
+    }
+
+    #[test]
+    fn trash_empty_allowlist() {
+        let tmp = TempDir::new("trash_empty_al");
+        let trash = trash_for(&tmp);
+        let allow = AllowList::empty();
+        write_file(&tmp.child("foo.txt"), "data");
+
+        let err = super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(tmp.child("foo.txt").is_file());
+    }
+
+    #[test]
+    fn trash_rejects_trash_root_itself() {
+        let tmp = TempDir::new("trash_root_itself");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::trash_item(&trash, &allow, &str_of(&tmp.child(".trash"))).unwrap_err();
+        assert!(err.contains("Cannot trash the trash directory"));
+    }
+
+    #[test]
+    fn trash_rejects_folder_containing_trash() {
+        let tmp = TempDir::new("trash_home");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        // Trashing the home directory — which contains the trash — must fail.
+        let err = super::trash_item(&trash, &allow, &str_of(tmp.path())).unwrap_err();
+        assert!(err.contains("Cannot trash a folder that contains the trash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_symlink_outside_allowlist() {
+        let tmp = TempDir::new("trash_symlink");
+        let outside = TempDir::new("trash_symlink_out");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&outside.child("secret.txt"), "data");
+
+        std::os::unix::fs::symlink(&outside.child("secret.txt"), &tmp.child("link.txt")).unwrap();
+
+        let err = super::trash_item(&trash, &allow, &str_of(&tmp.child("link.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("secret.txt").is_file());
+    }
+
+    #[test]
+    fn trash_with_unconfigured_root() {
+        let tmp = TempDir::new("trash_unconfigured");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        let empty_trash = TrashRoot::empty();
+
+        let err =
+            super::trash_item(&empty_trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap_err();
+        assert!(err.contains("Trash is not configured"));
+        assert!(tmp.child("foo.txt").is_file());
+    }
+
+    // -- restore containment -----------------------------------------------
+
+    #[test]
+    fn restore_valid_direct_entry() {
+        let tmp = TempDir::new("restore_direct");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        let restored = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap();
+        assert_eq!(restored, canonical_str(&tmp.child("foo.txt")));
+    }
+
+    #[test]
+    fn restore_valid_nested_dir() {
+        let tmp = TempDir::new("restore_nested");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("proj").join("nested")).unwrap();
+        write_file(&tmp.child("proj").join("nested").join("a.txt"), "a");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("proj"))).unwrap();
+
+        let restored =
+            super::restore_item(&trash, &allow, &str_of(&tmp.child(".trash").join("proj")))
+                .unwrap();
+        assert_eq!(restored, canonical_str(&tmp.child("proj")));
+        assert!(tmp.child("proj").join("nested").join("a.txt").is_file());
+    }
+
+    #[test]
+    fn restore_rejects_trash_root_itself() {
+        let tmp = TempDir::new("restore_root_itself");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::restore_item(&trash, &allow, &str_of(&tmp.child(".trash"))).unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    #[test]
+    fn restore_rejects_home_directory() {
+        let tmp = TempDir::new("restore_home");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::restore_item(&trash, &allow, &str_of(tmp.path())).unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    #[test]
+    fn restore_rejects_arbitrary_allowed_file_outside_trash() {
+        let tmp = TempDir::new("restore_arbitrary");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("plain.txt"), "data");
+
+        let err =
+            super::restore_item(&trash, &allow, &str_of(&tmp.child("plain.txt"))).unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    #[test]
+    fn restore_rejects_sibling_dir_beside_trash() {
+        let tmp = TempDir::new("restore_sibling");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child(".trash-sibling")).unwrap();
+
+        let err =
+            super::restore_item(&trash, &allow, &str_of(&tmp.child(".trash-sibling"))).unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    #[test]
+    fn restore_rejects_ancestor_of_trash() {
+        let tmp = TempDir::new("restore_ancestor");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::restore_item(&trash, &allow, &str_of(tmp.path())).unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    // -- restore behavior --------------------------------------------------
+
+    #[test]
+    fn restore_successful_round_trip() {
+        let tmp = TempDir::new("restore_roundtrip");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "hello world");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+        assert!(!tmp.child("foo.txt").exists());
+
+        let restored = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap();
+        assert_eq!(restored, canonical_str(&tmp.child("foo.txt")));
+
+        // Original is back with identical content and the sidecar is gone.
+        assert!(tmp.child("foo.txt").is_file());
+        assert_eq!(
+            String::from_utf8(fs::read(&tmp.child("foo.txt")).unwrap()).unwrap(),
+            "hello world"
+        );
+        assert!(!tmp.child(".trash").join("foo.txt.trash.json").exists());
+    }
+
+    #[test]
+    fn restore_destination_collision() {
+        let tmp = TempDir::new("restore_collision");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "original");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        // A new file claims the original slot.
+        write_file(&tmp.child("foo.txt"), "newcomer");
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert!(err.contains("already exists"));
+        // Nothing was moved out of the trash and the sidecar remains.
+        assert!(tmp.child(".trash").join("foo.txt").is_file());
+        assert!(tmp.child(".trash").join("foo.txt.trash.json").is_file());
+    }
+
+    #[test]
+    fn restore_original_parent_missing() {
+        let tmp = TempDir::new("restore_parent_missing");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("docs")).unwrap();
+        write_file(&tmp.child("docs").join("file.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("docs").join("file.txt"))).unwrap();
+
+        fs::remove_dir_all(&tmp.child("docs")).unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("file.txt")),
+        )
+        .unwrap_err();
+        assert!(err.contains("Unable to restore"));
+    }
+
+    #[test]
+    fn restore_destination_outside_allowlist() {
+        let tmp = TempDir::new("restore_outside_dest_r");
+        let outside = TempDir::new("restore_outside_dest_o");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        // Tamper with the sidecar: point it at a path outside the AllowList.
+        let sidecar = sidecar_path_for(&tmp.child(".trash").join("foo.txt"));
+        write_file(&outside.child("evil.txt"), "data");
+        write_sidecar(&sidecar, &outside.child("evil.txt")).unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        // The item stays put in the trash — nothing escaped.
+        assert!(tmp.child(".trash").join("foo.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_destination_through_outside_symlink() {
+        let tmp = TempDir::new("restore_symlink_r");
+        let outside = TempDir::new("restore_symlink_o");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        // A symlink inside the allowed zone resolving OUTSIDE the AllowList.
+        write_file(&outside.child("evil.txt"), "data");
+        std::os::unix::fs::symlink(outside.path(), tmp.child("alias")).unwrap();
+
+        let sidecar = sidecar_path_for(&tmp.child(".trash").join("foo.txt"));
+        write_sidecar(&sidecar, &tmp.child("alias").join("evil.txt")).unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(tmp.child(".trash").join("foo.txt").is_file());
+    }
+
+    #[test]
+    fn restore_malformed_sidecar() {
+        let tmp = TempDir::new("restore_malformed");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        let sidecar = sidecar_path_for(&tmp.child(".trash").join("foo.txt"));
+        fs::write(&sidecar, b"this is not json").unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert!(err.contains("Trash metadata is corrupt"));
+    }
+
+    #[test]
+    fn restore_missing_sidecar() {
+        let tmp = TempDir::new("restore_missing_sidecar");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        fs::remove_file(&tmp.child(".trash").join("foo.txt.trash.json")).unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert!(err.contains("Unable to restore"));
+    }
+
+    #[test]
+    fn restore_empty_allowlist_cannot_authorize() {
+        let tmp = TempDir::new("restore_empty_al");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        let err = super::restore_item(
+            &trash,
+            &AllowList::empty(),
+            &str_of(&tmp.child(".trash").join("foo.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- duplicate_item ---------------------------------------------------
+
+    #[test]
+    fn duplicate_a_file() {
+        let tmp = TempDir::new("dup_file");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("note.txt"), "hello");
+
+        let new_path = super::duplicate_item(&allow, &str_of(&tmp.child("note.txt"))).unwrap();
+        assert!(new_path.ends_with("note (copy).txt"));
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(&tmp.child("note.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn duplicate_a_directory() {
+        let tmp = TempDir::new("dup_dir");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("docs").join("sub")).unwrap();
+        write_file(&tmp.child("docs").join("readme.md"), "# hi");
+
+        let new_path = super::duplicate_item(&allow, &str_of(&tmp.child("docs"))).unwrap();
+        assert!(new_path.ends_with("docs (copy)"));
+        assert!(Path::new(&new_path).join("sub").is_dir());
+        assert_eq!(
+            fs::read_to_string(Path::new(&new_path).join("readme.md")).unwrap(),
+            "# hi"
+        );
+    }
+
+    #[test]
+    fn duplicate_collision_safe_naming() {
+        let tmp = TempDir::new("dup_collision");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.txt"), "1");
+        write_file(&tmp.child("a (copy).txt"), "2");
+        write_file(&tmp.child("a (copy 2).txt"), "3");
+
+        let new_path = super::duplicate_item(&allow, &str_of(&tmp.child("a.txt"))).unwrap();
+        assert_eq!(new_path, canonical_str(&tmp.child("a (copy 3).txt")));
+    }
+
+    #[test]
+    fn duplicate_duplicate_name_avoids_existing() {
+        let tmp = TempDir::new("dup_avoids");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("x.txt"), "orig");
+        write_file(&tmp.child("x (copy).txt"), "existing");
+
+        let new_path = super::duplicate_item(&allow, &str_of(&tmp.child("x.txt"))).unwrap();
+        assert_eq!(new_path, canonical_str(&tmp.child("x (copy 2).txt")));
+        // Original must not be overwritten.
+        assert_eq!(
+            fs::read_to_string(&tmp.child("x (copy).txt")).unwrap(),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn duplicate_source_outside_allowlist() {
+        let tmp = TempDir::new("dup_outside");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("secret.txt"), "data");
+
+        let outside = std::env::temp_dir().join("sfm_outside_dup.txt");
+        fs::write(&outside, "outside").unwrap();
+        let err = super::duplicate_item(&allow, &outside.to_string_lossy()).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn duplicate_missing_source() {
+        let tmp = TempDir::new("dup_missing");
+        let allow = allow_for(&tmp);
+
+        let err = super::duplicate_item(&allow, &str_of(&tmp.child("nope.txt"))).unwrap_err();
+        assert!(err.contains("no longer exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn duplicate_symlink_outside_allowlist() {
+        let tmp = TempDir::new("dup_symlink");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("real.txt"), "data");
+
+        // Symlink inside the allowlist pointing outside.
+        std::os::unix::fs::symlink(
+            std::env::temp_dir().join("sfm_symlink_target.txt"),
+            tmp.child("link.txt"),
+        )
+        .unwrap();
+        fs::write(
+            std::env::temp_dir().join("sfm_symlink_target.txt"),
+            "outside",
+        )
+        .unwrap();
+
+        let err = super::duplicate_item(&allow, &str_of(&tmp.child("link.txt"))).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        let _ = fs::remove_file(std::env::temp_dir().join("sfm_symlink_target.txt"));
+    }
+
+    #[test]
+    fn duplicate_returns_canonical_path() {
+        let tmp = TempDir::new("dup_canon");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("f.txt"), "data");
+
+        let new_path = super::duplicate_item(&allow, &str_of(&tmp.child("f.txt"))).unwrap();
+        let canonical = Path::new(&new_path)
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(new_path, canonical);
+        assert!(Path::new(&new_path).is_file());
     }
 }

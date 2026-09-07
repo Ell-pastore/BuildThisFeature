@@ -136,6 +136,36 @@ fn search_files(
     fs_service::search_files(allow_list.inner(), &query)
 }
 
+/// Move an authorized file or folder into the application-managed trash.
+#[tauri::command]
+fn trash_item(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+    trash: tauri::State<fs_service::TrashRoot>,
+) -> Result<(), String> {
+    fs_service::trash_item(trash.inner(), allow_list.inner(), &path)
+}
+
+/// Restore a genuine trash entry to its recorded original location.
+#[tauri::command]
+fn restore_item(
+    trashed_path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+    trash: tauri::State<fs_service::TrashRoot>,
+) -> Result<String, String> {
+    fs_service::restore_item(trash.inner(), allow_list.inner(), &trashed_path)
+}
+
+/// Duplicate a file or folder into the same parent directory with a
+/// collision-safe name.
+#[tauri::command]
+fn duplicate_item(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<String, String> {
+    fs_service::duplicate_item(allow_list.inner(), &path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -151,6 +181,16 @@ pub fn run() {
             // the canonicalized user home directory (fail-closed on any error)
             // and expose it to commands via Tauri managed state.
             app.manage(fs_service::AllowList::with_default_root());
+            // The application-managed trash directory is computed once here and
+            // exposed as configuration state (not an authorization mechanism).
+            // If it cannot be created, an empty-root tombstone is managed so
+            // every trash/restore operation is denied (fail closed).
+            let trash_root = fs_service::make_canonical_trash_root();
+            let trash = match trash_root {
+                None => fs_service::TrashRoot::empty(),
+                Some(t) => t,
+            };
+            app.manage(trash);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -167,6 +207,9 @@ pub fn run() {
             read_file,
             write_file,
             search_files,
+            trash_item,
+            restore_item,
+            duplicate_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
