@@ -980,6 +980,43 @@ fn build_file_entry(path: &Path, meta: &fs::Metadata) -> FileEntry {
     }
 }
 
+/// Create an empty regular file at `path` within the AllowList boundary.
+///
+/// # Security order
+///
+/// 1. validate the final component (no `.`, `..`, path separators, empty),
+/// 2. canonicalize the parent directory (resolves `..` and symlinked ancestors),
+/// 3. `ensure_allowed` on the canonical parent,
+/// 4. reject if the target already exists (never overwrite),
+/// 5. create the file, return the canonical path.
+pub fn create_file(allow_list: &AllowList, path: &str) -> Result<String, String> {
+    let target = Path::new(path);
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Invalid file path".to_string())?;
+    let name = validate_item_name(name)?;
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Invalid file path".to_string())?;
+    let canonical_parent = canonical_dir(parent.to_str().unwrap_or(""))?;
+    ensure_allowed(allow_list, &canonical_parent)?;
+
+    let destination = canonical_parent.join(&name);
+    if destination.exists() {
+        return Err("A file or folder with that name already exists.".to_string());
+    }
+
+    fs::write(&destination, &[])
+        .map_err(|e| format!("Unable to create file: {}", map_io_error(&e)))?;
+
+    let canonical = destination
+        .canonicalize()
+        .map_err(|e| format!("Unable to create file: {}", map_io_error(&e)))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 /// Recurse into `dir`, collecting entries whose name contains `query_lower`.
 /// Only the already-authorized subtree rooted at the AllowList root is visited.
 ///
@@ -3199,5 +3236,155 @@ mod tests {
             .to_string();
         assert_eq!(new_path, canonical);
         assert!(Path::new(&new_path).is_file());
+    }
+
+    // -- create_file --------------------------------------------------------
+
+    #[test]
+    fn create_file_successful() {
+        let tmp = TempDir::new("create_file_ok");
+        let allow = allow_for(&tmp);
+        let target = tmp.child("new_doc.txt");
+
+        let canonical = super::create_file(&allow, &str_of(&target)).unwrap();
+        assert!(target.is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"");
+        assert_eq!(canonical, target.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn create_file_nested_path() {
+        let tmp = TempDir::new("create_file_nested");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("sub").join("nested")).unwrap();
+        let target = tmp.child("sub").join("nested").join("deep.txt");
+
+        let canonical = super::create_file(&allow, &str_of(&target)).unwrap();
+        assert!(target.is_file());
+        assert_eq!(canonical, target.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn create_file_invalid_name() {
+        let tmp = TempDir::new("create_file_inv_name");
+        let allow = allow_for(&tmp);
+
+        // Name with a separator inside the final component is rejected by
+        // the name validator before any filesystem call.
+        let err = super::create_file(&allow, &str_of(&tmp.child("a/b.txt"))).unwrap_err();
+        assert!(
+            err.contains("separators")
+                || err.contains("Invalid")
+                || err.contains("folder")
+                || err.contains("not a folder"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn create_file_existing_file() {
+        let tmp = TempDir::new("create_file_exists");
+        let allow = allow_for(&tmp);
+        let target = tmp.child("exists.txt");
+        write_file(&target, "already here");
+
+        let err = super::create_file(&allow, &str_of(&target)).unwrap_err();
+        assert!(err.contains("already exists"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "already here");
+    }
+
+    #[test]
+    fn create_file_existing_directory() {
+        let tmp = TempDir::new("create_file_dir_exists");
+        let allow = allow_for(&tmp);
+        let target = tmp.child("some_folder");
+        fs::create_dir_all(&target).unwrap();
+
+        let err = super::create_file(&allow, &str_of(&target)).unwrap_err();
+        assert!(err.contains("already exists"));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn create_file_outside_allowlist() {
+        let tmp = TempDir::new("create_file_inside");
+        let outside = TempDir::new("create_file_outside");
+        let allow = allow_for(&tmp);
+        let target = outside.child("unauth.txt");
+
+        let err = super::create_file(&allow, &str_of(&target)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn create_file_empty_allowlist() {
+        let tmp = TempDir::new("create_file_empty_al");
+        let allow = AllowList::empty();
+        let target = tmp.child("fail.txt");
+
+        let err = super::create_file(&allow, &str_of(&target)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn create_file_traversal() {
+        let tmp = TempDir::new("create_file_traversal");
+        let outside = TempDir::new("create_file_trav_out");
+        let allow = allow_for(&tmp);
+
+        // Attempting to escape via `..` from inside the allowed root to outside
+        let escape = tmp
+            .path()
+            .join("..")
+            .join(outside.path().file_name().unwrap())
+            .join("escape.txt");
+        let err = super::create_file(&allow, &str_of(&escape)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!escape.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_symlinked_parent_inside_and_outside() {
+        let root = TempDir::new("create_file_sym_root");
+        let outside = TempDir::new("create_file_sym_out");
+        let allow = allow_for(&root);
+
+        // 1. Symlinked parent pointing INSIDE allowed root -> allowed
+        fs::create_dir_all(root.child("real_dir")).unwrap();
+        std::os::unix::fs::symlink(root.child("real_dir"), root.child("link_inside")).unwrap();
+        let inside_target = root.child("link_inside").join("test_inside.txt");
+        let canonical = super::create_file(&allow, &str_of(&inside_target)).unwrap();
+        assert!(inside_target.is_file());
+        assert_eq!(
+            canonical,
+            root.child("real_dir")
+                .join("test_inside.txt")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        // 2. Symlinked parent pointing OUTSIDE allowed root -> denied
+        std::os::unix::fs::symlink(outside.path(), root.child("link_outside")).unwrap();
+        let outside_target = root.child("link_outside").join("test_outside.txt");
+        let err = super::create_file(&allow, &str_of(&outside_target)).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(!outside.child("test_outside.txt").exists());
+    }
+
+    #[test]
+    fn create_file_returns_canonical_path() {
+        let tmp = TempDir::new("create_file_canon");
+        let allow = allow_for(&tmp);
+        let target = tmp.child("canon_test.txt");
+
+        let ret = super::create_file(&allow, &str_of(&target)).unwrap();
+        let expected = target.canonicalize().unwrap().to_string_lossy().to_string();
+        assert_eq!(ret, expected);
+        assert!(Path::new(&ret).is_file());
     }
 }

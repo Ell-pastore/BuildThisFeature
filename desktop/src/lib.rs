@@ -166,6 +166,15 @@ fn duplicate_item(
     fs_service::duplicate_item(allow_list.inner(), &path)
 }
 
+/// Create an empty regular file within the AllowList boundary.
+#[tauri::command]
+fn create_file(
+    path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<String, String> {
+    fs_service::create_file(allow_list.inner(), &path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -210,6 +219,7 @@ pub fn run() {
             trash_item,
             restore_item,
             duplicate_item,
+            create_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

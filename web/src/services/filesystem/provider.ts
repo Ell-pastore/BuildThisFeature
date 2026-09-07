@@ -70,6 +70,9 @@ export interface FilesystemProvider {
   /** Create a new folder inside `dir`. */
   createFolder(dir: string, name: string): Promise<void>;
 
+  /** Create an empty file at the given path (full path including name). */
+  createFile(path: string): Promise<string>;
+
   /** Rename an item in place (name only — location is unchanged). */
   renameItem(from: string, newName: string): Promise<void>;
 

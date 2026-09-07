@@ -86,6 +86,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke("create_folder", { dir, name });
   }
 
+  createFile(path: string): Promise<string> {
+    return invoke<string>("create_file", { path });
+  }
+
   renameItem(from: string, newName: string): Promise<void> {
     return invoke("rename_item", { from, newName });
   }
