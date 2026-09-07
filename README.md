@@ -256,9 +256,9 @@ Phase 12  AI Permissions & Safety
 Phase 13  Backend / Cloud
 Phase 14  Synchronization
 Phase 15  Web Application
-Phase 16  Full UI / UX
-Phase 17  Production Hardening
-```
+Phase 16  Full UI / UX 
+Phase 17  Production Hardenings
+``` 
 
 Mobile is developed alongside the broader product but must integrate with these contracts rather than creating a parallel architecture.
 
