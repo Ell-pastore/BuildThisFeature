@@ -241,7 +241,9 @@ describe("ProviderId — typed identifiers", () => {
     expect(isProviderId("grok")).toBe(true);
     expect(KNOWN_PROVIDER_IDS).toContain("gemini");
     expect(isProviderId("gemini")).toBe(true);
-    expect(isProviderId("openrouter")).toBe(false);
+    expect(KNOWN_PROVIDER_IDS).toContain("openrouter");
+    expect(isProviderId("openrouter")).toBe(true);
+    expect(isProviderId("ollama")).toBe(false);
     expect(isProviderId("")).toBe(false);
   });
 });
@@ -251,11 +253,16 @@ describe("ProviderId — typed identifiers", () => {
 // ---------------------------------------------------------------------------
 
 describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
-  it("pre-registers the built-in Grok and Gemini providers", () => {
+  it("pre-registers the built-in Grok, Gemini, and OpenRouter providers", () => {
     const registry = createDefaultProviderRegistry();
     expect(registry.has(ProviderId.Grok)).toBe(true);
     expect(registry.has(ProviderId.Gemini)).toBe(true);
-    expect(registry.registeredProviderIds).toEqual(["grok", "gemini"]);
+    expect(registry.has(ProviderId.OpenRouter)).toBe(true);
+    expect(registry.registeredProviderIds).toEqual([
+      "grok",
+      "gemini",
+      "openrouter",
+    ]);
   });
 
   it("resolves the configured provider name through a supplied registry", () => {
@@ -271,9 +278,9 @@ describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
   });
 
   it("fails clearly when a built-in provider has no API key configured", () => {
-    // config.grok.apiKey / config.gemini.apiKey are undefined in the test
-    // environment → each built-in factory surfaces the typed ProviderError
-    // (Authentication) at resolve.
+    // config.grok.apiKey / config.gemini.apiKey / config.openrouter.apiKey are
+    // undefined in the test environment → each built-in factory surfaces the
+    // typed ProviderError (Authentication) at resolve.
     const registry = createDefaultProviderRegistry();
     expect(() =>
       registry.resolve({ provider: ProviderId.Grok }),
@@ -285,6 +292,14 @@ describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
     );
     expect(() =>
       registry.resolve({ provider: ProviderId.Gemini }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: ProviderErrorCode.Authentication,
+        retryable: false,
+      }),
+    );
+    expect(() =>
+      registry.resolve({ provider: ProviderId.OpenRouter }),
     ).toThrowError(
       expect.objectContaining({
         code: ProviderErrorCode.Authentication,

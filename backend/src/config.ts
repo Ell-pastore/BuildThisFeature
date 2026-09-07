@@ -94,6 +94,28 @@ export const config = {
     ),
   },
   /**
+   * OpenRouter provider settings (Phase 10.15).
+   *
+   * OpenRouter routes a single request to any upstream model, so the model
+   * slug is an operator choice (`OPENROUTER_MODEL`, e.g.
+   * "anthropic/claude-sonnet-4") — NOT hard-coded here or in the adapter.
+   * The API key is a production secret: read from the environment only,
+   * never committed.
+   */
+  openrouter: {
+    /** OpenRouter API key. `undefined` until `OPENROUTER_API_KEY` is set. */
+    apiKey: envStringOrUndefined(process.env.OPENROUTER_API_KEY),
+    /** Model slug sent to OpenRouter. None by default — configuring one is required. */
+    model: envStringOrUndefined(process.env.OPENROUTER_MODEL),
+    /** OpenRouter API base URL. */
+    baseUrl: process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1",
+    /** Request timeout in milliseconds (Phase 10.15 HTTP client). */
+    timeoutMs: Math.max(
+      1000,
+      intFromEnv(process.env.OPENROUTER_TIMEOUT_MS) ?? 60_000,
+    ),
+  },
+  /**
    * The name of the AI provider requested via configuration (Phase 10.10).
    * Operators set `AI_PROVIDER` to choose among the providers registered in
    * the provider-selection layer; the value is validated against the known

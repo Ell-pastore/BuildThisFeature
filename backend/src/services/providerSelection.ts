@@ -33,27 +33,31 @@
  *     typed `ProviderRegistryError` listing the registered ids; a configured
  *     name that is not a known provider id is rejected the same way.
  *
- * The default registry pre-registers the built-in Grok (Phase 10.9) and Gemini
- * (Phase 10.14) adapters backed by `config.grok` / `config.gemini`, so an
- * operator needs only to set the relevant API key (plus optional `AI_PROVIDER`
- * to pick Gemini). Future providers register next to them without touching
- * agent code.
+ * The default registry pre-registers the built-in Grok (Phase 10.9), Gemini
+ * (Phase 10.14), and OpenRouter (Phase 10.15) adapters backed by
+ * `config.grok` / `config.gemini` / `config.openrouter`, so an operator needs
+ * only to set the relevant API key (plus optional `AI_PROVIDER` to pick a
+ * non-default provider). Future providers register next to them without
+ * touching agent code.
  */
 import { config } from "../config.js";
 import type { AgentProvider } from "./provider.js";
 import { createGrokProvider } from "./grokProvider.js";
 import { createGeminiProvider } from "./geminiProvider.js";
+import { createOpenRouterProvider } from "./openrouterProvider.js";
 
 /**
  * The typed identifier for every provider the selection layer knows about.
- * Extend this const object (and nothing else) to add `openrouter`, `ollama`,
- * ... — the agent contracts remain untouched.
+ * Extend this const object (and nothing else) to add `ollama`, ... — the
+ * agent contracts remain untouched.
  */
 export const ProviderId = {
   /** Grok — served by the xAI API through the Phase 10.9 adapter. */
   Grok: "grok",
   /** Gemini — served by the Google AI Studio API through the Phase 10.14 adapter. */
   Gemini: "gemini",
+  /** OpenRouter — served by the OpenAI-compatible chat completions API through the Phase 10.15 adapter. */
+  OpenRouter: "openrouter",
 } as const;
 
 /** The string union of every known provider id. */
@@ -210,10 +214,10 @@ export class ProviderRegistry {
 // ---------------------------------------------------------------------------
 
 /**
- * Register every built-in provider adapter. Currently Grok (Phase 10.9) and
- * Gemini (Phase 10.14), each built from server configuration at resolution
- * time. Future adapters (OpenRouter, Ollama) register here — no agent code
- * changes.
+ * Register every built-in provider adapter. Currently Grok (Phase 10.9),
+ * Gemini (Phase 10.14), and OpenRouter (Phase 10.15), each built from server
+ * configuration at resolution time. Future adapters (Ollama) register here —
+ * no agent code changes.
  */
 export function registerBuiltinProviders(registry: ProviderRegistry): void {
   registry.register(ProviderId.Grok, () =>
@@ -232,6 +236,14 @@ export function registerBuiltinProviders(registry: ProviderRegistry): void {
       timeoutMs: config.gemini.timeoutMs,
     }),
   );
+  registry.register(ProviderId.OpenRouter, () =>
+    createOpenRouterProvider({
+      apiKey: config.openrouter.apiKey ?? "",
+      model: config.openrouter.model ?? "",
+      baseUrl: config.openrouter.baseUrl,
+      timeoutMs: config.openrouter.timeoutMs,
+    }),
+  );
 }
 
 /** A fresh registry pre-loaded with every built-in provider. */
@@ -247,8 +259,9 @@ export function createDefaultProviderRegistry(): ProviderRegistry {
  *
  * @throws `ProviderRegistryError` (unknown) when the configured name is not
  *   a known provider id or has no registered factory.
- * @throws `ProviderError` (Authentication) when the selected provider is
- *   Grok or Gemini but no `GROK_API_KEY` / `GEMINI_API_KEY` is configured.
+ * @throws `ProviderError` (Authentication / Internal) when the selected
+ *   provider is Grok, Gemini, or OpenRouter but its API key (or OpenRouter
+ *   model) is not configured.
  */
 export function resolveConfiguredProvider(
   registry: ProviderRegistry = createDefaultProviderRegistry(),
