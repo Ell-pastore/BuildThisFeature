@@ -216,6 +216,149 @@ export async function appendAgentFinal(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Atomic turn persistence (Phase 10.8)
+// ---------------------------------------------------------------------------
+
+/** One executed provider round to persist: text, intents, and results. */
+export interface AgentTurnRecord {
+  text?: string;
+  toolCalls?: readonly AgentToolCall[];
+  toolResults?: readonly AgentToolResult[];
+}
+
+export interface PersistAgentTurnInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** Present → resume this conversation (ownership enforced); absent → create a new one. */
+  conversationId?: string;
+  /** The user's instruction for this turn. Always persisted as the first row. */
+  instruction: string;
+  /** Loop bound used when CREATING a conversation (ignored when resuming). */
+  maxToolRounds: number;
+  /** Optional display title for newly created conversations. */
+  title?: string;
+  /** Executed provider rounds, in order. */
+  rounds: readonly AgentTurnRecord[];
+  /** The terminal agent reply. */
+  finalText: string;
+}
+
+export interface PersistAgentTurnResult {
+  /** The conversation id (existing or newly created). */
+  id: string;
+  /** True when a new conversation was created for this turn. */
+  created: boolean;
+}
+
+/** Validate ONE provider round through the Phase 10.6 validators. */
+function validateAgentRound(round: AgentTurnRecord): {
+  text?: string;
+  toolCalls?: readonly AgentToolCall[];
+  toolResults?: readonly AgentToolResult[];
+} {
+  const text = assertStoredText(round.text, "provider text");
+  const toolCalls = round.toolCalls === undefined ? undefined : validateToolCalls(round.toolCalls);
+  if (text === undefined && toolCalls === undefined) {
+    throw new TypeError("A provider round must include text or toolCalls.");
+  }
+  const toolResults =
+    round.toolResults === undefined ? undefined : validateToolResults(round.toolResults);
+  return {
+    ...(text !== undefined ? { text } : {}),
+    ...(toolCalls !== undefined ? { toolCalls } : {}),
+    ...(toolResults !== undefined ? { toolResults } : {}),
+  };
+}
+
+/**
+ * Persist a COMPLETE agent turn atomically (Phase 10.8): user instruction →
+ * executed provider rounds → terminal reply, all in ONE transaction. A new
+ * conversation is created when `conversationId` is absent; otherwise
+ * ownership is verified inside the same transaction (foreign/missing ids
+ * throw `AgentConversationNotFoundError`). Every row is committed or NONE is,
+ * so a failed turn can never leave a partial transcript. Inputs are validated
+ * up front through the phase 10.6 guards (`createConversationState`,
+ * `validateToolCalls`, `validateToolResults`) before any write.
+ *
+ * Rows share the transaction's timestamp, so `created_at` is sequenced
+ * explicitly to keep the (created_at, id) transcript order deterministic.
+ */
+export async function persistAgentTurn(
+  input: PersistAgentTurnInput,
+): Promise<PersistAgentTurnResult> {
+  const state = createConversationState({
+    instruction: input.instruction,
+    maxToolRounds: input.maxToolRounds,
+  });
+  const rounds = input.rounds.map(validateAgentRound);
+  const finalText = assertStoredText(input.finalText, "final text");
+  if (finalText === undefined) {
+    throw new TypeError("final text must be a non-empty string.");
+  }
+
+  const db = getDatabase();
+  return db.$transaction(async (tx) => {
+    let id: string;
+    let created: boolean;
+    if (input.conversationId === undefined) {
+      const conversation = await tx.aiConversation.create({
+        data: {
+          userId: input.userId,
+          maxToolRounds: state.maxToolRounds,
+          title: input.title ?? null,
+        },
+      });
+      id = conversation.id;
+      created = true;
+    } else {
+      const owned = await tx.aiConversation.findFirst({
+        where: { id: input.conversationId, userId: input.userId },
+        select: { id: true },
+      });
+      if (owned === null) throw new AgentConversationNotFoundError();
+      id = owned.id;
+      created = false;
+    }
+
+    const base = Date.now();
+    let step = 0;
+    const createdAt = () => new Date(base + step++);
+
+    await tx.aiMessage.create({
+      data: {
+        conversationId: id,
+        role: "user",
+        content: state.instruction,
+        createdAt: createdAt(),
+      },
+    });
+    for (const round of rounds) {
+      await tx.aiMessage.create({
+        data: {
+          conversationId: id,
+          role: "assistant",
+          content: round.text ?? "",
+          ...(round.toolCalls !== undefined ? { toolCalls: asJson(round.toolCalls) } : {}),
+          ...(round.toolResults !== undefined ? { toolResults: asJson(round.toolResults) } : {}),
+          createdAt: createdAt(),
+        },
+      });
+    }
+    await tx.aiMessage.create({
+      data: {
+        conversationId: id,
+        role: "assistant",
+        content: finalText,
+        isFinal: true,
+        createdAt: createdAt(),
+      },
+    });
+    await tx.aiConversation.update({ where: { id }, data: { updatedAt: new Date() } });
+    return { id, created };
+  });
+}
+
 /** Bump `updated_at` (the schema promises it bumps on new messages). */
 async function bumpUpdatedAt(
   tx: Prisma.TransactionClient,

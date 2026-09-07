@@ -37,7 +37,7 @@
  *     via `parseAgentRequest` and routed through `routeAgentResponse`, the
  *     same authenticated, policy-gated path a single turn uses.
  */
-import type { AgentToolResult } from "./agent.js";
+import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { AgentProviderRequest } from "./provider.js";
 import { routeAgentResponse } from "./provider.js";
 import type { OrchestratedTurnOptions } from "./orchestrator.js";
@@ -81,6 +81,26 @@ export interface AgentLoopOptions extends OrchestratedTurnOptions {
    * more is stopped with `AgentLoopError`. Must be a positive integer.
    */
   maxToolRounds: number;
+  /**
+   * Optional observer invoked once after every EXECUTED tool round with the
+   * provider's message for that round (text + intents), the round's
+   * structured results, and the running round count. Additive and optional —
+   * existing callers are unaffected when it is omitted. Lets persistence
+   * record the transcript without re-implementing the loop.
+   */
+  onRound?: (round: AgentLoopRound) => void;
+}
+
+/** What one executed tool round looked like, for observers. */
+export interface AgentLoopRound {
+  /** The provider's free-form text for the round, when it produced any. */
+  readonly text?: string;
+  /** The tool-call intents that were executed this round. */
+  readonly toolCalls: readonly AgentToolCall[];
+  /** The structured results of executing those intents, in order. */
+  readonly results: readonly AgentToolResult[];
+  /** The running number of tool-execution rounds performed so far. */
+  readonly toolRounds: number;
 }
 
 /** The result of a bounded agent tool loop. */
@@ -152,5 +172,11 @@ export async function runAgentLoop(
     toolRounds += 1;
     const roundResults = await routeAgentResponse(c, response, options);
     toolResults = [...toolResults, ...roundResults];
+    options.onRound?.({
+      text: response.text,
+      toolCalls: response.toolCalls,
+      results: roundResults,
+      toolRounds,
+    });
   }
 }

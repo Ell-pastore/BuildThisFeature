@@ -25,6 +25,7 @@ import {
   appendAgentTurn,
   createAgentConversation,
   loadAgentConversationState,
+  persistAgentTurn,
   reconstructConversationState,
 } from "./agentConversations.js";
 import { ToolError } from "../../tools/errors.js";
@@ -426,6 +427,163 @@ describe("agentConversations repository", () => {
           { role: "assistant", content: "Two", isFinal: true, createdAt: new Date(3000) },
         ]),
       ).toThrow(AgentConversationCorruptError);
+    });
+  });
+
+  describe("persistAgentTurn (atomic)", () => {
+    it("creates a conversation and writes instruction, rounds, and final in one transaction", async () => {
+      const result = await persistAgentTurn({
+        userId: ALICE,
+        instruction: "List my docs.",
+        maxToolRounds: 2,
+        title: "Docs listing",
+        rounds: [
+          {
+            text: "Looking…",
+            toolCalls: [{ id: "c1", toolName: "list_directory", input: { path: "/home" } }],
+            toolResults: [{ ok: true, callId: "c1", data: { items: [] } }],
+          },
+        ],
+        finalText: "Here they are.",
+      });
+
+      expect(result.created).toBe(true);
+      expect(result.id).toBeDefined();
+      expect(db.conversations).toHaveLength(1);
+      expect(db.conversations[0]).toMatchObject({
+        userId: ALICE,
+        maxToolRounds: 2,
+        title: "Docs listing",
+      });
+      expect(db.messages).toHaveLength(3);
+      expect(db.messages.map((m) => [m.role, m.content, m.isFinal])).toEqual([
+        ["user", "List my docs.", false],
+        ["assistant", "Looking…", false],
+        ["assistant", "Here they are.", true],
+      ]);
+    });
+
+    it("writes rows with strictly increasing created_at so the transcript is ordered", async () => {
+      await persistAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        rounds: [
+          { toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }], toolResults: [{ ok: true, callId: "c1", data: null }] },
+          { toolCalls: [{ id: "c2", toolName: "list_directory", input: {} }], toolResults: [{ ok: true, callId: "c2", data: null }] },
+        ],
+        finalText: "Done.",
+      });
+
+      const times = db.messages.map((m) => (m.createdAt as Date).getTime());
+      expect(times).toEqual([...times].sort((a, b) => a - b));
+      expect(new Set(times).size).toBe(times.length);
+    });
+
+    it("appends a new turn when resuming an owned conversation", async () => {
+      const created = await createAgentConversation({
+        userId: ALICE,
+        instruction: "First turn",
+        maxToolRounds: 2,
+      });
+      const before = db.messages.length;
+
+      const result = await persistAgentTurn({
+        userId: ALICE,
+        conversationId: created.id,
+        instruction: "Second turn",
+        maxToolRounds: 5,
+        rounds: [{ text: "thinking", toolResults: [] }],
+        finalText: "Second reply.",
+      });
+
+      expect(result.created).toBe(false);
+      expect(result.id).toBe(created.id);
+      expect(db.messages.length).toBe(before + 3);
+      expect(db.conversations).toHaveLength(1);
+
+      const state = (await loadAgentConversationState(ALICE, created.id)) as ConversationState;
+      expect(state.instruction).toBe("Second turn");
+      expect(state.finalText).toBe("Second reply.");
+    });
+
+    it("rejects a foreign owner with not-found and writes nothing", async () => {
+      const created = await createAgentConversation({ userId: ALICE, instruction: "Private", maxToolRounds: 1 });
+      const before = db.messages.length;
+
+      await expect(
+        persistAgentTurn({
+          userId: BOB,
+          conversationId: created.id,
+          instruction: "sneak",
+          maxToolRounds: 2,
+          rounds: [],
+          finalText: "Done.",
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+      expect(db.messages.length).toBe(before);
+      expect(db.conversations).toHaveLength(1);
+    });
+
+    it("rejects an unknown conversation id with not-found", async () => {
+      await expect(
+        persistAgentTurn({
+          userId: ALICE,
+          conversationId: "00000000-0000-0000-0000-000000000000",
+          instruction: "Hi",
+          maxToolRounds: 2,
+          rounds: [],
+          finalText: "Done.",
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+      expect(db.conversations).toHaveLength(0);
+      expect(db.messages).toHaveLength(0);
+    });
+
+    it("validates every input before writing anything", async () => {
+      const base = { userId: ALICE, maxToolRounds: 2, rounds: [], finalText: "Done." };
+
+      await expect(
+        persistAgentTurn({ ...base, instruction: "" }),
+      ).rejects.toThrow(TypeError);
+      await expect(
+        persistAgentTurn({ ...base, instruction: "Hi", rounds: [{}] }),
+      ).rejects.toThrow(TypeError);
+      await expect(
+        persistAgentTurn({ ...base, instruction: "Hi", finalText: "" }),
+      ).rejects.toThrow(TypeError);
+      await expect(
+        persistAgentTurn({
+          ...base,
+          instruction: "Hi",
+          rounds: [{ toolCalls: [{ id: "x", toolName: "", input: {} }] }],
+        }),
+      ).rejects.toThrow(TypeError);
+
+      expect(db.conversations).toHaveLength(0);
+      expect(db.messages).toHaveLength(0);
+    });
+
+    it("preserves exact tool data in the created rows", async () => {
+      const fileId = "f0000000-0000-0000-0000-0000000000f0";
+      const versionId = "v0000000-0000-0000-0000-0000000000v0";
+      await persistAgentTurn({
+        userId: ALICE,
+        instruction: "Analyze",
+        maxToolRounds: 1,
+        rounds: [
+          {
+            text: "idle",
+            toolCalls: [{ id: "c1", toolName: "read_file", input: { fileId, versionId } }],
+            toolResults: [{ ok: true, callId: "c1", data: { head: "ok" } }],
+          },
+        ],
+        finalText: "Analyzed.",
+      });
+      const round = db.messages[1];
+      if (!round) throw new Error("expected a persisted round");
+      expect(round.toolCalls).toEqual([{ id: "c1", toolName: "read_file", input: { fileId, versionId } }]);
+      expect(round.toolResults).toEqual([{ ok: true, callId: "c1", data: { head: "ok" } }]);
     });
   });
 });

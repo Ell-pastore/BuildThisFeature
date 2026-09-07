@@ -242,6 +242,49 @@ describe("runAgentLoop — tool rounds", () => {
     expect(second).toEqual({ ok: true, callId: "t", data: homeListing() });
     expect(filesystem.calls).toEqual(["searchFiles", "listDirectory:/home"]);
   });
+
+  it("invokes the onRound observer once per executed round with the transcript", async () => {
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("s", "search_files", { query: "notes" })] },
+      { toolCalls: [call("t", "list_directory", { path: "/tmp" })] },
+      { text: "Everything done." },
+    ]);
+    const observed: unknown[] = [];
+
+    await runAgentLoop(sessionContext(ACTIVE_USER), "go", {
+      ...makeOptions(generate, { filesystem }),
+      onRound: (round) => observed.push(round),
+    });
+
+    expect(observed).toEqual([
+      {
+        text: undefined,
+        toolCalls: [call("s", "search_files", { query: "notes" })],
+        results: [{ ok: true, callId: "s", data: [] }],
+        toolRounds: 1,
+      },
+      {
+        text: undefined,
+        toolCalls: [call("t", "list_directory", { path: "/tmp" })],
+        results: [{ ok: true, callId: "t", data: homeListing("/tmp") }],
+        toolRounds: 2,
+      },
+    ]);
+  });
+
+  it("does not call the observer for a text-only turn (no tools executed)", async () => {
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([{ text: "Hello!" }]);
+    const observed: unknown[] = [];
+
+    await runAgentLoop(sessionContext(ACTIVE_USER), "hi", {
+      ...makeOptions(generate, { filesystem }),
+      onRound: (round) => observed.push(round),
+    });
+
+    expect(observed).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
