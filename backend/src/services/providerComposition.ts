@@ -80,6 +80,11 @@ import {
   createProviderHealth,
   type ProviderHealth,
 } from "./providerHealth.js";
+import {
+  validateProviderConfiguration,
+  isValidProviderBaseUrl,
+  type ProviderDiagnosticsReport,
+} from "./providerDiagnostics.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -136,6 +141,13 @@ export interface ComposedProviderStack {
   credentialProviders: readonly ProviderIdType[];
   /** Providers in the chain that require NO credential (e.g. Ollama). */
   credentialFreeProviders: readonly ProviderIdType[];
+  /**
+   * Deterministic, safe configuration diagnostics (Phase 10.19) for the
+   * composed stack — computed at composition/startup time. Never contains a
+   * credential value or a secret-bearing URL; safe for server logs. For a
+   * successfully composed stack this is always `{ overallStatus: "ok" }`.
+   */
+  diagnostics: ProviderDiagnosticsReport;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +260,15 @@ function validateSettings(
       throw new ProviderCompositionError(
         "provider-composition/invalid-configuration",
         `Provider "${id}" has an invalid (empty) base URL.`,
+        id,
+      );
+    }
+    // Phase 10.19: the base URL must be a parseable absolute http(s) URL —
+    // mirrors the diagnostics layer so a composed stack always reports "ok".
+    if (!isValidProviderBaseUrl(s.baseUrl)) {
+      throw new ProviderCompositionError(
+        "provider-composition/invalid-configuration",
+        `Provider "${id}" has a malformed base URL (expected an absolute http(s) URL).`,
         id,
       );
     }
@@ -423,6 +444,16 @@ export function composeProviderStack(
     chain,
     credentialProviders,
     credentialFreeProviders,
+    // Phase 10.19: deterministic, secret-free configuration diagnostics run at
+    // composition time. Since compose throws on any invalid configuration,
+    // a composed stack always reports overallStatus "ok" here; operators that
+    // want the FULL picture even for a broken configuration call
+    // validateProviderConfiguration directly (which never throws).
+    diagnostics: validateProviderConfiguration({
+      chain: options.chain,
+      settings: options.settings,
+      credentials: options.credentials,
+    }),
   };
 }
 
