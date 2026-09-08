@@ -11,20 +11,21 @@
  *      execution, no network).
  *   4. Rejects duplicate registration with a typed error.
  *   5. Fails clearly for unknown / unregistered provider names.
- *   6. Resolves the server-configured provider name without naming a
- *      concrete adapter anywhere in agent code.
+ *
+ * Concrete adapter construction no longer lives here (Phase 10.17): the
+ * composition root (`providerComposition.ts`) is the single place adapters
+ * are built and configured; this registry stays a pure provider-agnostic
+ * primitive.
  */
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  createDefaultProviderRegistry,
   isProviderId,
   isProviderRegistryError,
   KNOWN_PROVIDER_IDS,
   ProviderId,
   ProviderRegistry,
   ProviderRegistryError,
-  resolveConfiguredProvider,
 } from "./providerSelection.js";
 import {
   isProviderError,
@@ -247,86 +248,5 @@ describe("ProviderId — typed identifiers", () => {
     expect(isProviderId("ollama")).toBe(true);
     expect(isProviderId("anthropic")).toBe(false);
     expect(isProviderId("")).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 5. Built-in registry + configured resolution
-// ---------------------------------------------------------------------------
-
-describe("createDefaultProviderRegistry / resolveConfiguredProvider", () => {
-  it("pre-registers the built-in providers", () => {
-    const registry = createDefaultProviderRegistry();
-    expect(registry.has(ProviderId.Grok)).toBe(true);
-    expect(registry.has(ProviderId.Gemini)).toBe(true);
-    expect(registry.has(ProviderId.OpenRouter)).toBe(true);
-    expect(registry.has(ProviderId.Ollama)).toBe(true);
-    expect(registry.registeredProviderIds).toEqual([
-      "grok",
-      "gemini",
-      "openrouter",
-      "ollama",
-    ]);
-  });
-
-  it("resolves the configured provider name through a supplied registry", () => {
-    const registry = new ProviderRegistry();
-    installFakeGrok(registry);
-
-    const provider = resolveConfiguredProvider(registry);
-
-    expect(typeof provider.generate).toBe("function");
-    // The configured name came from config (default "grok") — no concrete
-    // adapter name leaked into the caller.
-    expect(provider).not.toBeNull();
-  });
-
-  it("fails clearly when a built-in provider has no API key configured", () => {
-    // config.grok.apiKey / config.gemini.apiKey / config.openrouter.apiKey are
-    // undefined in the test environment → each built-in factory surfaces the
-    // typed ProviderError (Authentication) at resolve.
-    const registry = createDefaultProviderRegistry();
-    expect(() =>
-      registry.resolve({ provider: ProviderId.Grok }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: ProviderErrorCode.Authentication,
-        retryable: false,
-      }),
-    );
-    expect(() =>
-      registry.resolve({ provider: ProviderId.Gemini }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: ProviderErrorCode.Authentication,
-        retryable: false,
-      }),
-    );
-    expect(() =>
-      registry.resolve({ provider: ProviderId.OpenRouter }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: ProviderErrorCode.Authentication,
-        retryable: false,
-      }),
-    );
-  });
-
-  it("resolves Ollama without a credential but fails clearly without a model", () => {
-    // Local Ollama requires NO API key, so the built-in factory cannot fail on
-    // credentials. Instead it surfaces a permanent typing error (Internal)
-    // when no `OLLAMA_MODEL` is configured — the adapter never assumes a model.
-    const registry = createDefaultProviderRegistry();
-    expect(() =>
-      registry.resolve({ provider: ProviderId.Ollama }),
-    ).toThrowError(ProviderError);
-    expect(() =>
-      registry.resolve({ provider: ProviderId.Ollama }),
-    ).toThrowError(
-      expect.objectContaining({
-        code: ProviderErrorCode.Internal,
-        retryable: false,
-      }),
-    );
   });
 });

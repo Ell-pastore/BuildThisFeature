@@ -15,13 +15,15 @@
  *
  *   - NAMED REGISTRY ONLY: providers are registered under a typed
  *     `ProviderId` (from the `ProviderId` map — extend the map to add future
- *     providers such as `openrouter` or `ollama`). Agent contracts (Phase 10.2
- *     `AgentProvider`, Phase 10.4 loop, Phase 10.8 persistence) are NEVER
- *     touched when a provider is added.
- *   - CONSTRUCTION IS SEPARATE FROM ORCHESTRATION: the registry produces
- *     providers through injectable factories. Orchestration (the agent loop,
- *     persistent turns) receives a ready `AgentProvider` and never imports
- *     this module or any concrete adapter.
+ *     providers). Agent contracts (Phase 10.2 `AgentProvider`, Phase 10.4
+ *     loop, Phase 10.8 persistence) are NEVER touched when a provider is
+ *     added.
+ *   - CONSTRUCTION IS SEPARATE FROM ORCHESTRATION: providers come from
+ *     registered factories. Orchestration (the agent loop, persistent turns)
+ *     receives a ready `AgentProvider` and never imports this module or any
+ *     concrete adapter. Since Phase 10.17 the DEFAULT construction path for
+ *     the running server is the composition root (`providerComposition.ts`);
+ *     this module stays a pure, provider-agnostic registry primitive.
  *   - NO EXECUTION HERE: resolving a provider only builds it. It never
  *     invokes `generate`, never executes tools, never touches policy /
  *     `invokeTool` / `runPersistentTurn` — those stay exclusively in the
@@ -32,21 +34,8 @@
  *   - FAIL CLEARLY: requesting a provider that is not registered throws a
  *     typed `ProviderRegistryError` listing the registered ids; a configured
  *     name that is not a known provider id is rejected the same way.
- *
- * The default registry pre-registers the built-in Grok (Phase 10.9), Gemini
- * (Phase 10.14), OpenRouter (Phase 10.15), and Ollama (Phase 10.16) adapters
- * backed by `config.grok` / `config.gemini` / `config.openrouter` /
- * `config.ollama`, so an operator needs only to set the relevant settings
- * (plus optional `AI_PROVIDER` to pick a non-default provider). Local Ollama
- * needs no credential and stays out of the credential pool. Future providers
- * register next to them without touching agent code.
  */
-import { config } from "../config.js";
 import type { AgentProvider } from "./provider.js";
-import { createGrokProvider } from "./grokProvider.js";
-import { createGeminiProvider } from "./geminiProvider.js";
-import { createOpenRouterProvider } from "./openrouterProvider.js";
-import { createOllamaProvider } from "./ollamaProvider.js";
 
 /**
  * The typed identifier for every provider the selection layer knows about.
@@ -211,76 +200,4 @@ export class ProviderRegistry {
     }
     return (factory as ProviderFactory<TConfig>)(selection.config);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Built-in wiring (composition root)
-// ---------------------------------------------------------------------------
-
-/**
- * Register every built-in provider adapter. Currently Grok (Phase 10.9),
- * Gemini (Phase 10.14), OpenRouter (Phase 10.15), and Ollama (Phase 10.16),
- * each built from server configuration at resolution time. Local Ollama has
- * no credential, so its factory never touches the credential pool. Future
- * adapters register here — no agent code changes.
- */
-export function registerBuiltinProviders(registry: ProviderRegistry): void {
-  registry.register(ProviderId.Grok, () =>
-    createGrokProvider({
-      apiKey: config.grok.apiKey ?? "",
-      model: config.grok.model,
-      baseUrl: config.grok.baseUrl,
-      timeoutMs: config.grok.timeoutMs,
-    }),
-  );
-  registry.register(ProviderId.Gemini, () =>
-    createGeminiProvider({
-      apiKey: config.gemini.apiKey ?? "",
-      model: config.gemini.model,
-      baseUrl: config.gemini.baseUrl,
-      timeoutMs: config.gemini.timeoutMs,
-    }),
-  );
-  registry.register(ProviderId.OpenRouter, () =>
-    createOpenRouterProvider({
-      apiKey: config.openrouter.apiKey ?? "",
-      model: config.openrouter.model ?? "",
-      baseUrl: config.openrouter.baseUrl,
-      timeoutMs: config.openrouter.timeoutMs,
-    }),
-  );
-  registry.register(ProviderId.Ollama, () =>
-    createOllamaProvider({
-      model: config.ollama.model ?? "",
-      baseUrl: config.ollama.baseUrl,
-      timeoutMs: config.ollama.timeoutMs,
-    }),
-  );
-}
-
-/** A fresh registry pre-loaded with every built-in provider. */
-export function createDefaultProviderRegistry(): ProviderRegistry {
-  const registry = new ProviderRegistry();
-  registerBuiltinProviders(registry);
-  return registry;
-}
-
-/**
- * Resolve the provider named by server configuration (`config.aiProvider`)
- * into a ready `AgentProvider`.
- *
- * @throws `ProviderRegistryError` (unknown) when the configured name is not
- *   a known provider id or has no registered factory.
- * @throws `ProviderError` (Authentication / Internal) when the selected
- *   provider is Grok, Gemini, or OpenRouter but its API key (or OpenRouter
- *   model) is not configured.
- */
-export function resolveConfiguredProvider(
-  registry: ProviderRegistry = createDefaultProviderRegistry(),
-): AgentProvider {
-  const configured = config.aiProvider;
-  if (!isProviderId(configured)) {
-    throw ProviderRegistryError.unknown(configured, KNOWN_PROVIDER_IDS);
-  }
-  return registry.resolve({ provider: configured });
 }

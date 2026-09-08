@@ -26,6 +26,28 @@ function listFromEnv(value: string | undefined): string[] | undefined {
 }
 
 /**
+ * Collect all credential values for a provider prefix from the environment.
+ *
+ * Convention: PREFIX_API_KEY (primary), then PREFIX_API_KEY_1,
+ * PREFIX_API_KEY_2, etc. (extras, in ascending numeric order). Returns
+ * the full ordered list (empty when none are configured). The primary key
+ * is always first in the returned list so the credential pool rotation
+ * order matches the operator intent.
+ */
+function credentialsFromEnv(prefix: string): string[] {
+  const primary = envStringOrUndefined(process.env[`${prefix}_API_KEY`]);
+  const extras: string[] = [];
+  for (let n = 1; ; n += 1) {
+    const value = envStringOrUndefined(
+      process.env[`${prefix}_API_KEY_${n}`],
+    );
+    if (value === undefined) break;
+    extras.push(value);
+  }
+  return primary ? [primary, ...extras] : extras;
+}
+
+/**
  * Browser/webview origins allowed to call the API when none are configured.
  * Covers the Vite dev servers used by this repo; Tauri webview origins can be
  * added via CORS_ORIGINS when the desktop app starts calling the API.
@@ -61,6 +83,8 @@ export const config = {
   grok: {
     /** xAI API key. `undefined` until `GROK_API_KEY` is set in env/.env. */
     apiKey: envStringOrUndefined(process.env.GROK_API_KEY),
+    /** All Grok credential values in rotation order (primary first). */
+    credentials: credentialsFromEnv("GROK"),
     /** Model sent to the xAI API. Default via configuration. */
     model: process.env.GROK_MODEL ?? "grok-3",
     /** xAI API base URL. */
@@ -81,6 +105,8 @@ export const config = {
   gemini: {
     /** Gemini API key. `undefined` until `GEMINI_API_KEY` is set in env/.env. */
     apiKey: envStringOrUndefined(process.env.GEMINI_API_KEY),
+    /** All Gemini credential values in rotation order (primary first). */
+    credentials: credentialsFromEnv("GEMINI"),
     /** Model sent to the Gemini API. Default via configuration. */
     model: process.env.GEMINI_MODEL ?? "gemini-3.5-flash",
     /** Google AI Studio API base URL. */
@@ -105,6 +131,8 @@ export const config = {
   openrouter: {
     /** OpenRouter API key. `undefined` until `OPENROUTER_API_KEY` is set. */
     apiKey: envStringOrUndefined(process.env.OPENROUTER_API_KEY),
+    /** All OpenRouter credential values in rotation order (primary first). */
+    credentials: credentialsFromEnv("OPENROUTER"),
     /** Model slug sent to OpenRouter. None by default — configuring one is required. */
     model: envStringOrUndefined(process.env.OPENROUTER_MODEL),
     /** OpenRouter API base URL. */
@@ -141,4 +169,13 @@ export const config = {
    * provider ids at resolution time. Defaults to the built-in Grok adapter.
    */
   aiProvider: process.env.AI_PROVIDER ?? "grok",
+  /**
+   * The ordered fallback chain (Phase 10.17). A comma-separated list of
+   * provider ids tried in order on rotation-eligible failures. When unset,
+   * the chain is just the single AI_PROVIDER (no fallback). When set,
+   * the fallback list IS the chain (the first entry is primary).
+   */
+  aiProviderFallback: listFromEnv(process.env.AI_PROVIDER_FALLBACK) ?? [
+    process.env.AI_PROVIDER ?? "grok",
+  ],
 };
