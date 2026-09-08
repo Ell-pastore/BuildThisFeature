@@ -408,6 +408,128 @@ export async function loadAgentConversationState(
   return reconstructConversationState(conversation.maxToolRounds, stored);
 }
 
+// ---------------------------------------------------------------------------
+// List / read history (Phase 10.23)
+// ---------------------------------------------------------------------------
+
+/** A persisted transcript row (with its stable row id). */
+export interface StoredMessageRecord extends StoredMessage {
+  id: string;
+}
+
+/** A conversation plus its persisted transcript rows (chronological). */
+export interface StoredConversationDetail {
+  conversation: StoredConversation;
+  messages: readonly StoredMessageRecord[];
+}
+
+function toStoredConversation(row: {
+  id: string;
+  userId: string;
+  title: string | null;
+  maxToolRounds: number;
+  createdAt: Date;
+  updatedAt: Date;
+}): StoredConversation {
+  return {
+    id: row.id,
+    userId: row.userId,
+    title: row.title,
+    maxToolRounds: row.maxToolRounds,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function toStoredMessage(row: {
+  role: string;
+  content: string;
+  toolCalls: unknown;
+  toolResults: unknown;
+  isFinal: boolean;
+  createdAt: Date;
+}): StoredMessage {
+  return {
+    role: row.role,
+    content: row.content,
+    toolCalls: row.toolCalls ?? undefined,
+    toolResults: row.toolResults ?? undefined,
+    isFinal: row.isFinal,
+    createdAt: row.createdAt,
+  };
+}
+
+function toStoredMessageRecord(row: {
+  id: string;
+  role: string;
+  content: string;
+  toolCalls: unknown;
+  toolResults: unknown;
+  isFinal: boolean;
+  createdAt: Date;
+}): StoredMessageRecord {
+  return { id: row.id, ...toStoredMessage(row) };
+}
+
+/**
+ * List the conversations OWNED by `userId`, newest-first. Deterministic
+ * order: most-recently-updated first, then most-recently-created, then by
+ * stable id. Uses the `(user_id, updated_at DESC)` conversation-list index.
+ */
+export async function listAgentConversations(
+  userId: string,
+): Promise<StoredConversation[]> {
+  const db = getDatabase();
+  const rows = await db.aiConversation.findMany({
+    where: { userId },
+    orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "asc" }],
+    select: {
+      id: true,
+      userId: true,
+      title: true,
+      maxToolRounds: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  });
+  return rows.map(toStoredConversation);
+}
+
+/**
+ * Retrieve ONE conversation OWNED by `userId` with its persisted transcript
+ * in chronological order, or `null` when the conversation does not exist for
+ * `userId` (ownership enforced — a foreign conversation is indistinguishable
+ * from a missing one). Raw structured tool data (intents, results, exact
+ * `fileId`/`versionId` references) is returned as stored — never file
+ * contents; the caller is responsible for safe presentation shaping.
+ */
+export async function getAgentConversation(
+  userId: string,
+  conversationId: string,
+): Promise<StoredConversationDetail | null> {
+  const db = getDatabase();
+  const conversation = await db.aiConversation.findFirst({
+    where: { id: conversationId, userId },
+    select: {
+      id: true,
+      userId: true,
+      title: true,
+      maxToolRounds: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  });
+  if (conversation === null) return null;
+  const messages = await db.aiMessage.findMany({
+    where: { conversationId },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  return {
+    conversation: toStoredConversation(conversation),
+    messages: messages.map(toStoredMessageRecord),
+  };
+}
+
 /**
  * Replay stored transcript rows into a `ConversationState`. Pure — no I/O —
  * so it is directly unit-testable. A stored `user` row starts a new turn, a

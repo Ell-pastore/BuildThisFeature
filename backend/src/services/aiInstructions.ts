@@ -31,6 +31,7 @@
  *     it delegates to owns all provider access.
  */
 import { AppError } from "../core/errors.js";
+import { isConversationId } from "./conversationId.js";
 import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { readToolDefinitions, registerReadTools } from "../tools/definitions/readTools.js";
@@ -52,10 +53,6 @@ import { composeDefaultProviderStack } from "./providerComposition.js";
 
 /** Reasonable server-side cap on a single instruction / prompt. */
 export const MAX_INSTRUCTION_LENGTH = 4096;
-
-/** Conversation ids are persisted as UUIDs; anything else is rejected. */
-const CONVERSATION_ID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Strict body shape: nothing outside these two fields is accepted. */
 const BODY_FIELDS = new Set(["conversationId", "instruction"]);
@@ -155,13 +152,12 @@ export function parseAiInstructionInput(raw: unknown): AiInstructionBody {
 
   let conversationId: string | undefined;
   if (record.conversationId !== undefined) {
-    const value = record.conversationId;
-    if (typeof value !== "string" || !CONVERSATION_ID_PATTERN.test(value)) {
+    if (!isConversationId(record.conversationId)) {
       throw AppError.badRequest(
         "A valid conversationId is required when resuming a conversation.",
       );
     }
-    conversationId = value;
+    conversationId = record.conversationId;
   }
 
   return {

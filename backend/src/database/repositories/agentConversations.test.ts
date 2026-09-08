@@ -24,6 +24,8 @@ import {
   appendAgentFinal,
   appendAgentTurn,
   createAgentConversation,
+  getAgentConversation,
+  listAgentConversations,
   loadAgentConversationState,
   persistAgentTurn,
   reconstructConversationState,
@@ -45,6 +47,27 @@ vi.mock("../client.js", () => ({
 // ---------------------------------------------------------------------------
 
 type AnyRecord = Record<string, unknown>;
+
+const PRISMA_SORT_ASC = "asc" as const;
+const PRISMA_SORT_DESC = "desc" as const;
+
+/** In-memory equivalent of Prisma's `orderBy: [{ field: "asc" | "desc" }]`. */
+function sortBy(rows: AnyRecord[], orderBy?: AnyRecord[]): AnyRecord[] {
+  if (orderBy === undefined || orderBy.length === 0) {
+    return [...rows];
+  }
+  return [...rows].sort((a, b) => {
+    for (const clause of orderBy) {
+      for (const [field, direction] of Object.entries(clause)) {
+        const av = a[field] instanceof Date ? (a[field] as Date).getTime() : (a[field] as string);
+        const bv = b[field] instanceof Date ? (b[field] as Date).getTime() : (b[field] as string);
+        if (av < bv) return direction === PRISMA_SORT_ASC ? -1 : 1;
+        if (av > bv) return direction === PRISMA_SORT_ASC ? 1 : -1;
+      }
+    }
+    return 0;
+  });
+}
 
 function createFakeDb() {
   const conversations: AnyRecord[] = [];
@@ -73,6 +96,12 @@ function createFakeDb() {
         );
         return row ?? null;
       }),
+      findMany: vi.fn(async ({ where = {}, orderBy }: { where?: AnyRecord; orderBy?: AnyRecord[] }) => {
+        const rows = conversations.filter(
+          (c) => where.userId === undefined || c.userId === where.userId,
+        );
+        return sortBy(rows, orderBy);
+      }),
       update: vi.fn(async ({ where, data }: { where: AnyRecord; data: AnyRecord }) => {
         const row = conversations.find((c) => c.id === where.id);
         if (!row) throw new Error(`Conversation ${where.id} not found (fake).`);
@@ -94,9 +123,18 @@ function createFakeDb() {
         messages.push(row);
         return row;
       }),
-      findMany: vi.fn(async ({ where }: { where: { conversationId?: string } }) => {
-        return messages.filter((m) => m.conversationId === where?.conversationId);
-      }),
+      findMany: vi.fn(
+        async ({
+          where,
+          orderBy,
+        }: {
+          where?: { conversationId?: string };
+          orderBy?: AnyRecord[];
+        }) => {
+          const rows = messages.filter((m) => m.conversationId === where?.conversationId);
+          return sortBy(rows, orderBy);
+        },
+      ),
     },
     $transaction: vi.fn(async (fn: (tx: typeof delegates) => Promise<unknown>) => {
       return await fn(delegates);
@@ -584,6 +622,147 @@ describe("agentConversations repository", () => {
       if (!round) throw new Error("expected a persisted round");
       expect(round.toolCalls).toEqual([{ id: "c1", toolName: "read_file", input: { fileId, versionId } }]);
       expect(round.toolResults).toEqual([{ ok: true, callId: "c1", data: { head: "ok" } }]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10.23 read endpoints
+  // ---------------------------------------------------------------------------
+
+  describe("listAgentConversations", () => {
+    async function seedConversation(
+      userId: string,
+      atMs: number,
+      title?: string,
+    ): Promise<string> {
+      const created = await createAgentConversation({
+        userId,
+        instruction: `Instruction at ${atMs}`,
+        maxToolRounds: 3,
+        ...(title !== undefined ? { title } : {}),
+      });
+      // The fake bumps updatedAt through `bumpUpdatedAt`; force the ordering
+      // timestamps directly so the test owns the clock.
+      const row = db.conversations.find((c) => c.id === created.id);
+      if (!row) throw new Error("expected a conversation row");
+      row.createdAt = new Date(atMs);
+      row.updatedAt = new Date(atMs);
+      return created.id;
+    }
+
+    it("returns only the authenticated user's conversations", async () => {
+      await seedConversation(ALICE, 1_705_000_000_001);
+      await seedConversation(BOB, 1_705_000_000_002);
+
+      const rows = await listAgentConversations(ALICE);
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.userId).toBe(ALICE);
+    });
+
+    it("orders the user's conversations newest-first (most recently updated)", async () => {
+      await seedConversation(ALICE, 1_705_000_000_001);
+      await seedConversation(ALICE, 1_705_000_000_003);
+      await seedConversation(ALICE, 1_705_000_000_002);
+
+      const rows = await listAgentConversations(ALICE);
+
+      expect(rows.map((r) => r.updatedAt.getTime())).toEqual([
+        1_705_000_000_003,
+        1_705_000_000_002,
+        1_705_000_000_001,
+      ]);
+    });
+
+    it("returns a valid empty list for a user with no conversations", async () => {
+      expect(await listAgentConversations(BOB)).toEqual([]);
+    });
+
+    it("exposes the conversation metadata fields deterministically", async () => {
+      await seedConversation(ALICE, 1_705_000_000_001, "Invoices");
+
+      const rows = await listAgentConversations(ALICE);
+
+      expect(rows[0]).toMatchObject({
+        title: "Invoices",
+        maxToolRounds: 3,
+      });
+      expect(rows[0]?.createdAt).toEqual(new Date(1_705_000_000_001));
+      expect(rows[0]?.updatedAt).toEqual(new Date(1_705_000_000_001));
+      expect(typeof rows[0]?.id).toBe("string");
+    });
+  });
+
+  describe("getAgentConversation", () => {
+    async function seedWithMessages(): Promise<{ id: string; messageIds: string[] }> {
+      const { id } = await persistAgentTurn({
+        userId: ALICE,
+        instruction: "List my files.",
+        maxToolRounds: 2,
+        rounds: [
+          {
+            text: "Looking…",
+            toolCalls: [{ id: "c1", toolName: "list_directory", input: { path: "/home" } }],
+            toolResults: [{ ok: true, callId: "c1", data: { items: [{ name: "notes.txt" }] } }],
+          },
+        ],
+        finalText: "Done.",
+      });
+      return {
+        id,
+        messageIds: db.messages
+          .filter((m) => m.conversationId === id)
+          .map((m) => m.id as string),
+      };
+    }
+
+    it("returns the owned conversation with its transcript in chronological order", async () => {
+      const { id } = await seedWithMessages();
+
+      const detail = await getAgentConversation(ALICE, id);
+
+      expect(detail).not.toBeNull();
+      expect(detail?.conversation.id).toBe(id);
+      expect(detail?.conversation.userId).toBe(ALICE);
+      expect(detail?.conversation.maxToolRounds).toBe(2);
+      // user instruction -> provider round -> final reply
+      expect(detail?.messages.map((m) => m.role)).toEqual([
+        "user",
+        "assistant",
+        "assistant",
+      ]);
+      expect(detail?.messages[0]?.content).toBe("List my files.");
+      expect(detail?.messages[1]?.content).toBe("Looking…");
+      expect(detail?.messages[2]?.content).toBe("Done.");
+      expect(detail?.messages.map((m) => m.isFinal)).toEqual([false, false, true]);
+    });
+
+    it("preserves persisted structured tool data and exact references as stored", async () => {
+      const { id } = await seedWithMessages();
+
+      const detail = await getAgentConversation(ALICE, id);
+
+      const round = detail?.messages[1];
+      expect(round?.toolCalls).toEqual([{ id: "c1", toolName: "list_directory", input: { path: "/home" } }]);
+      expect(round?.toolResults).toEqual([{ ok: true, callId: "c1", data: { items: [{ name: "notes.txt" }] } }]);
+    });
+
+    it("enforces ownership: a foreign conversation is indistinguishable from missing", async () => {
+      const { id } = await seedWithMessages();
+
+      const asForeign = await getAgentConversation(BOB, id);
+      const asMissing = await getAgentConversation(BOB, "00000000-0000-0000-0000-000000000000");
+
+      expect(asForeign).toBeNull();
+      expect(asMissing).toBeNull();
+    });
+
+    it("ensures message ids are stable and rows are edge-ordered deterministically", async () => {
+      const { id, messageIds } = await seedWithMessages();
+
+      const detail = await getAgentConversation(ALICE, id);
+
+      expect(detail?.messages.map((m) => m.id)).toEqual(messageIds);
     });
   });
 });

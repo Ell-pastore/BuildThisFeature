@@ -27,10 +27,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 
 import { onError } from "../core/http.js";
+import { AppError } from "../core/errors.js";
 import { aiRoutes } from "./ai.js";
 import type { AiRuntimeStatus } from "../services/aiStatus.js";
 import type { AiInstructionResponse } from "../services/aiInstructions.js";
 import { parseAiInstructionInput } from "../services/aiInstructions.js";
+import type { AiConversationDetail, AiConversationSummary } from "../services/aiConversations.js";
+import { validateConversationId } from "../services/conversationId.js";
 
 // ---------------------------------------------------------------------------
 // Mocked dependencies
@@ -42,6 +45,8 @@ const mocks = vi.hoisted(() => ({
   databaseNow: vi.fn(),
   getAiRuntimeStatus: vi.fn(),
   runAiInstruction: vi.fn(),
+  listAiConversations: vi.fn(),
+  getAiConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/sessions.js", () => ({
@@ -66,6 +71,18 @@ vi.mock("../services/aiInstructions.js", async (importOriginal) => {
     // The production entry is replaced; the REAL strict parser stays in the
     // pipeline so validation behavior is exercised end-to-end.
     runAiInstruction: mocks.runAiInstruction,
+  };
+});
+
+vi.mock("../services/aiConversations.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/aiConversations.js")>();
+  return {
+    ...actual,
+    // Production entries replaced; the REAL shared conversationId validator
+    // stays in the pipeline so path-param validation is exercised end-to-end
+    // (malformed ids reach the 400 envelope through the service contract).
+    listAiConversations: mocks.listAiConversations,
+    getAiConversation: mocks.getAiConversation,
   };
 });
 
@@ -128,8 +145,41 @@ const CANNED_STATUS: AiRuntimeStatus = {
   ],
 };
 
+const HISTORY_CONVERSATION_ID = "55555555-5555-5555-5555-555555555555";
+
+const CANNED_SUMMARY: AiConversationSummary = {
+  id: HISTORY_CONVERSATION_ID,
+  title: "Invoice review",
+  maxToolRounds: 3,
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-03T00:00:00.000Z",
+};
+
+const CANNED_DETAIL: AiConversationDetail = {
+  ...CANNED_SUMMARY,
+  messages: [
+    {
+      id: "msg-1",
+      role: "user",
+      content: "List my files.",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      isFinal: false,
+    },
+    {
+      id: "msg-2",
+      role: "assistant",
+      content: "Done.",
+      createdAt: "2026-01-01T00:00:02.000Z",
+      isFinal: true,
+    },
+  ],
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Every test starts WITHOUT a session; authenticated tests opt in. This
+  // prevents a persistent `mockResolvedValue` from a sibling test leaking.
+  mocks.findSessionByTokenHash.mockReset();
   mocks.updateSessionLastUsedAt.mockResolvedValue(undefined);
   mocks.databaseNow.mockResolvedValue(new Date("2026-01-01T00:00:00Z"));
   mocks.getAiRuntimeStatus.mockReturnValue(CANNED_STATUS);
@@ -149,6 +199,24 @@ beforeEach(() => {
           toolResults: [],
         },
       };
+    },
+  );
+  mocks.listAiConversations.mockImplementation(async (userId: string) => {
+    // The route consults ONLY the session user; canned ownership check.
+    if (userId !== ACTIVE_USER.id) return [];
+    return [CANNED_SUMMARY];
+  });
+  mocks.getAiConversation.mockImplementation(
+    async (userId: string, conversationId: string): Promise<AiConversationDetail> => {
+      // The REAL shared UUID validator runs → malformed ids get 400.
+      validateConversationId(conversationId);
+      if (conversationId !== HISTORY_CONVERSATION_ID) {
+        throw AppError.notFound("Agent conversation");
+      }
+      if (userId !== ACTIVE_USER.id) {
+        throw AppError.notFound("Agent conversation");
+      }
+      return CANNED_DETAIL;
     },
   );
 });
@@ -494,5 +562,197 @@ describe("POST /api/ai/instructions — no network", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
     expect((res as AiInstructionResponse).turn.instruction).toBe("List my home directory.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. GET /api/ai/conversations — history list (Phase 10.23)
+// ---------------------------------------------------------------------------
+
+describe("GET /api/ai/conversations — authenticated", () => {
+  it("returns 200 with the stable list shape for an authenticated user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request("/api/ai/conversations", {
+      method: "GET",
+      headers: authorizedHeaders(),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as AiConversationSummary[];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body[0]).toEqual(CANNED_SUMMARY);
+    expect(mocks.listAiConversations).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes the list to the SESSION user — request identity is ignored", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations?userId=99999999-9999-9999-9999-999999999999&user=attacker",
+      { method: "GET", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    // The route consults only the authenticated session identity.
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id);
+  });
+
+  it("returns a valid empty array for a user with no conversations", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(OTHER_ACTIVE_USER));
+
+    const body = (await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json()) as AiConversationSummary[];
+
+    expect(body).toEqual([]);
+  });
+});
+
+describe("GET /api/ai/conversations — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 for missing/malformed/unknown tokens", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Bearer x y" }, authorizedHeaders("unknown")]) {
+      const res = await app.request("/api/ai/conversations", { headers });
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.listAiConversations).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. GET /api/ai/conversations/:conversationId — history detail (Phase 10.23)
+// ---------------------------------------------------------------------------
+
+describe("GET /api/ai/conversations/:conversationId — authenticated", () => {
+  it("returns 200 with the stable detail shape for an owned conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "GET", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AiConversationDetail;
+    expect(body).toEqual(CANNED_DETAIL);
+    expect(body.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(body.messages.map((m) => m.isFinal)).toEqual([false, true]);
+    expect(mocks.getAiConversation).toHaveBeenCalledWith(ACTIVE_USER.id, HISTORY_CONVERSATION_ID);
+  });
+
+  it("returns the same generic 404 for a foreign and a nonexistent conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const foreignRes = await app.request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999", // owned by someone else
+      { headers: authorizedHeaders() },
+    );
+    const missingRes = await app.request(
+      "/api/ai/conversations/00000000-0000-0000-0000-000000000000",
+      { headers: authorizedHeaders() },
+    );
+
+    const foreign = await foreignRes.json();
+    const missing = await missingRes.json();
+    expect(foreign).toEqual(missing);
+    expect(foreign).toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+    expect(foreignRes.status).toBe(404);
+  });
+
+  it("rejects a malformed conversationId with the existing 400 envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/not-a-uuid!",
+      { headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "A valid conversationId is required." },
+    });
+  });
+});
+
+describe("GET /api/ai/conversations/:conversationId — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 without calling the service", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Basic abc" }, authorizedHeaders("unknown")]) {
+      const res = await app.request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { headers },
+      );
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.getAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /api/ai/conversations — unexpected failures use the generic envelope", () => {
+  it("reduces a raw repository error to internal/error without leaking internals", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.listAiConversations.mockRejectedValueOnce(
+      new Error("SECRET provider key sk-LIVE-leak at /Users/builder/src/db.ts:12"),
+    );
+
+    const res = await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("SECRET");
+    expect(JSON.stringify(res)).not.toContain("sk-LIVE");
+    expect(JSON.stringify(res)).not.toContain("/Users/builder");
+  });
+
+  it("reduces a raw service error in the detail route the same way", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.getAiConversation.mockRejectedValueOnce(
+      new Error("SECRET credential handle credential-99 leaked"),
+    );
+
+    const res = await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "GET", headers: authorizedHeaders() },
+      )
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("credential-99");
+  });
+});
+
+describe("GET /api/ai/conversations — no network / no provider invocation", () => {
+  it("performs no provider or network call while listing and reading history", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const app = makeApp();
+
+    const listRes = await app.request("/api/ai/conversations", { headers: authorizedHeaders() });
+    const detailRes = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { headers: authorizedHeaders() },
+    );
+
+    expect(listRes.status).toBe(200);
+    expect(detailRes.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
   });
 });
