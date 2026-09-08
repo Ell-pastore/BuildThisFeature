@@ -447,3 +447,113 @@ describe("CredentialPool — rotation", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. Credential-free entries (Phase 10.17 hardening)
+// ---------------------------------------------------------------------------
+
+describe("CredentialPool — credential-free entries carry no secret", () => {
+  it("registers a secret-less entry that still occupies one selection slot", () => {
+    const pool = new CredentialPool();
+    const handle = pool.registerCredentialFree(ProviderId.Ollama);
+
+    expect(pool.has(ProviderId.Ollama)).toBe(true);
+    expect(pool.registeredProviders).toContain(ProviderId.Ollama);
+    expect(pool.all(ProviderId.Ollama)).toHaveLength(1);
+    expect(handle.id).toBe("credential-1");
+    expect(handle.provider).toBe("ollama");
+    // Selection works like a real credential — the fallback counts this slot.
+    expect(pool.obtain(ProviderId.Ollama)).toEqual(handle);
+  });
+
+  it("refuses to reveal a credential-free entry as a secret", () => {
+    const pool = new CredentialPool();
+    const free = pool.registerCredentialFree(ProviderId.Ollama);
+
+    try {
+      pool.reveal(free);
+      expect.unreachable("reveal must refuse a credential-free entry");
+    } catch (error) {
+      expect(isCredentialPoolError(error)).toBe(true);
+      const err = error as CredentialPoolError;
+      expect(err.code).toBe("credential-pool/not-a-secret");
+      // The refusal carries no value anywhere — and the old string sentinel
+      // ("__credential_free__") is completely gone from the error surface.
+      expectNoSecret(err);
+      expect(err.message).not.toContain("__credential_free__");
+    }
+  });
+
+  it("keeps handles of credential-free entries minimal and serializable-clean", () => {
+    const pool = new CredentialPool();
+    const free = pool.registerCredentialFree(ProviderId.Ollama);
+
+    // Just id + provider (the brand is a non-serializable symbol) — no value,
+    // no flag, nothing resembling a key. The stub id is the same scheme as a
+    // real credential, but there is no secret to serialize.
+    expect(Object.keys(free)).toEqual(["id", "provider"]);
+    expect(JSON.stringify(free)).not.toContain("secret");
+    expect(JSON.stringify(pool.all(ProviderId.Ollama))).not.toContain(
+      "__credential_free__",
+    );
+  });
+
+  it("rotation over a single free slot is bounded and never yields a key", () => {
+    const pool = new CredentialPool();
+    const free = pool.registerCredentialFree(ProviderId.Ollama);
+
+    // Round-robin over the ONE slot cycles onto itself, just like a single
+    // real credential — but there is no value to rotate.
+    expect(pool.obtain(ProviderId.Ollama)).toEqual(free);
+    expect(pool.rotate(ProviderId.Ollama)).toEqual(free);
+    expect(pool.rotate(ProviderId.Ollama)).toEqual(free);
+
+    // No number of rotations turns the slot into a revealable secret.
+    expect(() => pool.reveal(pool.obtain(ProviderId.Ollama))).toThrowError(
+      CredentialPoolError,
+    );
+  });
+
+  it("never confuses free entries with real credentials next to them", () => {
+    const pool = new CredentialPool();
+    const real = pool.register(ProviderId.Grok, FAKE_GROK_KEY, "primary");
+    const free = pool.registerCredentialFree(ProviderId.Ollama);
+
+    // Real credentials remain fully opaque and revealable…
+    expect(pool.reveal(real)).toBe(FAKE_GROK_KEY);
+    expect(JSON.stringify(real)).not.toContain(FAKE_GROK_KEY);
+    // …while the credential-free slot stays refusable.
+    expect(() => pool.reveal(free)).toThrowError(
+      expect.objectContaining({ code: "credential-pool/not-a-secret" }),
+    );
+    // Same auto-id scheme per provider, never sharing a slot.
+    expect(pool.all(ProviderId.Grok).map((h) => h.id)).toEqual(["primary"]);
+    expect(pool.all(ProviderId.Ollama).map((h) => h.id)).toEqual([
+      "credential-1",
+    ]);
+  });
+
+  it("rejects duplicate ids for credential-free entries too", () => {
+    const pool = new CredentialPool();
+    pool.registerCredentialFree(ProviderId.Ollama, "local");
+    expect(() =>
+      pool.registerCredentialFree(ProviderId.Ollama, "local"),
+    ).toThrowError(CredentialPoolError);
+  });
+
+  it("registration order mixes credentials and free entries deterministically", () => {
+    const pool = new CredentialPool();
+    pool.register(ProviderId.Grok, FAKE_GROK_KEY);
+    pool.registerCredentialFree(ProviderId.Ollama);
+    pool.register(ProviderId.Grok, FAKE_GROK_KEY_2);
+
+    // Within a provider the slots keep their deterministic ids.
+    expect(pool.all(ProviderId.Grok).map((h) => h.id)).toEqual([
+      "credential-1",
+      "credential-2",
+    ]);
+    expect(pool.all(ProviderId.Ollama).map((h) => h.id)).toEqual([
+      "credential-1",
+    ]);
+  });
+});

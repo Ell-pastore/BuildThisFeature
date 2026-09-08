@@ -36,6 +36,7 @@ import {
   type AgentResponse,
 } from "./provider.js";
 import { ProviderFallbackError } from "./providerFallback.js";
+import { CredentialPoolError } from "./credentialPool.js";
 import { ProviderId } from "./providerSelection.js";
 
 // ---------------------------------------------------------------------------
@@ -342,17 +343,136 @@ describe("Ollama with no credentials", () => {
 
     expect(stack.credentialFreeProviders).toEqual([ProviderId.Ollama]);
     expect(stack.credentialProviders).toEqual([]);
-    // Exactly one non-secret placeholder so the unchanged fallback layer
-    // tries the provider once.
+    // Exactly ONE credential-free pool slot so the unchanged fallback layer
+    // tries the provider exactly once — the slot carries no secret and can
+    // never be revealed as a key.
     expect(stack.credentials.all(ProviderId.Ollama)).toHaveLength(1);
+    expect(() =>
+      stack.credentials.reveal(stack.credentials.obtain(ProviderId.Ollama)),
+    ).toThrowError(CredentialPoolError);
 
     const response = await stack.provider.generate({ message: "x", tools: [] });
 
     expect(response).toEqual({ text: "local reply" });
     const call = captured[0];
     expect(call?.url).toBe("http://localhost:11434/api/chat");
-    // No credential is ever attached to the local request.
+    // The local request carries NO credential: no Authorization header, and
+    // the request body contains no key material.
     expect(call?.init.headers.Authorization).toBeUndefined();
+    expect(Object.keys(call?.init.headers ?? {})).toEqual(["Content-Type"]);
+    expect(JSON.stringify(call?.init.body ?? "")).not.toContain(
+      "__credential_free__",
+    );
+  });
+
+  it("constructs the Ollama adapter with no credential value at all", async () => {
+    // The factory seam receives `undefined` for a credential-free provider —
+    // never the free slot (which the pool refuses to reveal anyway).
+    stubFetchQueue([
+      () =>
+        makeResponse({
+          message: { role: "assistant", content: "local reply" },
+        }),
+    ]);
+    const factory = vi
+      .fn()
+      .mockImplementation(
+        (_provider: string, _s: ProviderSettings, _value: string | undefined) =>
+          fakeProvider("from injected factory for ollama"),
+      );
+    const stack = composeProviderStack({
+      ...makeOptions({ chain: [ProviderId.Ollama] }),
+      adapterFactory: factory,
+    });
+
+    const response = await stack.provider.generate({ message: "x", tools: [] });
+
+    expect(response).toEqual({ text: "from injected factory for ollama" });
+    expect(factory).toHaveBeenCalledWith(
+      ProviderId.Ollama,
+      expect.objectContaining({ model: "qwen3" }),
+      undefined,
+    );
+  });
+
+  it("never exposes the removed placeholder string anywhere in the surface", async () => {
+    const SENTINEL = "__credential_free__";
+    stubFetchQueue([
+      () =>
+        makeResponse({
+          message: { role: "assistant", content: "ok" },
+        }),
+    ]);
+    const stack = composeProviderStack(
+      makeOptions({ chain: [ProviderId.Ollama] }),
+    );
+
+    const response = await stack.provider.generate({ message: "x", tools: [] });
+
+    // Not in the facade, the pool surface, the response, or the request.
+    expect(JSON.stringify(stack.provider)).not.toContain(SENTINEL);
+    expect(JSON.stringify(stack.credentials.all(ProviderId.Ollama))).not.toContain(
+      SENTINEL,
+    );
+    expect(JSON.stringify(response)).not.toContain(SENTINEL);
+  });
+
+  it("rotation advances the free slot without ever turning it into a key", async () => {
+    // Ollama is unavailable first (Unavailable → rotate-eligible), so the
+    // fallback rotates its single free slot and moves to Grok.
+    const { captured } = stubFetchQueue([
+      failWithUnavailable(),
+      () => makeResponse({ choices: [{ message: { content: "from grok" } }] }),
+    ]);
+    const stack = composeProviderStack(
+      makeOptions({
+        chain: [ProviderId.Ollama, ProviderId.Grok],
+        credentials: { [ProviderId.Grok]: ["grok-key-1"] },
+      }),
+    );
+
+    const response = await stack.provider.generate({ message: "x", tools: [] });
+
+    expect(response).toEqual({ text: "from grok" });
+    expect(captured).toHaveLength(2);
+    // The local attempt carried no credential; Grok used its own.
+    expect(captured[0]?.url).toBe("http://localhost:11434/api/chat");
+    expect(captured[0]?.init.headers.Authorization).toBeUndefined();
+    expect(captured[1]?.init.headers.Authorization).toBe("Bearer grok-key-1");
+    // After rotation the free slot is unchanged: still one entry, still a
+    // non-secret that reveal refuses.
+    expect(stack.credentials.all(ProviderId.Ollama)).toHaveLength(1);
+    expect(() =>
+      stack.credentials.reveal(stack.credentials.obtain(ProviderId.Ollama)),
+    ).toThrowError(CredentialPoolError);
+  });
+
+  it("exhaustion of the credential-free path reports ids, never a secret", async () => {
+    const { captured } = stubFetchQueue([failWithUnavailable()]);
+    const stack = composeProviderStack(
+      makeOptions({ chain: [ProviderId.Ollama] }),
+    );
+
+    try {
+      await stack.provider.generate({ message: "x", tools: [] });
+      expect.unreachable("single credential-free provider must exhaust");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProviderFallbackError);
+      const err = error as ProviderFallbackError;
+      // The summary names provider + the free slot's deterministic id — the
+      // removed sentinel string and any secret-shaped value stay absent.
+      expect(err.attempted).toEqual([
+        expect.objectContaining({
+          provider: ProviderId.Ollama,
+          credentialId: "credential-1",
+          code: ProviderErrorCode.Unavailable,
+        }),
+      ]);
+      expect(JSON.stringify(err.attempted)).not.toContain("__credential_free__");
+      expect(err.message).not.toContain("__credential_free__");
+    }
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.init.headers.Authorization).toBeUndefined();
   });
 });
 

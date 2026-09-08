@@ -34,10 +34,11 @@
  *     single `AI_PROVIDER`), the credential pool preserves registration
  *     order, and the fallback layer iterates in the configured order.
  *   - OLLAMA'S NO-CREDENTIAL PATH IS PRESERVED: local Ollama needs no
- *     secret. It gets exactly one non-secret "local" placeholder registered
- *     in the pool so the fallback layer's per-provider credential loop
- *     (which is not redesigned here) attempts it; the build hook never
- *     reveals that placeholder and constructs the local adapter instead.
+ *     secret. It gets exactly ONE credential-free pool entry (registered via
+ *     `CredentialPool.registerCredentialFree()` — no value stored, refused
+ *     by `reveal()`) so the fallback layer's per-provider credential loop
+ *     (which is not redesigned here) attempts it exactly once; the build
+ *     hook never reveals a value and constructs the local adapter instead.
  *   - FAIL CLEARLY AT COMPOSITION TIME: an empty/unknown/duplicate chain,
  *     malformed settings, a missing required model, or a required-credential
  *     provider with no credentials raises a typed `ProviderCompositionError`
@@ -171,9 +172,6 @@ const REQUIRES_CREDENTIAL: ReadonlySet<ProviderIdType> = new Set([
   ProviderId.OpenRouter,
 ]);
 
-/** The non-secret pool registration for a no-credential provider (Ollama). */
-const CREDENTIAL_FREE_PLACEHOLDER = "__credential_free__";
-
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -275,7 +273,7 @@ function validateCredentials(
  * Construct ONE concrete provider adapter for a composed stack. This is the
  * only place in the codebase that news the real adapters, and the only place
  * a credential VALUE is revealed. Credential-free providers (Ollama) pass no
- * credential and their pool placeholder is never revealed.
+ * credential and their credential-free pool entry carries no secret.
  */
 function buildBuiltinAdapter(
   provider: ProviderIdType,
@@ -306,7 +304,8 @@ function buildBuiltinAdapter(
       });
     case ProviderId.Ollama:
       // Local Ollama needs no credential — the constructed adapter is
-      // unauthenticated and the pool placeholder is never revealed.
+      // unauthenticated and the pool's credential-free entry is never
+      // revealed (the pool refuses it with `not-a-secret`).
       return createOllamaProvider({
         model: settings.model,
         baseUrl: settings.baseUrl,
@@ -331,8 +330,8 @@ function buildBuiltinAdapter(
  * Compose the provider stack from explicit options.
  *
  * Validates the chain and settings, registers every chain provider's
- * credentials (and the no-credential placeholder for credential-free
- * providers), and wires the pool through the fallback layer. Throws a typed
+ * credentials (and a credential-free entry for providers that require none),
+ * and wires the pool through the fallback layer. Throws a typed
  * `ProviderCompositionError` synchronously on any invalid configuration —
  * before any provider is contacted.
  */
@@ -363,7 +362,9 @@ export function composeProviderStack(
     }
   }
   for (const id of credentialFreeProviders) {
-    credentials.register(id, CREDENTIAL_FREE_PLACEHOLDER);
+    // One secret-less slot so the fallback's per-provider loop attempts the
+    // provider exactly once; the pool refuses to reveal it.
+    credentials.registerCredentialFree(id);
   }
 
   const build: ProviderBuilder = (provider, handle) => {

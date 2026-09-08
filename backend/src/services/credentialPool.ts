@@ -30,6 +30,13 @@
  *     nothing auto-rotates. `all()` exposes every handle in registration
  *     order so future fallback logic can iterate without touching
  *     `AgentProvider`.
+ *   - CREDENTIAL-FREE ENTRIES: local providers that need no secret (e.g.
+ *     Ollama) are registered via `registerCredentialFree()` — an entry that
+ *     occupies ONE selection/rotation slot so orchestration layers can treat
+ *     every provider uniformly, but that carries NO secret value and is
+ *     REFUSED by `reveal()`. It can never be revealed as a credential, never
+ *     conflicts with a real key value (there is no value), and never leaves
+ *     this module.
  *   - NEVER LOGGED: this module never logs anything, and error messages and
  *     tests carry only provider ids and credential IDs — never values.
  *
@@ -67,11 +74,15 @@ export interface OpaqueCredential {
   readonly provider: ProviderIdType;
 }
 
-interface RegisteredCredential {
-  id: string;
-  provider: ProviderIdType;
-  value: string;
-}
+/**
+ * A stored pool entry. Real credentials carry an opaque secret VALUE inside
+ * the pool (revealed only through `reveal()`); credential-free entries carry
+ * NO value at all, occupy a selection/rotation slot, and are refused by
+ * `reveal()` — so they can never be confused with a real API key.
+ */
+type RegisteredCredential =
+  | { kind: "secret"; id: string; provider: ProviderIdType; value: string }
+  | { kind: "credential-free"; id: string; provider: ProviderIdType };
 
 function toHandle(entry: RegisteredCredential): OpaqueCredential {
   return { [credentialBrand]: true, id: entry.id, provider: entry.provider };
@@ -93,7 +104,8 @@ export type CredentialPoolErrorCode =
   | "credential-pool/missing-credentials"
   | "credential-pool/duplicate-credential-id"
   | "credential-pool/empty-credential"
-  | "credential-pool/unknown-handle";
+  | "credential-pool/unknown-handle"
+  | "credential-pool/not-a-secret";
 
 /**
  * A typed failure from the credential pool. Messages name provider ids and
@@ -150,6 +162,19 @@ export class CredentialPoolError extends Error {
     return new CredentialPoolError(
       "credential-pool/unknown-handle",
       "Credential handle does not belong to this pool.",
+    );
+  }
+
+  /**
+   * The handle exists but carries NO secret — it is a credential-free entry
+   * (e.g. a local provider registered via `registerCredentialFree`).
+   * Revealing it is refused so such an entry can never be mistaken for a
+   * real provider API key.
+   */
+  static notSecret(): CredentialPoolError {
+    return new CredentialPoolError(
+      "credential-pool/not-a-secret",
+      "The credential handle carries no secret value (credential-free provider).",
     );
   }
 }
@@ -211,9 +236,41 @@ export class CredentialPool {
     }
 
     const entry: RegisteredCredential = {
+      kind: "secret",
       id: credentialId,
       provider,
       value,
+    };
+    existing.push(entry);
+    this.credentials.set(provider, existing);
+
+    return toHandle(entry);
+  }
+
+  /**
+   * Register a CREDENTIAL-FREE provider entry (e.g. local Ollama): one slot
+   * in the provider's selection/rotation list so orchestration layers (the
+   * fallback, which needs a counted entry) can treat every provider
+   * uniformly. The entry carries NO secret value and `reveal()` refuses it,
+   * so it can never be turned into a provider API key. Ids follow the same
+   * deterministic scheme as real credentials.
+   *
+   * @throws `CredentialPoolError` on a duplicate id.
+   */
+  registerCredentialFree(
+    provider: ProviderIdType,
+    id?: string,
+  ): OpaqueCredential {
+    const existing = this.credentials.get(provider) ?? [];
+    const credentialId = id ?? `credential-${existing.length + 1}`;
+    if (existing.some((entry) => entry.id === credentialId)) {
+      throw CredentialPoolError.duplicate(provider, credentialId);
+    }
+
+    const entry: RegisteredCredential = {
+      kind: "credential-free",
+      id: credentialId,
+      provider,
     };
     existing.push(entry);
     this.credentials.set(provider, existing);
@@ -297,6 +354,11 @@ export class CredentialPool {
     const entry = list?.find((candidate) => candidate.id === handle.id);
     if (entry === undefined) {
       throw CredentialPoolError.unknownHandle();
+    }
+    if (entry.kind !== "secret") {
+      // A credential-free entry has no value to hand out — refuse it so the
+      // slot can never be mistaken for (or used as) a real API key.
+      throw CredentialPoolError.notSecret();
     }
     return entry.value;
   }
