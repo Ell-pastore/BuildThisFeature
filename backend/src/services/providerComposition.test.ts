@@ -38,6 +38,7 @@ import {
 import { ProviderFallbackError } from "./providerFallback.js";
 import { CredentialPoolError } from "./credentialPool.js";
 import { ProviderId } from "./providerSelection.js";
+import { createProviderHealth } from "./providerHealth.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -960,5 +961,87 @@ describe("composition failure behavior", () => {
       "provider-composition/missing-credentials",
       ProviderId.Grok,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. Credential health / cooldown integration (Phase 10.18)
+// ---------------------------------------------------------------------------
+
+describe("provider composition — credential health / cooldown", () => {
+  it("skips a cooled-down credential by default (no option needed)", async () => {
+    const { captured } = stubFetchQueue([failWithUnavailable()]);
+    const stack = composeProviderStack(
+      makeOptions({ credentials: { [ProviderId.Grok]: ["grok-key-1"] } }),
+    );
+
+    // Call 1: the only Grok credential fails as unavailable → cooling down.
+    await expect(
+      stack.provider.generate({ message: "x", tools: [] }),
+    ).rejects.toBeInstanceOf(ProviderFallbackError);
+    expect(captured).toHaveLength(1);
+
+    // Call 2: the credential is still in cooldown → SKIPPED (typed), and the
+    // provider is NOT contacted again — the queue's single remaining step
+    // would throw if a request were made.
+    try {
+      await stack.provider.generate({ message: "x", tools: [] });
+      expect.unreachable("all credentials cooling down must exhaust");
+    } catch (error) {
+      const err = error as ProviderFallbackError;
+      expect(err.attempted[0]).toMatchObject({
+        provider: ProviderId.Grok,
+        credentialId: "credential-1",
+        code: "provider/credential-cooldown",
+      });
+      expect(err.message).not.toContain("grok-key-1");
+      expect(JSON.stringify(err.attempted)).not.toContain("grok-key-1");
+    }
+
+    // Still exactly one provider contact — the cooldown skip made no request.
+    expect(captured).toHaveLength(1);
+  });
+
+  it("recovers a cooled credential once the cooldown window expires", async () => {
+    const clock = { value: 1_000_000 };
+    const health = createProviderHealth({
+      cooldownMs: 60_000,
+      now: () => clock.value,
+    });
+    const { captured } = stubFetchQueue([
+      failWithUnavailable(),
+      () => makeResponse({ choices: [{ message: { content: "recovered" } }] }),
+    ]);
+    const stack = composeProviderStack(
+      makeOptions({
+        credentials: { [ProviderId.Grok]: ["grok-key-1"] },
+        health,
+      }),
+    );
+
+    // Call 1: the only Grok credential fails as unavailable → cooling down.
+    await expect(
+      stack.provider.generate({ message: "x", tools: [] }),
+    ).rejects.toBeInstanceOf(ProviderFallbackError);
+    expect(captured).toHaveLength(1);
+
+    // Call 2 (still within the window): skipped, no provider contact.
+    try {
+      await stack.provider.generate({ message: "x", tools: [] });
+      expect.unreachable("must stay in cooldown");
+    } catch (error) {
+      expect((error as ProviderFallbackError).attempted[0]?.code).toBe(
+        "provider/credential-cooldown",
+      );
+    }
+    expect(captured).toHaveLength(1);
+
+    // After the FIXED window passes, the same credential recovers and a fresh
+    // call succeeds through it.
+    clock.value += 60_000;
+
+    const response = await stack.provider.generate({ message: "x", tools: [] });
+    expect(response).toEqual({ text: "recovered" });
+    expect(captured).toHaveLength(2);
   });
 });

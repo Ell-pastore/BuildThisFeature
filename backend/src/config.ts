@@ -178,4 +178,15 @@ export const config = {
   aiProviderFallback: listFromEnv(process.env.AI_PROVIDER_FALLBACK) ?? [
     process.env.AI_PROVIDER ?? "grok",
   ],
+  /**
+   * Credential cooldown window in milliseconds (Phase 10.18). After a
+   * rotation-eligible provider failure, the in-memory health component keeps
+   * that credential unavailable for a fixed cooldownMs so the stacked
+   * provider skips it instead of hammering it on the next call. Defaults to
+   * 5 seconds; operators can tune it via `PROVIDER_COOLDOWN_MS`.
+   */
+  providerCooldownMs: Math.max(
+    1000,
+    intFromEnv(process.env.PROVIDER_COOLDOWN_MS) ?? 5_000,
+  ),
 };

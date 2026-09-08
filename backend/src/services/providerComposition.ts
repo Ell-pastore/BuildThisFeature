@@ -48,6 +48,11 @@
  *     inside the build hook. Composition errors carry provider ids and
  *     credential ids — never credential values — and this module never logs
  *     anything.
+ *   - HEALTH STAYS SERVER-SIDE: the Phase 10.18 in-memory cooldown is wired
+ *     into the fallback (skip cooling-down credentials, mark only
+ *     rotate-eligible failures, reset on success), keyed by opaque handles.
+ *     It never leaves this boundary: no agent exposure, no persistence, no
+ *     values, no real provider contact.
  *
  * The running server calls `composeDefaultProviderStack()` once at startup
  * (when the first provider-backed agent is wired); the returned
@@ -71,6 +76,10 @@ import { createGeminiProvider } from "./geminiProvider.js";
 import { createOpenRouterProvider } from "./openrouterProvider.js";
 import { createOllamaProvider } from "./ollamaProvider.js";
 import { config } from "../config.js";
+import {
+  createProviderHealth,
+  type ProviderHealth,
+} from "./providerHealth.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,6 +114,14 @@ export interface ProviderCompositionOptions {
     settings: ProviderSettings,
     credentialValue: string | undefined,
   ) => AgentProvider;
+  /**
+   * Injectable in-memory credential health/cooldown (Phase 10.18). Defaults to
+   * a fresh `createProviderHealth` wired to `config.providerCooldownMs`, so
+   * the composed stack ALWAYS avoids hammering a credential that just failed
+   * with a safe, replaceable error. Passing an instance lets tests/hosts own
+   * the cooldown window and clock. Never exposed past this boundary.
+   */
+  health?: ProviderHealth;
 }
 
 /** The composed provider stack returned by composeProviderStack. */
@@ -393,6 +410,11 @@ export function composeProviderStack(
     providers: chain,
     credentials,
     build,
+    // Phase 10.18 health/cooldown: injectable, defaulting to the configured
+    // cooldown window. The fallback skips a cooling-down credential before
+    // building the adapter, and marks it only when it already classified the
+    // failure as credential-rotatable — no new classification here.
+    health: options.health ?? createProviderHealth({ cooldownMs: config.providerCooldownMs }),
   });
 
   return {

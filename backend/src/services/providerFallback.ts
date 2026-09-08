@@ -46,6 +46,7 @@ import {
   ProviderErrorCode,
 } from "./provider.js";
 import type { OpaqueCredential } from "./credentialPool.js";
+import type { ProviderHealth } from "./providerHealth.js";
 import type { ProviderId as ProviderIdType } from "./providerSelection.js";
 
 // `ProviderId` is the value-map name-space in providerSelection; here we only
@@ -122,6 +123,22 @@ export interface ProviderFallbackOptions {
    * original error propagates unchanged and no further attempts are made.
    */
   classify?: (error: unknown) => ProviderFailureAction;
+  /**
+   * Optional in-memory credential health/cooldown (Phase 10.18). When given,
+   * the orchestrator:
+   *
+   *   - SKIPS any credential that is currently cooling down (recording a
+   *     `provider/credential-cooldown` attempt and advancing rotation so other
+   *     credentials of the same provider still get a chance);
+   *   - MARKS a credential unavailable via `markUnavailable()` exactly when
+   *     the existing failure classification already decided to rotate
+   *     (reused verbatim — no new classification lives here);
+   *   - RESETS the credential's cooldown when its `generate()` SUCCEEDS.
+   *
+   * It never reveals a value and never appears in agent contracts. When
+   * omitted, the orchestration behaves exactly as before (no cooldown).
+   */
+  health?: ProviderHealth;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +149,7 @@ export interface ProviderFallbackOptions {
 export type ProviderFailureCode =
   | ProviderErrorCode
   | "credential-pool/missing-credentials"
+  | "provider/credential-cooldown"
   | "provider/unguarded";
 
 /** One failed attempt: WHO failed, with which id — never the secret. */
@@ -208,10 +226,27 @@ export function createFallbackProvider(
 
       for (let attempt = 0; attempt < total; attempt += 1) {
         const handle = options.credentials.obtain(provider);
+
+        if (options.health && !options.health.isAvailable(handle)) {
+          // The credential is cooling down (Phase 10.18): skip it and rotate
+          // to the next credential so a healthy one still gets a chance. A
+          // skipped slot records a distinct typed code — never the value.
+          attempts.push({
+            provider,
+            credentialId: handle.id,
+            code: "provider/credential-cooldown",
+          });
+          options.credentials.rotate(provider);
+          continue;
+        }
+
         const instance = options.build(provider, handle);
 
         try {
-          return await instance.generate(request);
+          const response = await instance.generate(request);
+          // A working credential heals immediately (clears any cooldown).
+          options.health?.reset(handle);
+          return response;
         } catch (error) {
           const action = classify(error);
           if (action !== "rotate-credential") {
@@ -225,6 +260,10 @@ export function createFallbackProvider(
           });
           // Reuse the pool's rotation state — advance for the next attempt.
           options.credentials.rotate(provider);
+          // Record the temporary unavailability (fixed-duration cooldown, so
+          // repeated failures don't extend the window). Classification is
+          // EXACTLY the existing `classify` decision above — nothing new.
+          options.health?.markUnavailable(handle);
         }
       }
     }

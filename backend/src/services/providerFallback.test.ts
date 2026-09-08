@@ -32,6 +32,7 @@ import {
 } from "./provider.js";
 import type { AgentProvider, AgentResponse, AgentProviderRequest } from "./provider.js";
 import { ProviderId } from "./providerSelection.js";
+import { createProviderHealth, type ProviderHealth } from "./providerHealth.js";
 
 // `ProviderId` from providerSelection is both a const map (value, e.g.
 // ProviderId.Grok) and the provider-id string union (type, e.g. "gemini" as
@@ -553,5 +554,227 @@ describe("Provider fallback — classification policy", () => {
     expect(classifyProviderFailure(new Error("boom"))).toBe("stop");
     expect(classifyProviderFailure("string error")).toBe("stop");
     expect(classifyProviderFailure(undefined)).toBe("stop");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Cooldown / health integration (Phase 10.18)
+// ---------------------------------------------------------------------------
+
+function fakeClock(): { now: () => number; value: number } {
+  const state = { value: 1_000_000 };
+  return {
+    get value(): number {
+      return state.value;
+    },
+    set value(next: number) {
+      state.value = next;
+    },
+    now: () => state.value,
+  };
+}
+
+describe("Provider fallback — skipping credentials in cooldown", () => {
+  it("marks a failed credential and SKIPS it on the next call (no rebuild)", async () => {
+    const clock = fakeClock();
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a");
+    const health = createProviderHealth({ cooldownMs: 60_000, now: clock.now });
+
+    const buildCalls: string[] = [];
+    const build: ProviderBuilder = (_provider, handle) => {
+      buildCalls.push(handle.id);
+      return providerThatThrows(unavailableFailure());
+    };
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build,
+      health,
+    });
+
+    // Call 1: the only credential fails as unavailable → rotate + cooldown.
+    await expect(run(provider)).rejects.toBeInstanceOf(ProviderFallbackError);
+    expect(health.isAvailable(pool.obtain(ProviderId.Grok))).toBe(false);
+    expect(buildCalls).toEqual(["a"]);
+
+    // Call 2: the credential is cooling down → skipped with a typed code, and
+    // the adapter is NOT rebuilt (no duplicate construction, no requests).
+    try {
+      await run(provider);
+      expect.unreachable("all credentials cooling down must exhaust");
+    } catch (error) {
+      const err = error as ProviderFallbackError;
+      expect(err.attempted).toEqual([
+        expect.objectContaining({
+          provider: ProviderId.Grok,
+          credentialId: "a",
+          code: "provider/credential-cooldown",
+        }),
+      ]);
+    }
+    expect(buildCalls).toEqual(["a"]);
+  });
+
+  it("rotates past a cooled credential to a healthy one in the same provider", async () => {
+    const clock = fakeClock();
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a");
+    registerKey(pool, ProviderId.Grok, "b");
+    const health = createProviderHealth({ cooldownMs: 60_000, now: clock.now });
+    // "a" cooled down from an earlier failure; "b" is healthy.
+    health.markUnavailable(pool.obtain(ProviderId.Grok));
+
+    const buildCalls: string[] = [];
+    const build: ProviderBuilder = (_provider, handle) => {
+      buildCalls.push(handle.id);
+      return handle.id === "b" ? providerThatResponds("ok") : providerThatThrows(unavailableFailure());
+    };
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build,
+      health,
+    });
+
+    const response = await run(provider);
+
+    expect(response).toEqual({ text: "ok" });
+    // The cooled credential was passed over; only "b" was constructed.
+    expect(buildCalls).toEqual(["b"]);
+    // "a" stays in cooldown; "b" is healthy right after succeeding.
+    const [aHandle, bHandle] = pool.all(ProviderId.Grok);
+    expect(aHandle).toBeDefined();
+    expect(bHandle).toBeDefined();
+    if (!aHandle || !bHandle) return;
+    expect(health.isAvailable(aHandle)).toBe(false);
+    expect(health.isAvailable(bHandle)).toBe(true);
+  });
+
+  it("resets the credential's cooldown when its generate() succeeds", async () => {
+    const clock = fakeClock();
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a");
+    const real = createProviderHealth({ cooldownMs: 60_000, now: clock.now });
+    const reset = vi.fn((handle) => real.reset(handle));
+    const health: ProviderHealth = {
+      isAvailable: (h) => real.isAvailable(h),
+      markUnavailable: (h) => real.markUnavailable(h),
+      reset,
+      cooldownExpiresAt: (h) => real.cooldownExpiresAt(h),
+    };
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build: () => providerThatResponds("ok"),
+      health,
+    });
+
+    const response = await run(provider);
+
+    expect(response).toEqual({ text: "ok" });
+    // The successful handle is reset/healed by the orchestrator.
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(reset.mock.calls[0]?.[0].provider).toBe(ProviderId.Grok);
+    expect(reset.mock.calls[0]?.[0].id).toBe("a");
+  });
+
+  it("recovers a cooled credential once its cooldown has expired", async () => {
+    const clock = fakeClock();
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a");
+    const health = createProviderHealth({ cooldownMs: 60_000, now: clock.now });
+
+    const buildCalls: string[] = [];
+    const build: ProviderBuilder = (_provider, handle) => {
+      buildCalls.push(handle.id);
+      return providerThatThrows(unavailableFailure());
+    };
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build,
+      health,
+    });
+
+    // Call 1: the only credential fails → marked cooling down.
+    await expect(run(provider)).rejects.toBeInstanceOf(ProviderFallbackError);
+    expect(buildCalls).toEqual(["a"]);
+    expect(health.isAvailable(pool.obtain(ProviderId.Grok))).toBe(false);
+
+    // Move the injected clock past the fixed cooldown window: the credential
+    // recovers automatically (never permanent).
+    clock.value =
+      (health.cooldownExpiresAt(pool.obtain(ProviderId.Grok)) as number) + 1;
+
+    // Same pool + same health component; the provider now answers fine.
+    const recovered = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build: () => providerThatResponds("recovered"),
+      health,
+    });
+    const response = await run(recovered);
+
+    expect(response).toEqual({ text: "recovered" });
+    expect(health.isAvailable(pool.obtain(ProviderId.Grok))).toBe(true);
+  });
+
+  it("does not skip when no health component is wired (opt-in)", async () => {
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a");
+    const buildCalls: string[] = [];
+    const build: ProviderBuilder = (_provider, handle) => {
+      buildCalls.push(handle.id);
+      return providerThatThrows(unavailableFailure());
+    };
+    // No `health`: identical degraded-run behavior to Phase 10.13 — every
+    // call retries the same single credential immediately.
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok],
+      credentials: pool,
+      build,
+    });
+
+    await expect(run(provider)).rejects.toBeInstanceOf(ProviderFallbackError);
+    await expect(run(provider)).rejects.toBeInstanceOf(ProviderFallbackError);
+
+    expect(buildCalls).toEqual(["a", "a"]);
+  });
+
+  it("keeps cooldown summaries free of secret values", async () => {
+    const clock = fakeClock();
+    const pool = makePool();
+    registerKey(pool, ProviderId.Grok, "a", "super-secret-a");
+    registerKey(pool, "gemini" as ProviderId, "x", "super-secret-x");
+    const health = createProviderHealth({ cooldownMs: 60_000, now: clock.now });
+
+    const provider = createFallbackProvider({
+      providers: [ProviderId.Grok, "gemini" as ProviderId],
+      credentials: pool,
+      build: (_p, handle) =>
+        providerThatThrows(
+          handle.id === "a" ? unavailableFailure() : authFailure(),
+        ),
+      health,
+    });
+
+    // Call 1: both credentials fail and enter cooldown.
+    await expect(run(provider)).rejects.toBeInstanceOf(ProviderFallbackError);
+    // Call 2: everything is cooling down → exhausted via cooldown skips.
+    try {
+      await run(provider);
+      expect.unreachable("must exhaust");
+    } catch (error) {
+      const err = error as ProviderFallbackError;
+      expect(err.attempted.map((a) => a.code)).toEqual([
+        "provider/credential-cooldown",
+        "provider/credential-cooldown",
+      ]);
+      expect(err.message).not.toContain("super-secret-a");
+      expect(err.message).not.toContain("super-secret-x");
+      expect(JSON.stringify(err.attempted)).not.toContain("super-secret-a");
+      expect(JSON.stringify(err.attempted)).not.toContain("super-secret-x");
+    }
   });
 });
