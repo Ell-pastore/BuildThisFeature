@@ -32,7 +32,11 @@ import { aiRoutes } from "./ai.js";
 import type { AiRuntimeStatus } from "../services/aiStatus.js";
 import type { AiInstructionResponse } from "../services/aiInstructions.js";
 import { parseAiInstructionInput } from "../services/aiInstructions.js";
-import type { AiConversationDetail, AiConversationSummary } from "../services/aiConversations.js";
+import type {
+  AiConversationDeletionResult,
+  AiConversationDetail,
+  AiConversationSummary,
+} from "../services/aiConversations.js";
 import { validateConversationId } from "../services/conversationId.js";
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,7 @@ const mocks = vi.hoisted(() => ({
   runAiInstruction: vi.fn(),
   listAiConversations: vi.fn(),
   getAiConversation: vi.fn(),
+  deleteAiConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/sessions.js", () => ({
@@ -83,6 +88,7 @@ vi.mock("../services/aiConversations.js", async (importOriginal) => {
     // (malformed ids reach the 400 envelope through the service contract).
     listAiConversations: mocks.listAiConversations,
     getAiConversation: mocks.getAiConversation,
+    deleteAiConversation: mocks.deleteAiConversation,
   };
 });
 
@@ -175,11 +181,15 @@ const CANNED_DETAIL: AiConversationDetail = {
   ],
 };
 
+/** Tracks owned ids already deleted this test (default delete mock → repeated 404). */
+const deleteCounts = new Set<string>();
+
 beforeEach(() => {
   vi.clearAllMocks();
   // Every test starts WITHOUT a session; authenticated tests opt in. This
   // prevents a persistent `mockResolvedValue` from a sibling test leaking.
   mocks.findSessionByTokenHash.mockReset();
+  deleteCounts.clear();
   mocks.updateSessionLastUsedAt.mockResolvedValue(undefined);
   mocks.databaseNow.mockResolvedValue(new Date("2026-01-01T00:00:00Z"));
   mocks.getAiRuntimeStatus.mockReturnValue(CANNED_STATUS);
@@ -217,6 +227,24 @@ beforeEach(() => {
         throw AppError.notFound("Agent conversation");
       }
       return CANNED_DETAIL;
+    },
+  );
+  mocks.deleteAiConversation.mockImplementation(
+    async (userId: string, conversationId: string): Promise<AiConversationDeletionResult> => {
+      // The REAL shared UUID validator runs → malformed ids get 400; owned
+      // ids delete with the small stable result; foreign/missing collapse to
+      // the same 404. A single owned id can be deleted exactly once — the
+      // default impl flags repeated deletes so route tests exercise the
+      // "repeated deletion → 404" contract without extra orchestration.
+      validateConversationId(conversationId);
+      if (conversationId !== HISTORY_CONVERSATION_ID || userId !== ACTIVE_USER.id) {
+        throw AppError.notFound("Agent conversation");
+      }
+      if (deleteCounts.has(conversationId)) {
+        throw AppError.notFound("Agent conversation");
+      }
+      deleteCounts.add(conversationId);
+      return { conversationId, deleted: true };
     },
   );
 });
@@ -754,5 +782,179 @@ describe("GET /api/ai/conversations — no network / no provider invocation", ()
     expect(detailRes.status).toBe(200);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. DELETE /api/ai/conversations/:conversationId — deletion (Phase 10.24)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /api/ai/conversations/:conversationId — authenticated", () => {
+  it("returns 200 with the SMALL STABLE success result for an owned conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AiConversationDeletionResult;
+    // Never the deleted transcript/contents — just confirmation + the id.
+    expect(body).toEqual({ conversationId: HISTORY_CONVERSATION_ID, deleted: true });
+    expect(mocks.deleteAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+    );
+  });
+
+  it("scopes identity to the authenticated SESSION — request identity is ignored", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}?userId=99999999-9999-9999-9999-999999999999&user=attacker`,
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    // The route consults only the session user; the request cannot self-identify.
+    expect(mocks.deleteAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+    );
+  });
+});
+
+describe("DELETE /api/ai/conversations/:conversationId — ownership & 404 contract", () => {
+  it("returns the same generic 404 for a foreign and a nonexistent conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const foreignRes = await app.request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999", // owned by someone else
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+    const missingRes = await app.request(
+      "/api/ai/conversations/00000000-0000-0000-0000-000000000000",
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    const foreign = await foreignRes.json();
+    const missing = await missingRes.json();
+    expect(foreign).toEqual(missing);
+    expect(foreign).toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+    expect(foreignRes.status).toBe(404);
+    expect(missingRes.status).toBe(404);
+    // Both attempts were scoped to the SESSION user — never another identity.
+    expect(mocks.deleteAiConversation).toHaveBeenNthCalledWith(
+      1,
+      ACTIVE_USER.id,
+      "99999999-9999-9999-9999-999999999999",
+    );
+    expect(mocks.deleteAiConversation).toHaveBeenNthCalledWith(
+      2,
+      ACTIVE_USER.id,
+      "00000000-0000-0000-0000-000000000000",
+    );
+  });
+
+  it("treats a repeated deletion of an already-deleted conversation as the same 404", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const first = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+    const second = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({
+      conversationId: HISTORY_CONVERSATION_ID,
+      deleted: true,
+    });
+    expect(second.status).toBe(404);
+    await expect(second.json()).resolves.toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+  });
+
+  it("rejects a malformed conversationId with the existing 400 envelope before any delete", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/not-a-uuid!",
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "A valid conversationId is required." },
+    });
+    // The REAL shared validator runs inside the service pipeline — the
+    // malformed id reaches the service (which throws the existing 400) and is
+    // never passed toward anything destructive.
+    expect(mocks.deleteAiConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteAiConversation).toHaveBeenCalledWith(ACTIVE_USER.id, "not-a-uuid!");
+  });
+});
+
+describe("DELETE /api/ai/conversations/:conversationId — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 without calling the service", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Bearer x y" }, authorizedHeaders("unknown")]) {
+      const res = await app.request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "DELETE", headers },
+      );
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.deleteAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("DELETE /api/ai/conversations/:conversationId — unexpected failures use the generic envelope", () => {
+  it("reduces a raw service error to internal/error without leaking internals or contents", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.deleteAiConversation.mockRejectedValueOnce(
+      new Error("SECRET credential handle credential-99 leaked from /Users/builder/src/db.ts:12"),
+    );
+
+    const res = await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "DELETE", headers: authorizedHeaders() },
+      )
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("credential-99");
+    expect(JSON.stringify(res)).not.toContain("/Users/builder");
+  });
+});
+
+describe("DELETE /api/ai/conversations/:conversationId — no network / no provider invocation", () => {
+  it("performs no provider or network call while deleting", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const app = makeApp();
+
+    const res = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

@@ -24,6 +24,7 @@ import {
   appendAgentFinal,
   appendAgentTurn,
   createAgentConversation,
+  deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
   loadAgentConversationState,
@@ -101,6 +102,31 @@ function createFakeDb() {
           (c) => where.userId === undefined || c.userId === where.userId,
         );
         return sortBy(rows, orderBy);
+      }),
+      deleteMany: vi.fn(async ({ where = {} }: { where?: AnyRecord }) => {
+        const matches = conversations.filter(
+          (c) =>
+            (where.id === undefined || c.id === where.id) &&
+            (where.userId === undefined || c.userId === where.userId),
+        );
+        if (matches.length === 0) return { count: 0 };
+        for (const row of matches) {
+          // Simulates the schema's ON DELETE CASCADE: deleting the
+          // conversation deletes its transcript + conversation-scoped refs.
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const message = messages[i];
+            if (message !== undefined && message.conversationId === row.id) {
+              messages.splice(i, 1);
+            }
+          }
+        }
+        for (let i = conversations.length - 1; i >= 0; i--) {
+          const conversation = conversations[i];
+          if (conversation !== undefined && matches.includes(conversation)) {
+            conversations.splice(i, 1);
+          }
+        }
+        return { count: matches.length };
       }),
       update: vi.fn(async ({ where, data }: { where: AnyRecord; data: AnyRecord }) => {
         const row = conversations.find((c) => c.id === where.id);
@@ -763,6 +789,110 @@ describe("agentConversations repository", () => {
       const detail = await getAgentConversation(ALICE, id);
 
       expect(detail?.messages.map((m) => m.id)).toEqual(messageIds);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10.24 delete
+  // ---------------------------------------------------------------------------
+
+  describe("deleteAgentConversation", () => {
+    async function seedOwned(): Promise<string> {
+      const { id } = await persistAgentTurn({
+        userId: ALICE,
+        instruction: "List my files.",
+        maxToolRounds: 2,
+        rounds: [
+          {
+            text: "Looking…",
+            toolCalls: [{ id: "c1", toolName: "read_file_metadata", input: {} }],
+            toolResults: [
+              {
+                ok: true,
+                callId: "c1",
+                data: {
+                  fileId: "f0000000-0000-0000-0000-0000000000f0",
+                  versionId: "v0000000-0000-0000-0000-0000000000v0",
+                  name: "bill.pdf",
+                },
+              },
+            ],
+          },
+        ],
+        finalText: "Done.",
+      });
+      return id;
+    }
+
+    it("deletes an owned conversation and ALL its associated persisted messages", async () => {
+      const id = await seedOwned();
+      const before = db.messages.filter((m) => m.conversationId === id);
+
+      await expect(deleteAgentConversation(ALICE, id)).resolves.toBeUndefined();
+
+      expect(before.length).toBeGreaterThanOrEqual(3);
+      expect(db.conversations.find((c) => c.id === id)).toBeUndefined();
+      expect(db.messages.filter((m) => m.conversationId === id)).toHaveLength(0);
+    });
+
+    it("deletes atomically through ONE owned-scoped statement (no manual cleanup)", async () => {
+      const id = await seedOwned();
+
+      await deleteAgentConversation(ALICE, id);
+
+      expect(db.delegates.aiConversation.deleteMany).toHaveBeenCalledTimes(1);
+      expect(db.delegates.aiConversation.deleteMany).toHaveBeenCalledWith({
+        where: { id, userId: ALICE },
+      });
+      // No conversation row or its transcript is left behind.
+      expect(db.conversations).toHaveLength(0);
+      expect(db.messages).toHaveLength(0);
+    });
+
+    it("is indistinguishable for a foreign and a missing conversation (404 contract)", async () => {
+      const id = await seedOwned();
+
+      const foreign = deleteAgentConversation(BOB, id).catch((e) => e);
+      const missing = deleteAgentConversation(ALICE, "00000000-0000-0000-0000-000000000000").catch((e) => e);
+
+      await expect(foreign).resolves.toBeInstanceOf(AgentConversationNotFoundError);
+      await expect(missing).resolves.toBeInstanceOf(AgentConversationNotFoundError);
+      // Nothing was deleted.
+      expect(db.conversations.find((c) => c.id === id)).toBeDefined();
+      expect(db.messages.filter((m) => m.conversationId === id)).toHaveLength(3);
+    });
+
+    it("treats a repeated deletion of an already-deleted conversation as missing (404 contract)", async () => {
+      const id = await seedOwned();
+
+      await expect(deleteAgentConversation(ALICE, id)).resolves.toBeUndefined();
+      await expect(deleteAgentConversation(ALICE, id)).rejects.toBeInstanceOf(
+        AgentConversationNotFoundError,
+      );
+    });
+
+    it("never treats stored fileId/versionId references as deletion targets", async () => {
+      const id = await seedOwned();
+      // Sanity: the refs are persisted as metadata in the round row.
+      const round = db.messages.find((m) => m.conversationId === id && m.toolResults !== null);
+      expect(round?.toolResults).toEqual([
+        { ok: true, callId: "c1", data: { fileId: "f0000000-0000-0000-0000-0000000000f0", versionId: "v0000000-0000-0000-0000-0000000000v0", name: "bill.pdf" } },
+      ]);
+
+      // Seeding used the transaction; only the delete should run afterwards.
+      db.delegates.$transaction.mockClear();
+
+      await deleteAgentConversation(ALICE, id);
+
+      // Only the conversation delete happened — no file/file-version delete.
+      expect(db.delegates.$transaction).not.toHaveBeenCalled();
+      expect(db.delegates.aiConversation.deleteMany).toHaveBeenCalledTimes(1);
+      expect(db.delegates.aiConversation.deleteMany).toHaveBeenCalledWith({
+        where: { id, userId: ALICE },
+      });
+      // No message-level cleanup delegate exists — cascade reuse, never
+      // manual duplicate logic.
+      expect("deleteMany" in db.delegates.aiMessage).toBe(false);
     });
   });
 });

@@ -1,6 +1,7 @@
 /**
- * AI conversation history service (Phase 10.23) — the safe, typed read surface
- * that backs `GET /api/ai/conversations[/:conversationId]`.
+ * AI conversation history service (Phase 10.23 + 10.24) — the safe, typed
+ * surface that backs `GET /api/ai/conversations[/:conversationId]` and
+ * `DELETE /api/ai/conversations/:conversationId`.
  *
  * This module is THIN and provider-independent: it calls the existing Phase
  * 10.7 repository (`agentConversations`) for ownership-scoped reads and
@@ -29,12 +30,18 @@
  *     conversational references and are kept as references only.
  *   - ORDERING is deterministic: conversations newest-first (by `updatedAt`
  *     desc), persisted messages chronological (by `createdAt` asc).
+ *   - DELETION is owned-scoped and atomic (the repository's single
+ *     `deleteMany` + the schema's ON DELETE CASCADE): foreign/missing and
+ *     repeated deletions all collapse to 404; file/version references are
+ *     never deletion targets; deleted contents are never returned.
  *   - Provider keys, credential handles, environment variables, provider
  *     internals, stack traces, and DB internals never enter these shapes.
  *   - NO NETWORK: this module performs no provider or filesystem calls.
  */
 import { AppError } from "../core/errors.js";
 import {
+  AgentConversationNotFoundError,
+  deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
   type StoredConversation,
@@ -289,4 +296,46 @@ export async function getAiConversation(
     ...toSummary(detail.conversation),
     messages: detail.messages.map(toMessage),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Delete (Phase 10.24)
+// ---------------------------------------------------------------------------
+
+/** Stable success response for `DELETE /api/ai/conversations/:conversationId`. */
+export interface AiConversationDeletionResult {
+  conversationId: string;
+  deleted: true;
+}
+
+/**
+ * Delete ONE conversation owned by `userId`, atomically. A foreign OR
+ * missing conversation is indistinguishable and both produce the existing
+ * 404 `common/not-found` envelope; the same applies to a second deletion of
+ * an already-deleted conversation.
+ *
+ * This service NEVER returns the deleted conversation's contents and NEVER
+ * touches file/version records — `fileId`/`versionId` are metadata
+ * references, not deletion targets.
+ *
+ * @throws `AppError.badRequest` on a malformed conversationId (400
+ *         `common/bad-request`); `AppError.notFound` (404 `common/not-found`)
+ *         when the conversation does not exist for `userId`.
+ */
+export async function deleteAiConversation(
+  userId: string,
+  conversationIdParam: string,
+): Promise<AiConversationDeletionResult> {
+  const conversationId = validateConversationId(conversationIdParam);
+  try {
+    await deleteAgentConversation(userId, conversationId);
+  } catch (error) {
+    if (error instanceof AgentConversationNotFoundError) {
+      throw AppError.notFound("Agent conversation");
+    }
+    // Unexpected repository/database failures propagate raw so the HTTP
+    // layer's generic `internal/error` envelope hides the details.
+    throw error;
+  }
+  return { conversationId, deleted: true };
 }

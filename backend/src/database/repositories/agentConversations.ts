@@ -530,6 +530,40 @@ export async function getAgentConversation(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Delete (Phase 10.24)
+// ---------------------------------------------------------------------------
+
+/**
+ * Delete a user-owned conversation atomically (Phase 10.24).
+ *
+ * A single ownership-scoped `deleteMany` (`where: { id, userId }`) is one
+ * atomic SQL statement; on failure nothing is deleted and on success the
+ * schema's existing ON DELETE CASCADE FK relations remove every dependent
+ * row — the transcript `ai_messages`, conversation-scoped file/version
+ * references (`ai_file_references`), and conversation-scoped actions
+ * (`ai_actions`) — so no orphaned message or partial state can remain.
+ *
+ * Ownership is enforced by the delete predicate: a conversation whose
+ * `userId` differs, OR that does not exist, deletes nothing and throws
+ * `AgentConversationNotFoundError` — both are deliberately indistinguishable.
+ *
+ * NO file rows are ever touched: `fileId`/`versionId` values stored in the
+ * transcript are metadata references only, never deletion targets.
+ */
+export async function deleteAgentConversation(
+  userId: string,
+  conversationId: string,
+): Promise<void> {
+  const db = getDatabase();
+  const result = await db.aiConversation.deleteMany({
+    where: { id: conversationId, userId },
+  });
+  if (result.count === 0) {
+    throw new AgentConversationNotFoundError();
+  }
+}
+
 /**
  * Replay stored transcript rows into a `ConversationState`. Pure — no I/O —
  * so it is directly unit-testable. A stored `user` row starts a new turn, a

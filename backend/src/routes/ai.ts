@@ -7,6 +7,8 @@
  * `GET  /api/ai/conversations`              — list the user's conversations, newest-first.
  * `GET  /api/ai/conversations/:conversationId` — retrieve one owned conversation
  *                                              + its chronological transcript.
+ * `DELETE /api/ai/conversations/:conversationId` — delete one owned conversation
+ *                                              atomically (cascade transcript).
  *
  *   - All use the EXISTING per-route `requireAuth` middleware; unauthenticated
  *     requests receive the existing generic 401 `auth/unauthorized` envelope.
@@ -38,7 +40,11 @@ import type { AppVariables } from "../core/auth.js";
 import { AppError } from "../core/errors.js";
 import { getAiRuntimeStatus } from "../services/aiStatus.js";
 import { runAiInstruction } from "../services/aiInstructions.js";
-import { getAiConversation, listAiConversations } from "../services/aiConversations.js";
+import {
+  deleteAiConversation,
+  getAiConversation,
+  listAiConversations,
+} from "../services/aiConversations.js";
 
 export const aiRoutes = new Hono<AppVariables>()
   .get("/status", requireAuth, (c) => {
@@ -75,4 +81,13 @@ export const aiRoutes = new Hono<AppVariables>()
     const user = getCurrentUser(c);
     const conversationId = c.req.param("conversationId");
     return c.json(await getAiConversation(user.id, conversationId), 200);
+  })
+  .delete("/conversations/:conversationId", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session; the service
+    // ownership-scopes the delete, so a foreign or missing conversation (or a
+    // repeated delete) is indistinguishable and all produce the existing 404.
+    // Only the stable success result is returned — never the deleted contents.
+    const user = getCurrentUser(c);
+    const conversationId = c.req.param("conversationId");
+    return c.json(await deleteAiConversation(user.id, conversationId), 200);
   });

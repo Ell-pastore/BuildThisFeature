@@ -20,22 +20,32 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppError } from "../core/errors.js";
 import {
+  deleteAiConversation,
   getAiConversation,
   listAiConversations,
   projectStructuredValue,
   type AiConversationDetail,
+  type AiConversationDeletionResult,
   type AiConversationSummary,
 } from "./aiConversations.js";
+import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
 
 const mocks = vi.hoisted(() => ({
   listAgentConversations: vi.fn(),
   getAgentConversation: vi.fn(),
+  deleteAgentConversation: vi.fn(),
 }));
 
-vi.mock("../database/repositories/agentConversations.js", () => ({
-  listAgentConversations: mocks.listAgentConversations,
-  getAgentConversation: mocks.getAgentConversation,
-}));
+vi.mock("../database/repositories/agentConversations.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../database/repositories/agentConversations.js")>();
+  return {
+    ...actual,
+    listAgentConversations: mocks.listAgentConversations,
+    getAgentConversation: mocks.getAgentConversation,
+    deleteAgentConversation: mocks.deleteAgentConversation,
+  };
+});
 
 const ALICE = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const CONVERSATION_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -365,5 +375,86 @@ describe("getAiConversation — safe structured projection", () => {
       name: "a.pdf",
       meta: "b",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.24 delete
+// ---------------------------------------------------------------------------
+
+describe("deleteAiConversation", () => {
+  it("deletes an owned conversation and returns the small stable success result", async () => {
+    mocks.deleteAgentConversation.mockResolvedValue(undefined);
+
+    const result: AiConversationDeletionResult = await deleteAiConversation(
+      ALICE,
+      CONVERSATION_ID,
+    );
+
+    expect(mocks.deleteAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID);
+    expect(result).toEqual({ conversationId: CONVERSATION_ID, deleted: true });
+    // The stable result carries only confirmation — never deleted contents.
+    expect(Object.keys(result).sort()).toEqual(["conversationId", "deleted"]);
+  });
+
+  it("rejects a malformed conversationId with 400 before touching the repository", async () => {
+    for (const bad of ["", "not-a-uuid", "../etc/passwd", "GGGG"]) {
+      await expect(deleteAiConversation(ALICE, bad)).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.deleteAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("maps a foreign AND a missing conversation to the same 404 (indistinguishable)", async () => {
+    mocks.deleteAgentConversation.mockImplementation(() => {
+      throw new AgentConversationNotFoundError();
+    });
+
+    const foreign = await deleteAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+    const missing = await deleteAiConversation(
+      ALICE,
+      "ddd11111-1111-1111-1111-111111111111",
+    ).catch((e) => e);
+
+    expect(foreign).toBeInstanceOf(AppError);
+    expect(foreign).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(missing).toEqual(foreign);
+  });
+
+  it("treats a repeated deletion of an already-deleted conversation as 404", async () => {
+    mocks.deleteAgentConversation
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new AgentConversationNotFoundError());
+
+    await expect(deleteAiConversation(ALICE, CONVERSATION_ID)).resolves.toMatchObject({
+      deleted: true,
+    });
+    await expect(deleteAiConversation(ALICE, CONVERSATION_ID)).rejects.toMatchObject({
+      status: 404,
+      code: "common/not-found",
+    });
+  });
+
+  it("propagates unexpected repository failures raw for the generic internal-error envelope", async () => {
+    const raw = new Error("SECRET SQL: SELECT * FROM internal.creds at db.ts:9");
+    mocks.deleteAgentConversation.mockRejectedValueOnce(raw);
+
+    const outcome = await deleteAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+
+    expect(outcome).toBe(raw);
+    expect(outcome).not.toBeInstanceOf(AppError);
+  });
+
+  it("never treats stored fileId/versionId references as deletion targets", async () => {
+    mocks.deleteAgentConversation.mockResolvedValue(undefined);
+
+    await deleteAiConversation(ALICE, CONVERSATION_ID);
+
+    // The service/repository scope never receives file or version ids — only
+    // the conversation id. Anything beyond that is the repository's domain.
+    expect(mocks.deleteAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID);
+    expect(mocks.deleteAgentConversation).toHaveBeenCalledTimes(1);
   });
 });
