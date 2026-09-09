@@ -8,6 +8,8 @@ interface ConversationTranscriptProps {
   loading: boolean;
   error: string | null;
   onRetry: () => void;
+  /** Reconcile a conversation after an approval decision (reload from server). */
+  onReconcile: (conversationId: string) => Promise<void>;
 }
 
 const BANNERS: Partial<Record<AiTurnState, { title: string; detail: string }>> = {
@@ -56,7 +58,15 @@ function ToolMetadata({ message }: { message: AiHistoryMessage }) {
   );
 }
 
-function MessageRow({ message, approvals }: { message: AiHistoryMessage; approvals: readonly AiToolApproval[] }) {
+function MessageRow({
+  message,
+  approvals,
+  onReconcile,
+}: {
+  message: AiHistoryMessage;
+  approvals: readonly AiToolApproval[];
+  onReconcile: (conversationId: string) => Promise<void>;
+}) {
   const isUser = message.role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -77,7 +87,7 @@ function MessageRow({ message, approvals }: { message: AiHistoryMessage; approva
         <p className="whitespace-pre-line">{message.content}</p>
         <ToolMetadata message={message} />
         {approvals.map((approval) => (
-          <ApprovalCard key={approval.id} approval={approval} />
+          <ApprovalCard key={approval.id} approval={approval} onReconcile={onReconcile} />
         ))}
       </div>
     </div>
@@ -85,16 +95,19 @@ function MessageRow({ message, approvals }: { message: AiHistoryMessage; approva
 }
 
 /**
- * Read-only transcript of one persisted conversation: its server-derived turn
- * state, its chronological messages, and (when the backend reports them) the
- * still-decidable approvals rendered as read-only cards. Nothing here executes
- * tools or renders approve/reject controls.
+ * Transcript of one persisted conversation: its server-derived turn state, its
+ * chronological messages, and (when the backend reports them) the still-
+ * decidable approvals rendered as cards. Nothing here executes tools — approval
+ * decisions are submitted through the existing backend endpoints and the
+ * conversation is re-fetched so the newest reply/turn state render only from
+ * the authoritative projection.
  */
 export default function ConversationTranscript({
   conversation,
   loading,
   error,
   onRetry,
+  onReconcile,
 }: ConversationTranscriptProps) {
   if (loading) {
     return (
@@ -166,7 +179,12 @@ export default function ConversationTranscript({
 
         <div className="space-y-4">
           {conversation.messages.map((message) => (
-            <MessageRow key={message.id} message={message} approvals={approvalByMessage.get(message.id) ?? []} />
+            <MessageRow
+              key={message.id}
+              message={message}
+              approvals={approvalByMessage.get(message.id) ?? []}
+              onReconcile={onReconcile}
+            />
           ))}
         </div>
 
@@ -174,7 +192,7 @@ export default function ConversationTranscript({
           <div className="mt-5">
             <p className="text-xs font-medium text-muted-foreground mb-1">Pending approvals</p>
             {strayApprovals.map((approval) => (
-              <ApprovalCard key={approval.id} approval={approval} />
+              <ApprovalCard key={approval.id} approval={approval} onReconcile={onReconcile} />
             ))}
           </div>
         )}

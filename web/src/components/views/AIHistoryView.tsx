@@ -5,21 +5,25 @@ import {
   getAiConversation,
   listAiConversations,
 } from "../../services/api/aiConversations";
+import { submitAiInstruction } from "../../services/api/aiInstructions";
 import type { AiConversationDetail, AiConversationSummary } from "../../types/ai";
+import AIComposer from "../conversations/AIComposer";
 import ConversationList from "../conversations/ConversationList";
 import ConversationTranscript from "../conversations/ConversationTranscript";
 import SignInPanel from "../conversations/SignInPanel";
 
 /**
- * Desktop AI conversation view (Phase 10.32) — read-only history of the
- * signed-in user's real, persisted conversations, loaded from the existing
- * authenticated backend API.
+ * Desktop AI conversation view (Phase 10.33) — the signed-in user's real,
+ * persisted conversations loaded from the authenticated backend API, plus a
+ * composer that submits REAL instructions through `POST /api/ai/instructions`.
  *
  * Auth state comes from the centralized in-memory session store; the bearer
- * token never enters component state or the URL. Ownership, turn-state
- * derivation, and approvals stay authoritative on the backend — this view only
- * renders what the API returns, executes nothing, and offers no
- * approve/reject actions.
+ * token never enters component state or the URL. After each submission the view
+ * reconciles both the list and the selected transcript from the server, so the
+ * rendered messages, `turnState`, and `pendingApprovals` are always the
+ * backend's persisted, server-derived values — nothing is fabricated or
+ * inferred client-side. No tool is ever executed here and no approval actions
+ * are offered.
  */
 export default function AIHistoryView() {
   const { user, isAuthenticated, logout } = useSession();
@@ -30,6 +34,8 @@ export default function AIHistoryView() {
   const [detail, setDetail] = useState<AiConversationDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const loadList = useCallback(async () => {
     if (!isAuthenticated) return;
@@ -61,6 +67,44 @@ export default function AIHistoryView() {
       setDetailLoading(false);
     }
   }, []);
+
+  /** Reconcile after an approval decision: reload the list + selected transcript. */
+  const reconcileConversation = useCallback(
+    async (conversationId: string) => {
+      await loadList();
+      await loadDetail(conversationId);
+    },
+    [loadList, loadDetail],
+  );
+
+  const handleSubmit = useCallback(
+    async (instruction: string): Promise<boolean> => {
+      if (!isAuthenticated) return false;
+      setSubmitting(true);
+      setSubmitError(null);
+      try {
+        const response = await submitAiInstruction({
+          ...(selectedId !== null ? { conversationId: selectedId } : {}),
+          instruction,
+        });
+        const targetId = response.conversationId;
+        const resumedSame = selectedId === targetId;
+        setSelectedId(targetId);
+        await loadList();
+        if (resumedSame) await loadDetail(targetId);
+        return true;
+      } catch (err) {
+        setSubmitError(err instanceof Error ? err.message : "Could not submit your instruction.");
+        // A failed turn may still have persisted partial state — reconcile the
+        // currently selected transcript from the server.
+        if (selectedId !== null) void loadDetail(selectedId);
+        return false;
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [isAuthenticated, selectedId, loadList, loadDetail],
+  );
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -123,7 +167,8 @@ export default function AIHistoryView() {
         </div>
       </header>
 
-      {listLoading ? (
+      <div className="flex-1 flex flex-col min-h-0">
+        {listLoading ? (
         <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
           Loading conversations…
         </div>
@@ -173,10 +218,18 @@ export default function AIHistoryView() {
               loading={detailLoading}
               error={detailError}
               onRetry={() => selectedId !== null && void loadDetail(selectedId)}
+              onReconcile={reconcileConversation}
             />
           </main>
         </div>
-      )}
+        )}
+        <AIComposer
+          disabled={submitting}
+          submitting={submitting}
+          error={submitError}
+          onSubmit={handleSubmit}
+        />
+      </div>
     </div>
   );
 }

@@ -203,3 +203,77 @@ required — the 10.31 contract was sufficient.
   existing committed style by hand. (Also: the local `backend/src/services/h.txt`
   once appeared truncated to 0 bytes mid-session; it was restored from HEAD
   before appending this report.)
+
+## Phase 10.34 — Desktop AI approval decisions
+
+Goal: pending approval cards in the desktop AI views are actionable — Approve /
+Reject — via the existing backend endpoints, the frontend never executes tools,
+and every rendered reply / turn state is reconciled from the authoritative
+server projection.
+
+Frontend (web workspace; Phase 10.33 composer work remains uncommitted on top of
+commits 925ea5e / 4ab9066):
+
+- `web/src/services/api/aiApprovals.ts` — typed clients for the existing
+  decision endpoints: `approveAiApproval(id)` / `rejectAiApproval(id)` issue
+  `POST /api/ai/approvals/:approvalId/{approve,reject}` with `encodeURIComponent`
+  and the centralized `requireSessionToken()`; returns the bare safe
+  `AiToolApproval` projection; backend 400/404 envelopes surface as typed
+  `ApiClientError`. Also exports `RESUME_AFTER_APPROVAL_INSTRUCTION =
+  "Continue after approval."` (the Phase 10.30 resume instruction).
+- `web/src/components/conversations/ApprovalCard.tsx` — rewritten to be
+  actionable. Controls render ONLY when the server reports `status ===
+  "pending"` (the only authoritative "still decidable" signal) and never
+  otherwise. Approve = `approveAiApproval` then resume the approved turn with
+  `submitAiInstruction({ approvalId, instruction: RESUME_AFTER_APPROVAL_INSTRUCTION })`
+  — React submits an instruction; the backend runtime executes the stored tool
+  arguments and may ask for a fresh approval. Reject = `rejectAiApproval` only,
+  nothing resumes. Both paths reconcile via `onReconcile(conversationId)`. While
+  a decision is in flight both controls disable (no duplicate submissions);
+  failures surface the backend's own message in a `role="alert"` and still
+  reconcile best-effort so the derived turn state (e.g. expired) renders.
+- `web/src/components/conversations/ConversationTranscript.tsx` — accepts
+  `onReconcile` and threads it into every attached and stray `ApprovalCard`; no
+  other UI changes.
+- `web/src/components/views/AIHistoryView.tsx` — `reconcileConversation =
+  loadList + loadDetail(conversationId)` passed as `onReconcile` so a decision
+  refreshes the list badges and the transcript from the server.
+- `web/src/components/AIAssistant.tsx` — same reconciliation (`loadList` +
+  `openConversation(conversationId)`) so the side panel stays consistent with
+  the main view.
+- `web/src/services/api/aiInstructions.ts` — `SubmitAiInstructionInput` now
+  documents the optional `approvalId` field used for approved-turn resumes.
+
+Tests (web workspace, 54/54 passing; `pnpm typecheck` and `pnpm build` clean):
+
+- `web/src/services/api/aiApprovals.test.ts` (4) — unauth fail-fast with NO
+  request issued; approve/reject POST with session bearer + URL-encoded id;
+  returned `AiToolApproval` projection; 400 expired envelope propagation.
+- `web/src/components/conversations/ApprovalCard.test.tsx` (7) — controls only
+  when server-side pending; non-pending shows server status without controls;
+  approve = decision + resume-through-instruction + reconcile; reject = decision
+  only + reconcile; in-flight disable blocks duplicate submission; backend error
+  surfaced via alert + still reconciles + never resumes; no execute/run
+  affordance.
+- `web/src/components/views/AIHistoryView.test.tsx` (25, +4 for decisions) —
+  the old "NO action controls" card test now asserts Approve/Reject render and
+  still NO execute/run; approve flow posts the decision, resumes via the
+  instruction endpoint, refetches (2nd GET), and renders the new assistant reply
+  ONLY from the reconciled projection before removing the consumed controls;
+  reject flow posts reject, never resumes, renders the `rejected` banner;
+  never-resolving approve keeps both controls disabled with no duplicate calls;
+  a stale/expired decision fails on the backend, never resumes, reconciles the
+  `expired` banner, and never fabricates a reply (the transient in-card server
+  error surfacing is asserted at the card level, since reconcile promptly
+  swaps in the authoritative projection).
+
+Constraints honored: no second approval system (reuses the existing endpoints);
+no tool execution from React (resume goes through the existing instruction
+endpoint); no client-side expiry/authority guessing (gating only on server
+`pending`); no fabricated messages/turn states (every render post-decision comes
+from the refetched conversation); backend behavior unchanged; tokens stay in the
+centralized session module (never component state, storage, or URLs); the main
+view and side panel reconcile identically. The workspace oxfmt (v0.2.0) defect
+continues to be respected: oxfmt was NOT run; edits match committed style by
+hand. (`backend/src/services/h.txt` appeared truncated a third time and was again
+restored from HEAD before appending.)

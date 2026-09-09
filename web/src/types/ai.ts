@@ -1,11 +1,12 @@
 /**
- * Frontend types mirroring the backend's authenticated AI conversation API
- * (`GET /api/ai/conversations` and `GET /api/ai/conversations/:id`).
+ * Frontend types mirroring the backend's authenticated AI API (`POST
+ * /api/ai/instructions`, `GET /api/ai/conversations`, and `GET
+ * /api/ai/conversations/:id`).
  *
- * These are read-only projections of PERSISTED data returned by the backend.
- * The frontend never fabricates any of these values and never infers
- * permission or approval authority — the backend stays the sole source of
- * truth for ownership, turn state, and what is decidable.
+ * These are faithful mirrors of PERSISTED data returned by the backend. The
+ * frontend never fabricates any of these values and never infers permission or
+ * approval authority — the backend stays the sole source of truth for
+ * ownership, turn state, and what is decidable.
  */
 
 /**
@@ -83,4 +84,64 @@ export interface AiConversationDetail extends AiConversationSummaryBase {
   turnState: AiTurnState;
   pendingApprovals: readonly AiToolApproval[];
   messages: readonly AiHistoryMessage[];
+}
+
+// ---------------------------------------------------------------------------
+// Instruction submission (POST /api/ai/instructions)
+// ---------------------------------------------------------------------------
+
+/** Safe per-intent outcome synopsis echoed by one instruction turn. */
+export interface AiToolOutcome {
+  callId: string;
+  ok: boolean;
+}
+
+/**
+ * Safe pending-approval metadata echoed by one instruction turn: the persisted
+ * approval id, the tool name, the validated arguments, and the expiry. No raw
+ * file contents or secrets.
+ */
+export interface AiInstructionApprovalInfo {
+  approvalId: string;
+  toolName: string;
+  arguments: unknown;
+  expiresAt: string;
+}
+
+/**
+ * One transcript message echoed by `POST /api/ai/instructions`. This is the
+ * runtime's `AgentMessage` model (`kind`/`text`/`toolCalls`) — NOT the safe
+ * history projection. The desktop client never renders this directly; it
+ * reconciles from the safe `getAiConversation` history detail instead.
+ */
+export type AiInstructionMessage =
+  | {
+      kind: "provider";
+      text?: string;
+      toolCalls?: readonly { id: string; toolName: string; input: unknown }[];
+    }
+  | { kind: "final"; text: string };
+
+/** Safe per-turn result of `POST /api/ai/instructions`. */
+export interface AiInstructionTurn {
+  /** True when a new conversation was created for this turn. */
+  created: boolean;
+  /** The validated participant-visible instruction. */
+  instruction: string;
+  /** The persisted transcript (`AgentMessage` model, unprojected). */
+  messages: readonly AiInstructionMessage[];
+  /** The agent's final reply once the turn completed. */
+  finalText?: string;
+  toolRounds: number;
+  maxToolRounds: number;
+  toolResults: readonly AiToolOutcome[];
+  pendingApprovals: readonly AiInstructionApprovalInfo[];
+}
+
+/** Stable response of `POST /api/ai/instructions`. */
+export interface AiInstructionResponse {
+  /** The conversation id (existing or newly created). */
+  conversationId: string;
+  /** The safe, persisted turn result. */
+  turn: AiInstructionTurn;
 }

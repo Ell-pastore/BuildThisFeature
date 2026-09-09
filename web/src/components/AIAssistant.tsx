@@ -50,6 +50,12 @@ export default function AIAssistant({ onClose }: AIAssistantProps) {
       .finally(() => setDetailLoading(false));
   }
 
+  /** Reconcile after an approval decision: reload the list + the owning detail. */
+  async function reconcileConversation(conversationId: string) {
+    loadList();
+    await openConversation(conversationId);
+  }
+
   useEffect(() => {
     if (!isAuthenticated) {
       setConversations(null);
@@ -144,6 +150,7 @@ export default function AIAssistant({ onClose }: AIAssistantProps) {
               loading={detailLoading}
               error={detailError}
               onRetry={() => selectedId !== null && openConversation(selectedId)}
+              onReconcile={reconcileConversation}
             />
           </div>
         )}
