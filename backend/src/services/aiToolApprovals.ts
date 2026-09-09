@@ -40,6 +40,8 @@ import {
   ToolApprovalExpiredError,
   ToolApprovalNotFoundError,
   createToolApproval,
+  getPendingToolApproval,
+  getToolApproval,
   resolveToolApproval,
   type ToolApprovalRecord,
 } from "../database/repositories/aiToolApprovals.js";
@@ -52,6 +54,8 @@ export {
   ToolApprovalDuplicateError,
   ToolApprovalExpiredError,
   ToolApprovalNotFoundError,
+  getPendingToolApproval,
+  getToolApproval,
   type ToolApprovalRecord,
 };
 

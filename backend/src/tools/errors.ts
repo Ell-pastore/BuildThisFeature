@@ -57,6 +57,14 @@ export const ToolErrorCode = {
   IdentityInvalid: "tools/identity-invalid",
   FilesystemPermissionDenied: "filesystem/permission-denied",
   FilesystemNotAllowed: "filesystem/not-allowed",
+  // security — approval gate (Phase 10.28C)
+  ApprovalRequired: "tools/approval-required",
+  ApprovalNotFound: "tools/approval-not-found",
+  ApprovalNotExecutable: "tools/approval-not-executable",
+  ApprovalToolMismatch: "tools/approval-tool-mismatch",
+  ApprovalContextMissing: "tools/approval-context-missing",
+  // validation — approval gate (Phase 10.28C)
+  ApprovalInvalidArguments: "tools/approval-invalid-arguments",
   // internal
   Internal: "internal/error",
 } as const;

@@ -235,6 +235,32 @@ export async function getToolApproval(
   return row === null ? null : toRecord(row);
 }
 
+/**
+ * Load the ONE `pending` approval for a given message + tool owned by
+ * `userId`, or `null` when none is pending. Used by the Phase 10.28C
+ * invocation gate to make a duplicate tool-approval request IDEMPOTENT:
+ * the second request surfaces the existing pending approval instead of
+ * writing a second row (the repository's one-pending-per-(message, tool)
+ * rule stays the enforcement backstop). Ownership is enforced by the
+ * `userId` predicate.
+ */
+export async function getPendingToolApproval(
+  userId: string,
+  messageId: string,
+  toolName: string,
+): Promise<ToolApprovalRecord | null> {
+  const db = getDatabase();
+  const row = await db.aiToolApproval.findFirst({
+    where: {
+      userId,
+      messageId,
+      toolName,
+      status: ToolApprovalStatus.Pending,
+    },
+  });
+  return row === null ? null : toRecord(row);
+}
+
 // ---------------------------------------------------------------------------
 // Resolve
 // ---------------------------------------------------------------------------
