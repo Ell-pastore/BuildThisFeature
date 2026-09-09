@@ -392,6 +392,41 @@ describe("list_directory handler", () => {
     expect(fake.calls.listDirectory).toEqual([]);
   });
 
+  // Phase 10.35 — deterministic tool-layer scope guard. Relative / unusable
+  // paths are rejected before the executor is reached; the original absolute
+  // path is passed through verbatim for the canonical scope check.
+  it("rejects a relative path as invalid input and never calls the executor", async () => {
+    const result = await handlers.list_directory(
+      { path: "Documents" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidPath);
+    expect(fake.calls.listDirectory).toEqual([]);
+  });
+
+  it("rejects a traversal path that escapes the scope and never calls the executor", async () => {
+    for (const path of ["/../etc", "/home/../../etc/passwd"]) {
+      const result = await handlers.list_directory({ path }, makeContext());
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.category).toBe("security");
+      expect(result.error.code).toBe(ToolErrorCode.PathOutOfScope);
+    }
+    expect(fake.calls.listDirectory).toEqual([]);
+  });
+
+  it("passes a valid absolute path through to the executor unchanged", async () => {
+    const result = await handlers.list_directory(
+      { path: "/Users/alice/Documents" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(true);
+    expect(fake.calls.listDirectory).toEqual(["/Users/alice/Documents"]);
+  });
+
   it("projects an executor 'not found' to category=not_found", async () => {
     fake.throwFor.listDirectory = new Error(
       "The file or folder does not exist.",

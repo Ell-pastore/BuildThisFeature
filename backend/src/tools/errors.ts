@@ -46,6 +46,10 @@ export const ToolErrorCode = {
   // validation
   InvalidInput: "tools/invalid-input",
   HandlerMissing: "tools/handler-missing",
+  // validation — path guard (Phase 10.35)
+  InvalidPath: "tools/invalid-path",
+  // security — path guard (Phase 10.35)
+  PathOutOfScope: "tools/path-out-of-scope",
   // unknown_tool
   UnknownTool: "tools/unknown-tool",
   // not_found

@@ -277,3 +277,109 @@ view and side panel reconcile identically. The workspace oxfmt (v0.2.0) defect
 continues to be respected: oxfmt was NOT run; edits match committed style by
 hand. (`backend/src/services/h.txt` appeared truncated a third time and was again
 restored from HEAD before appending.)
+
+## Phase 10.35 — AI tool execution runtime foundation
+
+Goal: a controlled, typed, deterministic backend boundary for AI-requested tool
+execution — the AI never touches the filesystem directly; every tool call goes
+through the existing registry → approval → policy → handler → executor runtime
+chain, with invalid and traversal-escaped paths rejected before any execution.
+
+### Existing foundation (confirmed, reused — NOT recreated)
+The repo's Phase 9.x–10.30 tool layer already provides the bulk of the
+"tool runtime":
+- typed tool contract: `RawToolInput` (untrusted input), `ToolExecutionResult`
+  (`ToolSuccessResult { ok, data }` / `ToolFailureResult { ok, error }`),
+  `ToolHandlerContext`, `ToolDefinition`/`ToolInputSchema`;
+- registry: `ToolRegistry` in `backend/src/tools/registry.ts` — exact-name
+  lookup, duplicate rejection, deterministic `tools/unknown-tool`;
+- explicit tool definitions without dynamic execution:
+  `backend/src/tools/definitions/readTools.ts` + the FROZEN handler map in
+  `backend/src/tools/handlers/index.ts` (no `eval`/`Function`/dynamic import —
+  dispatch only runs the closed map); implementations live in `handlers/`,
+  fully separate from the AI provider layer (`provider.ts`/`gemini-roetc.`);
+- typed errors: `ToolError` with `category` (validation / unknown_tool /
+  not_found / security / internal) in `backend/src/tools/errors.ts`;
+- runtime connection + approval preservation: `tools.ts::invokeTool` runs the
+  chain registry → APPROVAL gate (`requiresApproval` tools stop before
+  policy/handler/executor and create a pending approval; approval resume runs
+  ONLY the stored validated args) → `dispatchTool` (policy → handler →
+  executor). `persistentAgentTurn` persists each tool round through the eager
+  conversation/message rows + `completeAgentTurn`; `aiInstructions` maps known
+  failures to safe `AppError`s (never raw stacks, never file contents).
+
+### What changed this phase
+1. `backend/src/tools/paths.ts` (NEW) — deterministic, tool-layer path-scope
+   guard. `validateToolPath(path)`:
+   - rejects RELATIVE paths → `validation` / `tools/invalid-path`
+     (an absolute path is required: POSIX `/`, Windows drive `X:\`, or UNC);
+   - rejects NUL/control characters → `validation` / `tools/invalid-path`;
+   - rejects ROOT-ESCAPING traversal (`..` climbing above the root) →
+     `security` / `tools/path-out-of-scope`. `/a/../b` (stays in-root) is
+     accepted; it returns the ORIGINAL string verbatim so the Rust `AllowList`
+     (canonical-path containment against the home directory) remains the final
+     scope authority. Pure/shape-only: no I/O, no normalization-on-disk, no
+     symlink resolution. Messages never include the raw path.
+2. `backend/src/tools/errors.ts` (EDIT, additive) — two new stable codes:
+   `tools/invalid-path` and `tools/path-out-of-scope`.
+3. `backend/src/tools/handlers/listDirectory.ts` (EDIT) — `list_directory`
+   (the ONE tool wired this phase) now runs `validateToolPath` after
+   `requireString`, so unusable/traversal paths never reach the executor.
+   The existing list_directory contract is unchanged: input `{ path }`,
+   output the safe `DirectoryListing` (entries + name/path/type/size/
+   timestamps metadata for AI reasoning); never returns file contents.
+4. Tests (backend, 958 passing total; `pnpm typecheck` + `pnpm build` clean):
+   - `backend/src/tools/paths.test.ts` (NEW) — valid absolute (POSIX/drive/
+     UNC/root) accepted verbatim; in-root dot-dot accepted; relative + control
+     chars → validation/invalid-path; root-escaping cases (POSIX + windows +
+     UNC) → security/path-out-of-scope; public-safe messages.
+   - `backend/src/tools/handlers/handlers.test.ts` (EXTENDED) — relative path
+     → validation/invalid-path, traversal → security/path-out-of-scope, both
+     with `fake.calls.listDirectory === []` (executor NEVER reached); valid
+     absolute path passed through unchanged.
+   - `backend/src/tools/security.test.ts` (NEW) — no arbitrary execution:
+     handlers map is `Object.freeze`d and closed; hostile/mangled tool names
+     (`eval`, `exec`, `spawn`, `require`, `child_process`, `sudo`,
+     `list_directory;rm -rf /`, `list_directory && curl …`, `../..`, `""`) →
+     `unknown_tool`, filesystem untouched; a mechanically REGISTERED
+     handler-less name (`eval`) still cannot execute → `internal`
+     handler-missing, filesystem untouched; exact-name lookup rejects
+     near-misses; only the real `list_directory` route reaches the executor.
+   - Known/unknown resolution, permission→security mapping, structured
+     results, execution-failure→internal, and approval-stops-before-execution
+     were already covered by the existing `registry.test.ts`,
+     `handlers.test.ts`, `tools.test.ts`, `aiInstructionApprovals.test.ts`,
+     `toolApprovalGate.test.ts`, and `policy.test.ts` suites.
+
+### Where authorization / path-scope enforcement occurs
+- AUTH: `createSessionExecutionContext` → `createToolExecutionContext`
+  (identity from `requireAuth`, never from tool args/provider output) +
+  `defaultToolPolicy` (active user required) before any handler runs.
+- APPROVAL: `invokeTool` requires an executable owned approval for
+  `requiresApproval` tools; without one it stops at CREATE (never executes).
+- PATH SCOPE: (1) tool layer now rejects relative/control/traversal paths in
+  `paths.ts`; (2) the desktop Rust `fs_service` `AllowList` enforces canonical
+  membership against the home directory — final authority. No shell commands,
+  no arbitrary code, no dynamic import; tool registrations are static metadata
+  and names never resolve to code by convention.
+
+### How approval boundaries are preserved
+Unchanged. `list_directory` declares `requiresApproval` absent (default safe
+read: no approval), and the approval gate sits in `invokeTool`, untouched.
+Any future approval-bestowing change to a definition flows through the SAME
+gate; nothing in this phase bypasses or weakens it.
+
+### Assumptions / limitations
+- Scope shape guard is platform-aware but the desktop scope is macOS/POSIX;
+  Windows drive/UNC cases are validated at the SHAPE level only and their final
+  membership remains the Rust AllowList's job (which also canonicalizes, so
+  symlinks are neutralized there, not here).
+- Only `list_directory` is wired to the guard this phase. `search_files`,
+  `get_file_metadata`, and `read_file` still delegate to the executor with only
+  `requireString` validation and remain fully guarded at execution by the
+  existing Rust AllowList — they get the same `validateToolPath` treatment
+  when their phases land.
+- No new execution path was introduced; the phase hardened the existing one.
+- oxfmt (workspace defect) was NOT run; edits match committed style.
+  (`backend/src/services/h.txt` appeared truncated a FOURTH time; restored from
+  HEAD before appending.)
