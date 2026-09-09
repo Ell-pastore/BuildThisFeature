@@ -332,10 +332,12 @@ The AI layer is a first-class product surface, so its data model is explicit rat
 | `title` | text | nullable | Auto-derived from the first message; user-renamable |
 | `created_at` / `updated_at` | timestamptz | required | `updated_at` bumps on new messages |
 | `max_tool_rounds` | int | required | DEFAULT `1`. Loop bound for the bounded agent tool loop (Phase 10.6 `maxToolRounds`), persisted so turn progress is reconstructible across sessions. |
+| `archived_at` | timestamptz | nullable | **Archive timestamp (Phase 10.26A).** `NULL` = active; `NOT NULL` = archived. Defaults to `NULL` — existing rows stay active. |
 
 **Constraints & rules**
 
 - **Index:** `(user_id, updated_at DESC)` — conversation list.
+- **Archive semantics (Phase 10.26A):** `archived_at = NULL` → active; `archived_at != NULL` → archived. Archiving hides a conversation from the **normal** conversation list (the application list query filters `archived_at IS NULL`) while retaining the conversation and its transcript — an archived conversation remains **directly retrievable** and is **NOT** deleted. **This is archival state, not soft-delete** (D5, §9: only `files.deleted_at`/`folders.deleted_at` are soft-delete); a future unarchive clears the timestamp to restore visibility. There is deliberately a single `archived_at` field — no `is_archived`, and no overlapping archive/status fields. Later archive/unarchive API applications must not modify messages, tool results, file/version references, or ownership.
 - Deleting a conversation deletes its transcript and conversation-scoped references. This never touches filesystem history (§12).
 
 ### 6.2 `ai_messages` — transcript messages

@@ -365,6 +365,11 @@ model AiConversation {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId    String   @map("user_id") @db.Uuid
   title     String? // auto-derived from the first message; user-renamable
+  // Phase 10.26A: arbitrary archive timestamp. NULL = active; NOT NULL =
+  // archived (hidden from the normal conversation list but not deleted).
+  // NOT soft-delete — an archived conversation and its transcript are retained
+  // and remain directly retrievable; see SCHEMA.md §6.1.
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
   // Phase 10.7: strict bound for the bounded agent tool loop, so a persisted
   // conversation can reconstruct its turn progress without re-implementing
   // the loop. Enduring per-conversation, not per-turn.
