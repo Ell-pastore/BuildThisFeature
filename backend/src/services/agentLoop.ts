@@ -106,6 +106,21 @@ export interface AgentLoopOptions extends OrchestratedTurnOptions {
    * (non-persistent loops are unchanged).
    */
   prepareRound?: (response: AgentResponse) => Promise<AgentTurnContext | undefined>;
+  /**
+   * Seeded structured results of an approval round that was ALREADY executed
+   * before this loop ran (Phase 10.30). The loop starts with these as
+   * context — the provider's first request already carries them — and the
+   * running round count starts at `initialToolRounds`. Additive and optional;
+   * omitted for every existing loop, which starts empty at round zero.
+   */
+  initialToolResults?: readonly AgentToolResult[];
+  /**
+   * Seeded running round count. The approved tool execution counts as one
+   * round against `maxToolRounds`: when resuming an approval the caller
+   * passes `1` so the conversation's bound is respected from the very
+   * first provider request. Defaults to zero.
+   */
+  initialToolRounds?: number;
 }
 
 /** What one executed tool round looked like, for observers. */
@@ -149,6 +164,10 @@ export interface AgentLoopOutput {
  * - Terminates with `{ text, results, toolRounds }` when the provider
  *   returns final text (no tool calls), and throws `AgentLoopError` when the
  *   provider requests tools past `maxToolRounds`.
+ * - May be SEEDED (Phase 10.30): `initialToolResults` are shown to the
+ *   provider as already-executed context on the first request and
+ *   `initialToolRounds` counts them against `maxToolRounds`, so a resumed
+ *   approval execution is inside the bound, not outside it.
  *
  * @throws `AppError.unauthorized()` when `c` has no session identity.
  * @throws `AppError.badRequest` when the provider returns malformed intents
@@ -166,11 +185,21 @@ export async function runAgentLoop(
   if (!Number.isInteger(options.maxToolRounds) || options.maxToolRounds < 1) {
     throw new TypeError(`maxToolRounds must be a positive integer, got ${options.maxToolRounds}`);
   }
+  if (
+    options.initialToolRounds !== undefined &&
+    (!Number.isInteger(options.initialToolRounds) || options.initialToolRounds < 0)
+  ) {
+    throw new TypeError(
+      `initialToolRounds must be a non-negative integer, got ${options.initialToolRounds}`,
+    );
+  }
 
   createSessionExecutionContext(c);
 
-  let toolResults: AgentToolResult[] = [];
-  let toolRounds = 0;
+  let toolResults: AgentToolResult[] = options.initialToolResults
+    ? [...options.initialToolResults]
+    : [];
+  let toolRounds = options.initialToolRounds ?? 0;
   const pendingApprovals: ToolApprovalRequestInfo[] = [];
 
   while (true) {

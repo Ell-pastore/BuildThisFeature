@@ -45,6 +45,19 @@
  * only plain `AgentResponse` values, never provider ids, credentials,
  * fallback state, or cooldown state.
  *
+ * Phase 10.30 — APPROVAL RESUME: `resumeApprovalId` continues an interrupted
+ * turn after a tool approval decision. The approved approval is resolved with
+ * ownership enforced, asserted executable, executed ONCE through the existing
+ * `invokeTool` gate → policy → handler → executor pipeline (only the EXACT
+ * stored arguments run), consumed so it can never be replayed, and recorded
+ * as this turn's first (pre-run) tool round. The bounded loop then continues
+ * from round one against the approval's own conversation with the executed
+ * result as seeded context — bounded by the conversation's persisted
+ * `maxToolRounds`, never beyond it. Rejected, expired, foreign, or
+ * already-consumed approvals are rejected before anything runs, and the tool
+ * round's result is persisted through the same eager transcript +
+ * `completeAgentTurn` path as every other round.
+ *
  * Design rules:
  *
  *   - OWNERSHIP EVERYWHERE: load, eager-write, complete, and cancel are keyed
@@ -69,7 +82,16 @@ import { AppError } from "../core/errors.js";
 import type { AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
 import type { InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
-import type { AgentToolResult } from "./agent.js";
+import { invokeTool } from "./tools.js";
+import type { AgentToolCall, AgentToolResult } from "./agent.js";
+import type { RawToolInput } from "../tools/handlers/handler.js";
+import {
+  ToolApprovalNotFoundError,
+  assertToolApprovalExecutable,
+  consumeToolApproval,
+  getToolApproval,
+  type ToolApprovalRecord,
+} from "./aiToolApprovals.js";
 import { buildAgentContext } from "./agentContext.js";
 import { runAgentLoop, type AgentLoopRound } from "./agentLoop.js";
 import type { ComposedProviderStack } from "./providerComposition.js";
@@ -102,6 +124,16 @@ export interface PersistentTurnInput {
   instruction: string;
   /** Optional display title for newly created conversations. */
   title?: string;
+  /**
+   * Resume mode (Phase 10.30): the id of an OWNED, `approved` tool approval to
+   * execute. The turn executes ONLY the approval's exact stored arguments
+   * through the existing gate → policy → handler → executor pipeline, records
+   * the result as this turn's first round, consumes the approval so it can
+   * never be replayed, then continues the bounded loop against the approval's
+   * OWN conversation (the conversation's persisted round bound applies). A
+   * supplied `conversationId` must match the approval's conversation.
+   */
+  resumeApprovalId?: string;
 }
 
 export interface PersistentTurnOptions extends InvokeToolOptions {
@@ -198,6 +230,15 @@ function toTurnRecord(round: AgentLoopRound): AgentTurnRecord {
  *         closed before the provider is contacted).
  * @throws `AgentConversationNotFoundError` when `conversationId` is not
  *         owned by the authenticated user (or does not exist).
+ * @throws `ToolApprovalNotFoundError` (resume mode) when `resumeApprovalId`
+ *         is not owned by the authenticated user (indistinguishable from
+ *         missing), or references a conversation the user cannot load.
+ * @throws `ToolApprovalNotExecutableError` / `ToolApprovalExpiredError`
+ *         (resume mode) when the approval is not `approved` / its window has
+ *         elapsed — nothing is executed. The same guards prevent replay of an
+ *         already-consumed approval.
+ * @throws `AppError.badRequest` (resume mode) when a supplied
+ *         `conversationId` does not match the approval's own conversation.
  * @throws `ProviderError` when the provider fails — the eager rows of the
  *         failed turn are compensated away (nothing new remains).
  * @throws `AgentLoopError` when the provider requests tools past the bound —
@@ -230,9 +271,29 @@ export async function runPersistentTurn(
   }
 
   // 2. Load an existing conversation (ownership enforced) to inherit its
-  //    round bound; otherwise the input/default bound applies.
+  //    round bound; otherwise the input/default bound applies. In resume mode
+  //    (Phase 10.30) the conversation is the approved approval's OWN one: the
+  //    approval is resolved with ownership enforced, its stored operation is
+  //    asserted executable NOW (rejected/expired/foreign/consumed never run),
+  //    and its conversation's persisted bound becomes this turn's bound.
   let bound: number | undefined;
-  if (input.conversationId !== undefined) {
+  let resumeRecord: ToolApprovalRecord | undefined;
+  if (input.resumeApprovalId !== undefined) {
+    const record = await getToolApproval(userId, input.resumeApprovalId);
+    if (record === null) {
+      throw new ToolApprovalNotFoundError();
+    }
+    if (input.conversationId !== undefined && record.conversationId !== input.conversationId) {
+      throw AppError.badRequest("The approval belongs to a different conversation.");
+    }
+    assertToolApprovalExecutable(record, new Date());
+    const resumedConversation = await loadAgentConversationState(userId, record.conversationId);
+    if (resumedConversation === null) {
+      throw new ToolApprovalNotFoundError();
+    }
+    bound = resumedConversation.maxToolRounds;
+    resumeRecord = record;
+  } else if (input.conversationId !== undefined) {
     const loaded = await loadAgentConversationState(userId, input.conversationId);
     if (loaded === null) {
       throw new AgentConversationNotFoundError();
@@ -252,12 +313,70 @@ export async function runPersistentTurn(
   const roundSlots: { messageId: string; toolResults?: readonly AgentToolResult[] }[] = [];
 
   try {
-    // 3. Run the existing bounded loop (Phase 10.4): the `onRound` observer
-    //    records the transcript, while `prepareRound` PERSISTS each round's
-    //    assistant message (and, on the first round, its conversation +
-    //    instruction) BEFORE that round's intents execute — giving every tool
-    //    execution a real persisted messageId.
+    // 3. Resume mode (Phase 10.30): BEFORE the loop, execute the approved
+    //    approval exactly once, consume it so it can never be replayed, and
+    //    record it as this turn's first (pre-run) tool round. Execution stays
+    //    in the unchanged `invokeTool` gate → policy → handler → executor
+    //    pipeline; ONLY the approval's exact stored arguments run (the caller
+    //    supplies none here). The result is fed to the provider as seeded
+    //    context and counted against the conversation's round bound.
     const observed: AgentLoopRound[] = [];
+    let resumeSeeded: { toolResult: AgentToolResult; approvedCall: AgentToolCall } | undefined;
+    if (resumeRecord !== undefined) {
+      const executed = await invokeTool(
+        c,
+        resumeRecord.toolName,
+        {},
+        {
+          registry: options.registry,
+          filesystem: options.filesystem,
+          ...(options.policy !== undefined ? { policy: options.policy } : {}),
+          turnContext: {
+            conversationId: resumeRecord.conversationId,
+            messageId: resumeRecord.messageId,
+          },
+          approvalId: resumeRecord.id,
+        },
+      );
+      const toolResult: AgentToolResult = executed.ok
+        ? { ok: true, callId: resumeRecord.id, data: executed.data }
+        : { ok: false, callId: resumeRecord.id, error: executed.error };
+      const approvedCall: AgentToolCall = {
+        id: resumeRecord.id,
+        toolName: resumeRecord.toolName,
+        input: resumeRecord.arguments as RawToolInput,
+      };
+      // Seal the spent approval so it can never authorize a second execution.
+      // Best-effort: the execution has already happened, so a consume failure
+      // must not mask the executed turn (single-request semantics — the same
+      // non-transactional caveat the Phase 10.28C approval gate has).
+      try {
+        await consumeToolApproval(userId, resumeRecord.id, new Date());
+      } catch {
+        // A concurrent decision cannot undo an execution that already ran.
+      }
+      const begun = await beginAgentTurn({
+        userId,
+        conversationId: resumeRecord.conversationId,
+        instruction: context.instruction,
+        maxToolRounds,
+        toolCalls: [approvedCall],
+      });
+      conversationId = begun.conversationId;
+      created = begun.created;
+      instructionMessageId = begun.instructionMessageId;
+      engaged = true;
+      currentSlot = { messageId: begun.messageId, toolResults: [toolResult] };
+      roundSlots.push(currentSlot);
+      observed.push({
+        text: undefined,
+        toolCalls: [approvedCall],
+        results: [toolResult],
+        toolRounds: 1,
+      });
+      resumeSeeded = { toolResult, approvedCall };
+    }
+
     const output = await runAgentLoop(c, context.instruction, {
       provider,
       tools: context.tools,
@@ -265,6 +384,9 @@ export async function runPersistentTurn(
       filesystem: options.filesystem,
       ...(options.policy !== undefined ? { policy: options.policy } : {}),
       maxToolRounds,
+      ...(resumeSeeded !== undefined
+        ? { initialToolResults: [resumeSeeded.toolResult], initialToolRounds: 1 }
+        : {}),
       onRound: (round) => {
         observed.push(round);
         // The loop calls prepareRound → execute → onRound in strict order,

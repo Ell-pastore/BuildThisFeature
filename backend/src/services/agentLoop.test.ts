@@ -11,6 +11,10 @@
  *      `AgentLoopError` — tools past the limit are NEVER executed.
  *   4. Preserves typed provider failures, authentication, input
  *      validation, and the tool policy on every round.
+ *   5. Honors Phase 10.30 SEEDING: `initialToolResults` are shown to the
+ *      provider as already-executed first-round context and
+ *      `initialToolRounds` count against `maxToolRounds` (so a resumed
+ *      approval execution is INSIDE the bound, never outside it).
  */
 import { describe, expect, it, vi, type Mock } from "vitest";
 
@@ -18,13 +22,10 @@ import { AppError } from "../core/errors.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { registerReadTools } from "../tools/definitions/readTools.js";
 import { readToolDefinitions } from "../tools/definitions/readTools.js";
-import {
-  ToolPermission,
-  type ToolDefinition,
-} from "../tools/types.js";
+import { ToolPermission, type ToolDefinition } from "../tools/types.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
 import type { DirectoryListing } from "../tools/tauriShapes.js";
-import type { AgentToolCall } from "./agent.js";
+import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { AgentProvider, AgentProviderRequest, AgentResponse } from "./provider.js";
 import { isProviderError, ProviderError, ProviderErrorCode } from "./provider.js";
 import {
@@ -81,9 +82,10 @@ function makeRegistry(): ToolRegistry {
 type Generate = AgentProvider["generate"];
 
 /** A fake provider that serves a scripted list of responses, one per round. */
-function scriptedProvider(
-  responses: Array<AgentResponse | ProviderError>,
-): { generate: Mock<Generate>; requests: AgentProviderRequest[] } {
+function scriptedProvider(responses: Array<AgentResponse | ProviderError>): {
+  generate: Mock<Generate>;
+  requests: AgentProviderRequest[];
+} {
   const requests: AgentProviderRequest[] = [];
   const generate = vi.fn<Generate>().mockImplementation(async (request) => {
     requests.push(request);
@@ -99,7 +101,12 @@ function scriptedProvider(
 
 function makeOptions(
   generate: Mock<Generate>,
-  override?: Partial<Pick<AgentLoopOptions, "registry" | "filesystem" | "maxToolRounds">>,
+  override?: Partial<
+    Pick<
+      AgentLoopOptions,
+      "registry" | "filesystem" | "maxToolRounds" | "initialToolResults" | "initialToolRounds"
+    >
+  >,
 ): AgentLoopOptions {
   return {
     provider: { generate },
@@ -107,6 +114,12 @@ function makeOptions(
     registry: override?.registry ?? makeRegistry(),
     filesystem: override?.filesystem ?? makeFilesystem(),
     maxToolRounds: override?.maxToolRounds ?? 3,
+    ...(override?.initialToolResults !== undefined
+      ? { initialToolResults: override.initialToolResults }
+      : {}),
+    ...(override?.initialToolRounds !== undefined
+      ? { initialToolRounds: override.initialToolRounds }
+      : {}),
   };
 }
 
@@ -167,9 +180,7 @@ describe("runAgentLoop — tool rounds", () => {
     expect(requests[1]).toEqual({
       message: "list /home",
       tools: readToolDefinitions,
-      toolResults: [
-        { ok: true, callId: "a", data: homeListing() },
-      ],
+      toolResults: [{ ok: true, callId: "a", data: homeListing() }],
     });
     expect(output).toEqual({
       text: "/home is listed.",
@@ -380,11 +391,7 @@ describe("runAgentLoop — failure propagation and guards on every round", () =>
     const { generate } = scriptedProvider([{ text: "never asked" }]);
 
     await expect(
-      runAgentLoop(
-        sessionContext(undefined),
-        "hello",
-        makeOptions(generate, { filesystem }),
-      ),
+      runAgentLoop(sessionContext(undefined), "hello", makeOptions(generate, { filesystem })),
     ).rejects.toThrow(AppError);
 
     expect(generate).not.toHaveBeenCalled();
@@ -443,19 +450,96 @@ describe("runAgentLoop — failure propagation and guards on every round", () =>
   });
 
   it("requests round-one context WITHOUT the toolResults field", async () => {
-    const { generate, requests } = scriptedProvider([
-      { text: "no tools needed" },
-    ]);
-    await runAgentLoop(
-      sessionContext(ACTIVE_USER),
-      "hi",
-      makeOptions(generate),
-    );
+    const { generate, requests } = scriptedProvider([{ text: "no tools needed" }]);
+    await runAgentLoop(sessionContext(ACTIVE_USER), "hi", makeOptions(generate));
     const roundOne = requests[0];
     expect(roundOne).toBeDefined();
     if (!roundOne) return;
     expect(roundOne).toEqual({ message: "hi", tools: readToolDefinitions });
     expect("toolResults" in roundOne).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Phase 10.30 seeding: pre-executed context + bound accounting
+// ---------------------------------------------------------------------------
+
+describe("runAgentLoop — seeded initial context (Phase 10.30)", () => {
+  const seeded: AgentToolResult = { ok: true, callId: "seed", data: homeListing() };
+
+  it("serves seeded results as first-round context and counts them against the bound", async () => {
+    const filesystem = makeFilesystem();
+    const { generate, requests } = scriptedProvider([{ text: "already done" }]);
+
+    const output = await runAgentLoop(
+      sessionContext(ACTIVE_USER),
+      "continue after approval",
+      makeOptions(generate, {
+        filesystem,
+        maxToolRounds: 2,
+        initialToolResults: [seeded],
+        initialToolRounds: 1,
+      }),
+    );
+
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(requests[0]).toEqual({
+      message: "continue after approval",
+      tools: readToolDefinitions,
+      toolResults: [seeded],
+    });
+    expect(output).toEqual({
+      text: "already done",
+      results: [seeded],
+      toolRounds: 1,
+      pendingApprovals: [],
+    });
+    // Seeded results are context, not new executions.
+    expect(filesystem.calls).toEqual([]);
+  });
+
+  it("enforces the bound from the seeded round count before executing anything new", async () => {
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("new", "list_directory", { path: "/home" })] },
+    ]);
+
+    await expect(
+      runAgentLoop(
+        sessionContext(ACTIVE_USER),
+        "continue after approval",
+        makeOptions(generate, {
+          filesystem,
+          maxToolRounds: 2,
+          initialToolResults: [seeded],
+          initialToolRounds: 2,
+        }),
+      ),
+    ).rejects.toThrow(AgentLoopError);
+
+    // The provider asked for a third round on a two-round budget: it was
+    // asked once and answered, then the loop refused the new tool WITHOUT
+    // executing it.
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(filesystem.calls).toEqual([]);
+  });
+
+  it("rejects a negative initialToolRounds as invalid configuration", async () => {
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([{ text: "never asked" }]);
+
+    await expect(
+      runAgentLoop(
+        sessionContext(ACTIVE_USER),
+        "hi",
+        makeOptions(generate, {
+          filesystem,
+          maxToolRounds: 2,
+          initialToolResults: [seeded],
+          initialToolRounds: -1,
+        }),
+      ),
+    ).rejects.toThrow(TypeError);
   });
 });
 

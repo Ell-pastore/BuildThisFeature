@@ -39,6 +39,7 @@ import {
   ToolApprovalDuplicateError,
   ToolApprovalExpiredError,
   ToolApprovalNotFoundError,
+  consumeToolApproval as consumeToolApprovalRepo,
   createToolApproval,
   getPendingToolApproval,
   getToolApproval,
@@ -415,6 +416,30 @@ export async function listPendingToolApprovals(userId: string): Promise<ToolAppr
     throw new ToolApprovalValidationError("A non-empty userId is required.");
   }
   return listPendingToolApprovalsRepo(userId);
+}
+
+/**
+ * Consume an already-EXECUTED `approved` approval (Phase 10.30), sealing it so
+ * it can never be replayed or double-executed. The row stays `approved` but
+ * its window is backdated to `now`, so every later executable guard treats it
+ * as expired. Ownership is enforced by the repository.
+ *
+ * @throws `ToolApprovalValidationError` on a malformed approval id.
+ * @throws repository errors unchanged (`ToolApprovalNotFoundError`,
+ *         `ToolApprovalAlreadyResolvedError`, `ToolApprovalExpiredError`).
+ */
+export async function consumeToolApproval(
+  userId: string,
+  approvalId: unknown,
+  now: Date = new Date(),
+): Promise<ToolApprovalRecord> {
+  if (typeof userId !== "string" || userId.length === 0) {
+    throw new ToolApprovalValidationError("A non-empty userId is required.");
+  }
+  if (!isUuid(approvalId)) {
+    throw new ToolApprovalValidationError("A valid approvalId is required.");
+  }
+  return consumeToolApprovalRepo(userId, approvalId, now);
 }
 
 // ---------------------------------------------------------------------------

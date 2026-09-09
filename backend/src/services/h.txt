@@ -1,75 +1,85 @@
-Phase 10.29 — AI: integrate approval lifecycle into instruction flow
-=====================================================================
+# Phase 10.30 — Approval Resume (execution after decision)
 
-Commit
-------
-`AI: integrate approval lifecycle into instruction flow` (on `main`, not pushed).
-Includes the Phase 10.28D approval API (uncommitted in the working tree) plus the
-Phase 10.29 integration into the authenticated AI instruction flow.
+> Root: dc62d2e `AI: gate privileged tools behind user approval`
+> This phase: `AI: resume instruction after approval`
 
-Scope
------
-1. The tool-approval lifecycle (10.28A persistence + 10.28B contract +
-   10.28C invocation gate + 10.28D authenticated approval API) is now wired into
-   `POST /api/ai/instructions`: the bounded persistent turn surfaces pending
-   approvals to the authenticated client and never executes a gated tool.
+## Goal
 
-2. A gated tool request in an instruction turn:
-   - persists ONE pending approval bound to the authenticated user and the
-     turn's REAL persisted `conversationId`/`messageId`;
-   - NEVER executes (the executor is untouched);
-   - returns a typed, structured result (round feedback to the provider is the
-     ordinary `tools/approval-required` denial; the API response carries safe
-     pending-approval metadata ONLY — approval id, tool name, validated
-     arguments, expiry — no raw file contents, provider output, or secrets);
-   - is idempotent for the same message + tool (no second row; the existing
-     pending approval is surfaced again).
+Continue an interrupted AI instruction turn after the user approves the gated
+tool call. The approved tool operation — and ONLY it — executes, consumes the
+approval, and the turn resumes inside the approval's own conversation, on the
+conversation's persisted round budget.
 
-3. Approved tools continue through the existing 10.28C pipeline (approval →
-   policy → handler → executor) executing the EXACT stored arguments; rejected
-   and expired approvals never execute; ownership stays structural (a peer's
-   approval is indistinguishable from a missing one).
+## What changed
 
-Files (under backend/src)
--------------------------
-- services/provider.ts       `routeAgentResponse` → `RouteAgentResponseResult`
-                             `{ results, pendingApprovals }`.
-- services/agent.ts          `AgentResult.pendingApprovals`; `runAgentRequest`
-                             collects approval metadata at the gate.
-- services/agentLoop.ts      `AgentLoopOutput.pendingApprovals` accumulated per
-                             round and returned on loop exit.
-- services/persistentAgentTurn.ts `PersistentTurnResult.pendingApprovals`.
-- services/aiInstructions.ts `AiInstructionTurn.pendingApprovals` in the safe
-                             HTTP response (`toAiInstructionTurn`).
-- services/aiToolApprovals.ts    Phase 10.28D service wrappers
-                             (`approveToolApproval` / `rejectToolApproval` /
-                             `listPendingToolApprovals`).
-- routes/ai.ts               Phase 10.28D authenticated approval API
-                             (`GET /api/ai/approvals`,
-                             `POST /api/ai/approvals/:id/approve`,
-                             `POST /api/ai/approvals/:id/reject`) with the
-                             safe envelope (`mapApprovalError`) and preferred
-                             response projection.
-- database/repositories/aiToolApprovals.ts  `listPendingToolApprovals` (user's
-                             pending rows, oldest-first).
+### Persistence (`ai_tool_approvals`)
+- Repo `consumeToolApproval(userId, approvalId, now)`: a transaction that
+  verifies ownership, requires `approved` status, and backdates `expires_at`
+  to `now`. The DB CHECK forbids a `consumed` status, so the row stays
+  `approved` — but every later executable guard treats the backdated window
+  as expired, so any replay fails closed. Missing/foreign → 404
+  (`ToolApprovalNotFoundError`); not-`approved` → 400
+  (`ToolApprovalAlreadyResolvedError`); elapsed window → sweeps to `expired`
+  then throws `ToolApprovalExpiredError`.
+- Service `consumeToolApproval(userId, approvalId, now = now())`: input
+  validation (non-empty user, UUID id), delegates to the repo.
 
-Tests
------
-- routes/aiApprovals.test.ts  Phase 10.28D route coverage: authentication
-                             (401), ownership-scoped safe listing, approve /
-                             reject (200 + idempotent), malformed id (400),
-                             foreign/missing (safe 404), expired (400).
-- services/aiInstructionApprovals.test.ts  Phase 10.29 focused coverage:
-                             pending creation + no execution + safe surfacing +
-                             persisted ownership context; approved continuation
-                             through policy → handler → executor with stored
-                             args; rejected/expired never execute; cross-user
-                             ownership at both the flow and the boundary; and
-                             ungated-tool regression (`pendingApprovals: []`).
+### Loop seeding (`agentLoop`)
+- `runAgentLoop` accepts optional `initialToolResults` + `initialToolRounds`
+  (non-negative integer). Seeded results are served as already-executed
+  first-request context and the seeded round count is compared against
+  `maxToolRounds` from the very first provider request. Default behavior
+  (omitted) is byte-for-byte unchanged: empty results, round zero.
 
-Verification
-------------
-- `pnpm test` (backend):  878 passed (34 files).
-- `npx tsc --noEmit`      clean.
-- `npm run build`         clean.
-- `npx oxfmt`             applied.
+### Resume turn (`persistentAgentTurn`)
+- `PersistentTurnInput.resumeApprovalId` enters resume mode.
+- Load phase (before anything runs): resolve the approval OWNED by the
+  authenticated user (missing/foreign → 404); a supplied `conversationId`
+  must equal the approval's own conversation (else 400); assert the approval
+  is currently executable (rejected/expired/consumed → 400, nothing runs);
+  load the approval's conversation and adopt its persisted `maxToolRounds`
+  as this turn's bound. This mirrors Phase 10.28D (approval resolution) and
+  Phase 10.8/10.9 (conversation ownership via `loadAgentConversationState`).
+- Execute phase (inside the turn's try): the approved operation runs ONCE
+  through the UNCHANGED `invokeTool` gate → policy → handler → executor
+  pipeline with the approval's id (`approvalId`) and the approval's own
+  persisted conversation/message context. The caller supplies NO arguments —
+  only the approval's exact stored, validated arguments execute (this is the
+  caller-input-ignored contract of the Phase 10.28C EXECUTE path). The result
+  is recorded as this turn's first round (`callId = approval.id`), the
+  approval is consumed immediately (best-effort, so a consume failure can
+  never mask an already-executed turn), and the eager transcript is committed
+  via the same `beginAgentTurn` → `completeAgentTurn` path as any round.
+- Loop phase: the executed result is seeded (`initialToolResults`,
+  `initialToolRounds: 1`) so the provider's first request already carries the
+  result and the turn continues from round one — bounded by the
+  conversation's persisted `maxToolRounds`, never beyond it. The normal
+  failure compensation (`cancelAgentTurn`) applies on any later failure.
+
+### Instruction contract (`aiInstructions`)
+- Body gains optional `approvalId` (UUID-shaped; malformed → 400; never a
+  substitute for the required `instruction`). Anything else is still
+  rejected — the strict-body rule and identity isolation are unchanged.
+- `mapAgentTurnError` maps resume outcomes for the HTTP layer:
+  - `ToolApprovalNotFoundError` → 404 `common/not-found` (foreign equivalent
+    to missing),
+  - `ToolApprovalExpiredError` / `ToolApprovalNotExecutableError` → 400
+    `common/bad-request` (rejected / expired / consumed never execute),
+  - `AppError.badRequest` (conversation mismatch) and the existing agent-loop
+    → 502 mapping pass through unchanged.
+
+## Verification
+
+- 890/890 tests pass (`pnpm test`), including new coverage:
+  - `agentLoop.test.ts` — seeding: served as first-round context, counted
+    against the bound (a seeded budget refuses new tools with
+    `AgentLoopError`, nothing executes), negative seed rejected.
+  - `aiInstructionResume.test.ts` (real runtime + real gate/handlers + fake
+    provider and executor, mirrored in-memory repository seams):
+    happy resume (stored args only, round 1, consumed, provider saw the
+    result, no new approvals), rejected → 400, expired → 400, foreign → 404,
+    conversation mismatch → 400, replay prevention (executor runs once across
+    resume AND the invocation boundary), conversation bound → 502 +
+    `cancelAgentTurn`, malformed `approvalId` → 400 before the runtime, and
+    `approvalId` cannot replace `instruction`.
+- `pnpm typecheck` clean; `pnpm build` clean; oxfmt applied.

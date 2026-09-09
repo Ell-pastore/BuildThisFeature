@@ -334,3 +334,59 @@ export async function resolveToolApproval(
     return toRecord(updated);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Consume (Phase 10.30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Consume an ALREADY-EXECUTED `approved` approval so it can never authorize a
+ * second execution. Consumption backdates `expires_at` to `now`: the row
+ * stays `approved` (the DB CHECK forbids a `consumed` state) but every later
+ * executable guard (`assertToolApprovalExecutable`,
+ * `isToolApprovalExecutable`) treats it as expired, so any replay fails
+ * closed. Ownership is verified inside the same transaction as the write.
+ *
+ * @throws `ToolApprovalNotFoundError` when the approval does not exist for
+ *         `userId` (indistinguishable from foreign ownership).
+ * @throws `ToolApprovalAlreadyResolvedError` when the row is not `approved`
+ *         (a pending/rejected/expired approval has nothing to consume).
+ * @throws `ToolApprovalExpiredError` when the window already elapsed; the row
+ *         is transitioned to `expired` before throwing.
+ */
+export async function consumeToolApproval(
+  userId: string,
+  approvalId: string,
+  now: Date,
+): Promise<ToolApprovalRecord> {
+  const db = getDatabase();
+  return db.$transaction(async (tx) => {
+    const owned = await tx.aiToolApproval.findFirst({
+      where: { id: approvalId, userId },
+      select: { id: true, status: true, expiresAt: true },
+    });
+    if (owned === null) throw new ToolApprovalNotFoundError();
+    if (owned.status !== ToolApprovalStatus.Approved) {
+      throw new ToolApprovalAlreadyResolvedError(owned.status as ToolApprovalStatus);
+    }
+    if (now.getTime() >= owned.expiresAt.getTime()) {
+      await tx.aiToolApproval.update({
+        where: { id: approvalId },
+        data: {
+          status: ToolApprovalStatus.Expired,
+          decidedAt: now,
+          updatedAt: now,
+        },
+      });
+      throw new ToolApprovalExpiredError();
+    }
+    const updated = await tx.aiToolApproval.update({
+      where: { id: approvalId },
+      data: {
+        expiresAt: now,
+        updatedAt: now,
+      },
+    });
+    return toRecord(updated);
+  });
+}

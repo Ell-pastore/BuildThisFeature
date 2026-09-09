@@ -12,10 +12,11 @@
  *     `PersistentAgentTurnRuntime` (`runPersistentTurn`), preserving the
  *     bounded loop, provider fallback/rotation/cooldown, conversation
  *     ownership checks, and the `invokeTool()`/policy pipeline verbatim.
- *   - STRICT BODY: only `conversationId` (optional) and `instruction`
- *     (required) are accepted. Unknown fields — including any user id — are
- *     REJECTED, so a body can never override or influence the authenticated
- *     identity (which comes exclusively from the session).
+ *   - STRICT BODY: only `conversationId` (optional), `approvalId` (optional,
+ *     Phase 10.30 resume) and `instruction` (required) are accepted. Unknown
+ *     fields — including any user id — are REJECTED, so a body can never
+ *     override or influence the authenticated identity (which comes
+ *     exclusively from the session).
  *   - VALIDATION CONVENTIONS: mirrors the existing auth-service style —
  *     module-level constants, `AppError.badRequest` with explicit messages.
  *   - SAFE RESPONSE: reuses the persisted `ConversationState` types. The
@@ -39,6 +40,11 @@ import type { FilesystemExecutor } from "../tools/executor.js";
 import type { AgentMessage } from "./conversation.js";
 import { isAgentLoopError } from "./agentLoop.js";
 import { isProviderError } from "./provider.js";
+import {
+  ToolApprovalExpiredError,
+  ToolApprovalNotFoundError,
+  ToolApprovalNotExecutableError,
+} from "./aiToolApprovals.js";
 import type { ToolApprovalRequestInfo } from "./tools.js";
 import {
   createPersistentTurnRuntime,
@@ -55,8 +61,8 @@ import { composeDefaultProviderStack } from "./providerComposition.js";
 /** Reasonable server-side cap on a single instruction / prompt. */
 export const MAX_INSTRUCTION_LENGTH = 4096;
 
-/** Strict body shape: nothing outside these two fields is accepted. */
-const BODY_FIELDS = new Set(["conversationId", "instruction"]);
+/** Strict body shape: nothing outside these three fields is accepted. */
+const BODY_FIELDS = new Set(["conversationId", "instruction", "approvalId"]);
 
 /** Tool-loop bound applied when the host has not pre-bound a runtime. */
 const MAX_TOOL_ROUNDS = 3;
@@ -71,6 +77,12 @@ export interface AiInstructionBody {
   conversationId?: string;
   /** The authenticated user's instruction (required). */
   instruction: string;
+  /**
+   * Resume after an approval decision (Phase 10.30): the id of the owned,
+   * `approved` tool approval whose EXACT stored arguments this turn should
+   * execute. Optional.
+   */
+  approvalId?: string;
 }
 
 /** Safe outcome synopsis for one executed tool intent (payloads excluded). */
@@ -168,8 +180,17 @@ export function parseAiInstructionInput(raw: unknown): AiInstructionBody {
     conversationId = record.conversationId;
   }
 
+  let approvalId: string | undefined;
+  if (record.approvalId !== undefined) {
+    if (!isConversationId(record.approvalId)) {
+      throw AppError.badRequest("A valid approvalId is required when resuming an approval.");
+    }
+    approvalId = record.approvalId;
+  }
+
   return {
     ...(conversationId !== undefined ? { conversationId } : {}),
+    ...(approvalId !== undefined ? { approvalId } : {}),
     instruction,
   };
 }
@@ -187,6 +208,11 @@ export function parseAiInstructionInput(raw: unknown): AiInstructionBody {
  *   - `ProviderError` (incl. the composition fallback exhaustion error) →
  *     503 `ai/provider-unavailable`, provider-agnostic message.
  *   - `AgentLoopError`      → 502 `ai/max-tool-rounds-reached`.
+ *   - `ToolApprovalNotFoundError` (Phase 10.30) → 404 `common/not-found` (a
+ *     foreign approval is indistinguishable from a missing one).
+ *   - `ToolApprovalExpiredError` / `ToolApprovalNotExecutableError` (Phase
+ *     10.30) → 400 `common/bad-request` (rejected / expired / consumed
+ *     approvals never execute).
  *   - anything else         → returned UNCHANGED so the HTTP layer's generic
  *     `internal/error` envelope (no stack, no message) protects internals.
  */
@@ -208,6 +234,18 @@ export function mapAgentTurnError(error: unknown): unknown {
       "ai/max-tool-rounds-reached",
       "The agent exceeded the allowed number of tool rounds.",
     );
+  }
+  // Phase 10.30 resume failures: a missing/foreign approval is 404 (as
+  // indistinguishable as a missing conversation); an expired or otherwise
+  // non-executable approval is 400 and never executes.
+  if (error instanceof ToolApprovalNotFoundError) {
+    return AppError.notFound("Tool approval");
+  }
+  if (
+    error instanceof ToolApprovalExpiredError ||
+    error instanceof ToolApprovalNotExecutableError
+  ) {
+    return AppError.badRequest(error.message);
   }
   return error;
 }
@@ -264,6 +302,7 @@ export async function runAiInstructionWithRuntime(
 
   const turnInput: PersistentTurnInput = {
     ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
+    ...(input.approvalId !== undefined ? { resumeApprovalId: input.approvalId } : {}),
     instruction: input.instruction,
   };
 
