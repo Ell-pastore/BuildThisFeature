@@ -42,6 +42,7 @@ import type { AgentProviderRequest, AgentResponse } from "./provider.js";
 import { routeAgentResponse } from "./provider.js";
 import type { OrchestratedTurnOptions } from "./orchestrator.js";
 import type { AgentTurnContext } from "./tools.js";
+import type { ToolApprovalRequestInfo } from "./tools.js";
 import { createSessionExecutionContext } from "../tools/sessionContext.js";
 
 /**
@@ -61,9 +62,7 @@ export class AgentLoopError extends Error {
   readonly code: string;
 
   constructor(maxToolRounds: number) {
-    super(
-      `Agent requested tools after the maximum of ${maxToolRounds} tool round(s) was reached.`,
-    );
+    super(`Agent requested tools after the maximum of ${maxToolRounds} tool round(s) was reached.`);
     this.name = "AgentLoopError";
     this.maxToolRounds = maxToolRounds;
     this.code = AgentLoopError.code;
@@ -129,6 +128,11 @@ export interface AgentLoopOutput {
   results: AgentToolResult[];
   /** Number of tool-execution rounds actually performed. */
   toolRounds: number;
+  /**
+   * Pending approval metadata collected across all executed rounds
+   * (Phase 10.29). Empty when no tools required approval.
+   */
+  pendingApprovals: readonly ToolApprovalRequestInfo[];
 }
 
 /**
@@ -160,15 +164,14 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<AgentLoopOutput> {
   if (!Number.isInteger(options.maxToolRounds) || options.maxToolRounds < 1) {
-    throw new TypeError(
-      `maxToolRounds must be a positive integer, got ${options.maxToolRounds}`,
-    );
+    throw new TypeError(`maxToolRounds must be a positive integer, got ${options.maxToolRounds}`);
   }
 
   createSessionExecutionContext(c);
 
   let toolResults: AgentToolResult[] = [];
   let toolRounds = 0;
+  const pendingApprovals: ToolApprovalRequestInfo[] = [];
 
   while (true) {
     const request: AgentProviderRequest = {
@@ -180,7 +183,7 @@ export async function runAgentLoop(
     const response = await options.provider.generate(request);
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
-      return { text: response.text, results: toolResults, toolRounds };
+      return { text: response.text, results: toolResults, toolRounds, pendingApprovals };
     }
 
     if (toolRounds >= options.maxToolRounds) {
@@ -199,15 +202,16 @@ export async function runAgentLoop(
       const prepared = await options.prepareRound(response);
       if (prepared !== undefined) roundContext = prepared;
     }
-    const roundResults = await routeAgentResponse(c, response, {
+    const routed = await routeAgentResponse(c, response, {
       ...options,
       ...(roundContext !== undefined ? { turnContext: roundContext } : {}),
     });
-    toolResults = [...toolResults, ...roundResults];
+    toolResults = [...toolResults, ...routed.results];
+    pendingApprovals.push(...routed.pendingApprovals);
     options.onRound?.({
       text: response.text,
       toolCalls: response.toolCalls,
-      results: roundResults,
+      results: routed.results,
       toolRounds,
     });
   }

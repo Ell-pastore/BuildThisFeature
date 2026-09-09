@@ -137,6 +137,7 @@ describe("runAgentLoop — final text termination", () => {
       text: "Hello!",
       results: [],
       toolRounds: 0,
+      pendingApprovals: [],
     });
     expect(generate).toHaveBeenCalledTimes(1);
     expect(requests[0]).toEqual({ message: "hi", tools: readToolDefinitions });
@@ -174,6 +175,7 @@ describe("runAgentLoop — tool rounds", () => {
       text: "/home is listed.",
       results: [{ ok: true, callId: "a", data: homeListing() }],
       toolRounds: 1,
+      pendingApprovals: [],
     });
     expect(filesystem.calls).toEqual(["listDirectory:/home"]);
   });
@@ -213,6 +215,7 @@ describe("runAgentLoop — tool rounds", () => {
         { ok: true, callId: "t", data: homeListing("/tmp") },
       ],
       toolRounds: 2,
+      pendingApprovals: [],
     });
     expect(filesystem.calls).toEqual(["searchFiles", "listDirectory:/tmp"]);
   });

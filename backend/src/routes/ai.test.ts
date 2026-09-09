@@ -214,6 +214,7 @@ beforeEach(() => {
           toolRounds: 0,
           maxToolRounds: 3,
           toolResults: [],
+          pendingApprovals: [],
         },
       };
     },
@@ -478,7 +479,7 @@ describe("POST /api/ai/instructions — authenticated", () => {
     const body = (await res.json()) as AiInstructionResponse;
     expect(Object.keys(body).sort()).toEqual(["conversationId", "turn"]);
     expect(Object.keys(body.turn).sort()).toEqual(
-      ["created", "finalText", "instruction", "maxToolRounds", "messages", "toolResults", "toolRounds"].sort(),
+      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "toolResults", "toolRounds"].sort(),
     );
     expect(body.turn.instruction).toBe("List my home directory.");
     expect(body.conversationId).toBe("22222222-2222-2222-2222-222222222222");

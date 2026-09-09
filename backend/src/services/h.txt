@@ -1,0 +1,75 @@
+Phase 10.29 — AI: integrate approval lifecycle into instruction flow
+=====================================================================
+
+Commit
+------
+`AI: integrate approval lifecycle into instruction flow` (on `main`, not pushed).
+Includes the Phase 10.28D approval API (uncommitted in the working tree) plus the
+Phase 10.29 integration into the authenticated AI instruction flow.
+
+Scope
+-----
+1. The tool-approval lifecycle (10.28A persistence + 10.28B contract +
+   10.28C invocation gate + 10.28D authenticated approval API) is now wired into
+   `POST /api/ai/instructions`: the bounded persistent turn surfaces pending
+   approvals to the authenticated client and never executes a gated tool.
+
+2. A gated tool request in an instruction turn:
+   - persists ONE pending approval bound to the authenticated user and the
+     turn's REAL persisted `conversationId`/`messageId`;
+   - NEVER executes (the executor is untouched);
+   - returns a typed, structured result (round feedback to the provider is the
+     ordinary `tools/approval-required` denial; the API response carries safe
+     pending-approval metadata ONLY — approval id, tool name, validated
+     arguments, expiry — no raw file contents, provider output, or secrets);
+   - is idempotent for the same message + tool (no second row; the existing
+     pending approval is surfaced again).
+
+3. Approved tools continue through the existing 10.28C pipeline (approval →
+   policy → handler → executor) executing the EXACT stored arguments; rejected
+   and expired approvals never execute; ownership stays structural (a peer's
+   approval is indistinguishable from a missing one).
+
+Files (under backend/src)
+-------------------------
+- services/provider.ts       `routeAgentResponse` → `RouteAgentResponseResult`
+                             `{ results, pendingApprovals }`.
+- services/agent.ts          `AgentResult.pendingApprovals`; `runAgentRequest`
+                             collects approval metadata at the gate.
+- services/agentLoop.ts      `AgentLoopOutput.pendingApprovals` accumulated per
+                             round and returned on loop exit.
+- services/persistentAgentTurn.ts `PersistentTurnResult.pendingApprovals`.
+- services/aiInstructions.ts `AiInstructionTurn.pendingApprovals` in the safe
+                             HTTP response (`toAiInstructionTurn`).
+- services/aiToolApprovals.ts    Phase 10.28D service wrappers
+                             (`approveToolApproval` / `rejectToolApproval` /
+                             `listPendingToolApprovals`).
+- routes/ai.ts               Phase 10.28D authenticated approval API
+                             (`GET /api/ai/approvals`,
+                             `POST /api/ai/approvals/:id/approve`,
+                             `POST /api/ai/approvals/:id/reject`) with the
+                             safe envelope (`mapApprovalError`) and preferred
+                             response projection.
+- database/repositories/aiToolApprovals.ts  `listPendingToolApprovals` (user's
+                             pending rows, oldest-first).
+
+Tests
+-----
+- routes/aiApprovals.test.ts  Phase 10.28D route coverage: authentication
+                             (401), ownership-scoped safe listing, approve /
+                             reject (200 + idempotent), malformed id (400),
+                             foreign/missing (safe 404), expired (400).
+- services/aiInstructionApprovals.test.ts  Phase 10.29 focused coverage:
+                             pending creation + no execution + safe surfacing +
+                             persisted ownership context; approved continuation
+                             through policy → handler → executor with stored
+                             args; rejected/expired never execute; cross-user
+                             ownership at both the flow and the boundary; and
+                             ungated-tool regression (`pendingApprovals: []`).
+
+Verification
+------------
+- `pnpm test` (backend):  878 passed (34 files).
+- `npx tsc --noEmit`      clean.
+- `npm run build`         clean.
+- `npx oxfmt`             applied.

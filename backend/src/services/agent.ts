@@ -28,7 +28,12 @@
 import { AppError } from "../core/errors.js";
 import type { RawToolInput } from "../tools/handlers/handler.js";
 import type { ToolError } from "../tools/errors.js";
-import { invokeTool, type InvokeToolOptions } from "./tools.js";
+import {
+  invokeTool,
+  isToolApprovalRequiredResult,
+  type InvokeToolOptions,
+  type ToolApprovalRequestInfo,
+} from "./tools.js";
 
 /**
  * A provider-independent representation of an agent tool-call intent.
@@ -71,6 +76,12 @@ export interface AgentResult<T = unknown> {
   requestId?: string;
   /** Per-intent results, in request order. */
   results: AgentToolResult<T>[];
+  /**
+   * Pending approval metadata collected from any `approval_required` results
+   * (Phase 10.29). Empty when no gated tool required approval. Safe metadata
+   * only: approval id, tool name, validated arguments, and expiry.
+   */
+  pendingApprovals: readonly ToolApprovalRequestInfo[];
 }
 
 /**
@@ -115,11 +126,7 @@ function parseAgentToolCall(value: unknown): AgentToolCall {
   if (typeof record.toolName !== "string" || record.toolName.length === 0) {
     throw AppError.badRequest("Agent tool call toolName must be a non-empty string.");
   }
-  if (
-    typeof record.input !== "object" ||
-    record.input === null ||
-    Array.isArray(record.input)
-  ) {
+  if (typeof record.input !== "object" || record.input === null || Array.isArray(record.input)) {
     throw AppError.badRequest("Agent tool call input must be a JSON object.");
   }
 
@@ -148,13 +155,19 @@ export async function runAgentRequest(
   options: InvokeToolOptions,
 ): Promise<AgentResult> {
   const results: AgentToolResult[] = [];
+  const pendingApprovals: ToolApprovalRequestInfo[] = [];
   for (const call of request.calls) {
     const result = await invokeTool(c, call.toolName, call.input, options);
+    // Phase 10.29: surface the pending approval's safe metadata alongside the
+    // structured denial, so the instruction flow can report it to the client.
+    if (isToolApprovalRequiredResult(result)) {
+      pendingApprovals.push(result.approval);
+    }
     results.push(
       result.ok
         ? { ok: true, callId: call.id, data: result.data }
         : { ok: false, callId: call.id, error: result.error },
     );
   }
-  return { requestId: request.id, results };
+  return { requestId: request.id, results, pendingApprovals };
 }

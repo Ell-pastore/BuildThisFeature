@@ -39,6 +39,7 @@ import type { FilesystemExecutor } from "../tools/executor.js";
 import type { AgentMessage } from "./conversation.js";
 import { isAgentLoopError } from "./agentLoop.js";
 import { isProviderError } from "./provider.js";
+import type { ToolApprovalRequestInfo } from "./tools.js";
 import {
   createPersistentTurnRuntime,
   type PersistentAgentTurnRuntime,
@@ -85,7 +86,8 @@ export interface AiToolOutcome {
  * reuses the existing persisted `ConversationState` fields — the transcript
  * (`messages`), scalar progress fields, and `finalText` — plus `created`.
  * Tool RESULTS are deliberately reduced to `{ callId, ok }`; payload fields
- * (which can carry raw file contents) are never echoed.
+ * (which can carry raw file contents) are never echoed. Pending approval
+ * metadata is included when any tool required approval (Phase 10.29).
  */
 export interface AiInstructionTurn {
   /** True when a new conversation was created for this turn. */
@@ -102,6 +104,14 @@ export interface AiInstructionTurn {
   maxToolRounds: number;
   /** Safe per-intent outcome synopsis; payloads are never included. */
   toolResults: readonly AiToolOutcome[];
+  /**
+   * Pending approval metadata collected during this turn (Phase 10.29).
+   * Each entry contains safe metadata only: the persisted approval id, the
+   * tool name, the schema-validated arguments stored in the approval, and
+   * the expiry of the approval window. Empty when no tools required
+   * approval. No raw file contents, provider responses, or secrets.
+   */
+  pendingApprovals: readonly ToolApprovalRequestInfo[];
 }
 
 /** Stable HTTP response for `POST /api/ai/instructions`. */
@@ -153,9 +163,7 @@ export function parseAiInstructionInput(raw: unknown): AiInstructionBody {
   let conversationId: string | undefined;
   if (record.conversationId !== undefined) {
     if (!isConversationId(record.conversationId)) {
-      throw AppError.badRequest(
-        "A valid conversationId is required when resuming a conversation.",
-      );
+      throw AppError.badRequest("A valid conversationId is required when resuming a conversation.");
     }
     conversationId = record.conversationId;
   }
@@ -213,9 +221,7 @@ function toAiInstructionTurn(result: PersistentTurnResult): AiInstructionTurn {
     created: result.created,
     instruction: result.state.instruction,
     messages: result.state.messages,
-    ...(result.state.finalText !== undefined
-      ? { finalText: result.state.finalText }
-      : {}),
+    ...(result.state.finalText !== undefined ? { finalText: result.state.finalText } : {}),
     toolRounds: result.state.toolRounds,
     maxToolRounds: result.state.maxToolRounds,
     // Never echo payload-bearing results (raw file content etc.).
@@ -223,13 +229,14 @@ function toAiInstructionTurn(result: PersistentTurnResult): AiInstructionTurn {
       callId: toolResult.callId,
       ok: toolResult.ok,
     })),
+    // Phase 10.29: safe pending approval metadata — approval id, tool name,
+    // validated args, and expiry. No raw file contents or provider output.
+    pendingApprovals: result.pendingApprovals,
   };
 }
 
 /** Shape the existing persisted turn result into the stable HTTP response. */
-export function toAiInstructionResponse(
-  result: PersistentTurnResult,
-): AiInstructionResponse {
+export function toAiInstructionResponse(result: PersistentTurnResult): AiInstructionResponse {
   return {
     conversationId: result.conversationId,
     turn: toAiInstructionTurn(result),
@@ -256,9 +263,7 @@ export async function runAiInstructionWithRuntime(
   const input = parseAiInstructionInput(raw);
 
   const turnInput: PersistentTurnInput = {
-    ...(input.conversationId !== undefined
-      ? { conversationId: input.conversationId }
-      : {}),
+    ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
     instruction: input.instruction,
   };
 
@@ -286,9 +291,7 @@ let boundFilesystem: FilesystemExecutor | undefined;
  * so provider fallback/rotation/cooldown state survives across requests.
  * Pass `undefined` to clear (for tests).
  */
-export function bindAiInstructionRuntime(
-  runtime: PersistentAgentTurnRuntime | undefined,
-): void {
+export function bindAiInstructionRuntime(runtime: PersistentAgentTurnRuntime | undefined): void {
   boundRuntime = runtime;
 }
 
@@ -297,9 +300,7 @@ export function bindAiInstructionRuntime(
  * built lazily on first use from the default provider stack and registered
  * read-only tools. Pass `undefined` to clear (for tests).
  */
-export function bindAiInstructionFilesystem(
-  filesystem: FilesystemExecutor | undefined,
-): void {
+export function bindAiInstructionFilesystem(filesystem: FilesystemExecutor | undefined): void {
   boundFilesystem = filesystem;
 }
 

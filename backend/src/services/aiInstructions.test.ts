@@ -101,6 +101,7 @@ function makeResult(
     conversationId: overrides?.conversationId ?? CONVERSATION_ID,
     created: overrides?.created ?? true,
     state,
+    pendingApprovals: overrides?.pendingApprovals ?? [],
   };
 }
 
@@ -336,7 +337,7 @@ describe("toAiInstructionResponse — safe response shape", () => {
 
     expect(Object.keys(response).sort()).toEqual(["conversationId", "turn"]);
     expect(Object.keys(response.turn).sort()).toEqual(
-      ["created", "finalText", "instruction", "maxToolRounds", "messages", "toolResults", "toolRounds"].sort(),
+      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "toolResults", "toolRounds"].sort(),
     );
     expect(response.conversationId).toBe(CONVERSATION_ID);
     expect(response.turn.instruction).toBe("List my home directory.");
@@ -375,7 +376,12 @@ describe("toAiInstructionResponse — safe response shape", () => {
     ]);
     state = finalizeConversation(state, "I could not read that file.");
 
-    const response = toAiInstructionResponse({ conversationId: CONVERSATION_ID, created: true, state });
+    const response = toAiInstructionResponse({
+      conversationId: CONVERSATION_ID,
+      created: true,
+      state,
+      pendingApprovals: [],
+    });
 
     expect(response.turn.toolResults).toEqual([{ callId: "f1", ok: false }]);
     expect(response.turn.finalText).toBe("I could not read that file.");
@@ -384,7 +390,12 @@ describe("toAiInstructionResponse — safe response shape", () => {
 
   it("omits finalText when the turn has not produced one", () => {
     const state = createConversationState({ instruction: "x", maxToolRounds: 1 });
-    const response = toAiInstructionResponse({ conversationId: CONVERSATION_ID, created: true, state });
+    const response = toAiInstructionResponse({
+      conversationId: CONVERSATION_ID,
+      created: true,
+      state,
+      pendingApprovals: [],
+    });
     expect("finalText" in response.turn).toBe(false);
   });
 });

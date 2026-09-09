@@ -68,7 +68,7 @@
 import { AppError } from "../core/errors.js";
 import type { AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
-import type { InvokeToolOptions } from "./tools.js";
+import type { InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
 import type { AgentToolResult } from "./agent.js";
 import { buildAgentContext } from "./agentContext.js";
 import { runAgentLoop, type AgentLoopRound } from "./agentLoop.js";
@@ -130,6 +130,13 @@ export interface PersistentTurnResult {
   created: boolean;
   /** The updated, fully persisted conversation state (Phase 10.6). */
   state: ConversationState;
+  /**
+   * Pending approval metadata collected during this turn (Phase 10.29).
+   * Empty when no tools required approval. Safe metadata only: approval id,
+   * tool name, validated arguments, and expiry — no raw file contents or
+   * provider output.
+   */
+  pendingApprovals: readonly ToolApprovalRequestInfo[];
 }
 
 /**
@@ -241,9 +248,7 @@ export async function runPersistentTurn(
   let conversationId: string | undefined;
   let created = false;
   let instructionMessageId: string | undefined;
-  let currentSlot:
-    | { messageId: string; toolResults?: readonly AgentToolResult[] }
-    | undefined;
+  let currentSlot: { messageId: string; toolResults?: readonly AgentToolResult[] } | undefined;
   const roundSlots: { messageId: string; toolResults?: readonly AgentToolResult[] }[] = [];
 
   try {
@@ -284,9 +289,7 @@ export async function runPersistentTurn(
         }
         const begun = await beginAgentTurn({
           userId,
-          ...(input.conversationId !== undefined
-            ? { conversationId: input.conversationId }
-            : {}),
+          ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
           instruction: context.instruction,
           maxToolRounds,
           ...(input.title !== undefined ? { title: input.title } : {}),
@@ -306,6 +309,11 @@ export async function runPersistentTurn(
       },
     });
     const rounds = observed.map(toTurnRecord);
+
+    // Phase 10.29: collect pending approval metadata from the agent loop.
+    // This is safe metadata only — approval id, tool name, validated args,
+    // and expiry — no raw file contents or provider output.
+    const turnPendingApprovals = output.pendingApprovals;
 
     // 4. Replay the transcript through the Phase 10.6 transitions. This both
     //    validates (reusing the same guards persistence uses) and produces the
@@ -339,7 +347,12 @@ export async function runPersistentTurn(
         })),
         finalText: state.finalText ?? "",
       });
-      return { conversationId: conversationId as string, created, state };
+      return {
+        conversationId: conversationId as string,
+        created,
+        state,
+        pendingApprovals: turnPendingApprovals,
+      };
     }
 
     const persisted = await persistAgentTurn({
@@ -356,6 +369,7 @@ export async function runPersistentTurn(
       conversationId: persisted.id,
       created: persisted.created,
       state,
+      pendingApprovals: turnPendingApprovals,
     };
   } catch (error) {
     // 6. Compensation: a failed turn that already committed eager rows must
@@ -394,10 +408,7 @@ export async function runPersistentTurn(
  * drives every turn; setting `provider` is intentionally disallowed here so
  * production wiring cannot bypass the multi-provider system.
  */
-export type PersistentTurnStackOptions = Omit<
-  PersistentTurnOptions,
-  "provider" | "stack"
-> & {
+export type PersistentTurnStackOptions = Omit<PersistentTurnOptions, "provider" | "stack"> & {
   /** The composed provider stack whose facade runs each turn's rounds. */
   stack: ComposedProviderStack;
 };

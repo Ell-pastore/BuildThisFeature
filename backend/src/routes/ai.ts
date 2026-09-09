@@ -12,7 +12,27 @@
  *                                              + its chronological transcript.
  * `DELETE /api/ai/conversations/:conversationId` — delete one owned conversation
  *                                              atomically (cascade transcript).
+ * `GET    /api/ai/approvals`                              — list the authenticated user's pending tool approvals.
+ * `POST   /api/ai/approvals/:approvalId/approve`          — approve one owned pending approval.
+ * `POST   /api/ai/approvals/:approvalId/reject`           — reject one owned pending approval.
  *
+ * Approval API (Phase 10.28D):
+ *
+ *   - All use the EXISTING per-route `requireAuth` middleware; unauthenticated
+ *     requests receive the existing generic 401 `auth/unauthorized` envelope.
+ *   - Identity comes EXCLUSIVELY from the authenticated session — never from
+ *     the request body or path. The service ownership-scopes every operation,
+ *     so a foreign or missing approval is indistinguishable and both produce
+ *     the existing 404.
+ *   - `GET /approvals` returns only the caller's OWN pending approvals (oldest
+ *     first), projected to a safe representation: ids, tool name, validated
+ *     arguments, status, timestamps, expiry, and decision timestamp. No
+ *     secrets, credentials, raw file contents, or internal details ever leave
+ *     the API.
+ *   - Approve/reject are idempotent: a repeated decision returns the existing
+ *     terminal state rather than erroring. An expired approval cannot be
+ *     approved/rejected (400). Approving/rejecting never executes a tool —
+ *     execution stays behind the existing approved-tool invocation path.
  *   - All use the EXISTING per-route `requireAuth` middleware; unauthenticated
  *     requests receive the existing generic 401 `auth/unauthorized` envelope.
  *   - This is application-level AI access, NOT an admin endpoint: every
@@ -51,6 +71,59 @@ import {
   renameAiConversation,
   unarchiveAiConversation,
 } from "../services/aiConversations.js";
+import {
+  approveToolApproval,
+  listPendingToolApprovals,
+  rejectToolApproval,
+  ToolApprovalExpiredError,
+  ToolApprovalNotFoundError,
+  ToolApprovalValidationError,
+  type ToolApprovalRecord,
+} from "../services/aiToolApprovals.js";
+
+// ---------------------------------------------------------------------------
+// Approval API helpers (Phase 10.28D)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map an approval-domain error to the matching HTTP envelope. Malformed ids →
+ * 400; missing/foreign (deliberately indistinguishable) → 404; an elapsed
+ * window → 400. Anything unexpected is rethrown to surface as a generic 500.
+ */
+function mapApprovalError(error: unknown): AppError {
+  if (error instanceof ToolApprovalValidationError) {
+    return AppError.badRequest(error.message);
+  }
+  if (error instanceof ToolApprovalNotFoundError) {
+    return AppError.notFound("Tool approval");
+  }
+  if (error instanceof ToolApprovalExpiredError) {
+    return AppError.badRequest(error.message);
+  }
+  throw error;
+}
+
+/**
+ * Project a persisted approval record to the safe API representation: ids, tool
+ * name, validated arguments, status, timestamps, expiry, and decision
+ * timestamp. The record is already safe by construction (validated arguments
+ * only — no secrets, per SCHEMA.md §6.8); this merely drops the internal
+ * `userId` and converts `Date`s to ISO strings.
+ */
+function toApprovalResponse(record: ToolApprovalRecord) {
+  return {
+    id: record.id,
+    conversationId: record.conversationId,
+    messageId: record.messageId,
+    toolName: record.toolName,
+    arguments: record.arguments,
+    status: record.status,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
+    expiresAt: record.expiresAt.toISOString(),
+    decidedAt: record.decidedAt === null ? null : record.decidedAt.toISOString(),
+  };
+}
 
 export const aiRoutes = new Hono<AppVariables>()
   .get("/status", requireAuth, (c) => {
@@ -130,10 +203,7 @@ export const aiRoutes = new Hono<AppVariables>()
     }
 
     const body = raw as { title: unknown };
-    return c.json(
-      await renameAiConversation(user.id, conversationId, body.title as string),
-      200,
-    );
+    return c.json(await renameAiConversation(user.id, conversationId, body.title as string), 200);
   })
   .patch("/conversations/:conversationId/archive", requireAuth, async (c) => {
     // Identity comes EXCLUSIVELY from the authenticated session. Archive is
@@ -151,4 +221,39 @@ export const aiRoutes = new Hono<AppVariables>()
     const user = getCurrentUser(c);
     const conversationId = c.req.param("conversationId");
     return c.json(await unarchiveAiConversation(user.id, conversationId), 200);
+  })
+  .get("/approvals", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session. Listing is
+    // ownership-scoped by the service/repository, so a user sees only their
+    // own pending approvals — never another user's.
+    const user = getCurrentUser(c);
+    try {
+      return c.json((await listPendingToolApprovals(user.id)).map(toApprovalResponse), 200);
+    } catch (error) {
+      throw mapApprovalError(error);
+    }
+  })
+  .post("/approvals/:approvalId/approve", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session; the service
+    // ownership-scopes the resolve, so a foreign/missing approval is a clean
+    // 404. A resolved approval resolves idempotently to its terminal state.
+    const user = getCurrentUser(c);
+    const approvalId = c.req.param("approvalId");
+    try {
+      return c.json(toApprovalResponse(await approveToolApproval(user.id, approvalId)), 200);
+    } catch (error) {
+      throw mapApprovalError(error);
+    }
+  })
+  .post("/approvals/:approvalId/reject", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session; the service
+    // ownership-scopes the resolve, so a foreign/missing approval is a clean
+    // 404. A resolved approval resolves idempotently to its terminal state.
+    const user = getCurrentUser(c);
+    const approvalId = c.req.param("approvalId");
+    try {
+      return c.json(toApprovalResponse(await rejectToolApproval(user.id, approvalId)), 200);
+    } catch (error) {
+      throw mapApprovalError(error);
+    }
   });

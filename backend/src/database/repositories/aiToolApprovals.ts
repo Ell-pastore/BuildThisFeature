@@ -36,8 +36,7 @@ export const ToolApprovalStatus = {
   Expired: "expired",
 } as const;
 
-export type ToolApprovalStatus =
-  (typeof ToolApprovalStatus)[keyof typeof ToolApprovalStatus];
+export type ToolApprovalStatus = (typeof ToolApprovalStatus)[keyof typeof ToolApprovalStatus];
 
 /** The only decisions the contract allows — approve or reject. */
 export const ToolApprovalDecision = {
@@ -45,8 +44,7 @@ export const ToolApprovalDecision = {
   Reject: "rejected",
 } as const;
 
-export type ToolApprovalDecision =
-  (typeof ToolApprovalDecision)[keyof typeof ToolApprovalDecision];
+export type ToolApprovalDecision = (typeof ToolApprovalDecision)[keyof typeof ToolApprovalDecision];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -259,6 +257,22 @@ export async function getPendingToolApproval(
     },
   });
   return row === null ? null : toRecord(row);
+}
+
+/**
+ * List the current user's PENDING tool approvals, oldest-first (the natural
+ * decision order). Ownership is structural (`userId`); only `pending` rows
+ * are returned. Ordered by `createdAt` so the longest-waiting request is
+ * decided first. The existing partial `(user_id, expires_at) WHERE status =
+ * 'pending'` index covers the filter.
+ */
+export async function listPendingToolApprovals(userId: string): Promise<ToolApprovalRecord[]> {
+  const db = getDatabase();
+  const rows = await db.aiToolApproval.findMany({
+    where: { userId, status: ToolApprovalStatus.Pending },
+    orderBy: { createdAt: "asc" },
+  });
+  return rows.map(toRecord);
 }
 
 // ---------------------------------------------------------------------------

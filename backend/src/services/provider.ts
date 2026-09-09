@@ -38,7 +38,7 @@ import type { ToolDefinition } from "../tools/types.js";
 import { AppError } from "../core/errors.js";
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import { parseAgentRequest, runAgentRequest } from "./agent.js";
-import type { InvokeToolOptions } from "./tools.js";
+import type { InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
 
 /**
  * The provider-agnostic context a provider receives to produce a reply.
@@ -107,8 +107,7 @@ export const ProviderErrorCode = {
   Internal: "provider/internal",
 } as const;
 
-export type ProviderErrorCode =
-  (typeof ProviderErrorCode)[keyof typeof ProviderErrorCode];
+export type ProviderErrorCode = (typeof ProviderErrorCode)[keyof typeof ProviderErrorCode];
 
 /**
  * The typed error contract for provider failures.
@@ -168,6 +167,23 @@ export interface AgentTurnOutput {
 }
 
 /**
+ * The structured return from `routeAgentResponse`: per-intent execution
+ * results plus any pending approval metadata collected during the round.
+ * Pending approvals are extracted from `approval_required` outcomes so
+ * callers can surface them to the authenticated client without coupling
+ * to the internal error shape.
+ */
+export interface RouteAgentResponseResult {
+  /** Per-intent execution results, in request order. */
+  readonly results: AgentToolResult[];
+  /**
+   * Pending approval metadata collected from any `approval_required` results
+   * in this round. Empty when no tools required approval.
+   */
+  readonly pendingApprovals: readonly ToolApprovalRequestInfo[];
+}
+
+/**
  * Validate a provider response's tool-call intents and route them through
  * the authenticated pipeline (`runAgentRequest()` → `invokeTool()`).
  *
@@ -177,7 +193,9 @@ export interface AgentTurnOutput {
  *
  * - Executes nothing from inside the provider.
  * - Re-validates provider output through `parseAgentRequest`.
- * - Returns an empty array when the response requested no tools.
+ * - Returns an empty results array when the response requested no tools.
+ * - Collects pending approval metadata from `approval_required` results
+ *   (Phase 10.29) so callers can surface them to the authenticated client.
  *
  * @throws `AppError.badRequest` when the provider returned malformed intents.
  * @throws `AppError.unauthorized()` when `c` has no session identity.
@@ -186,13 +204,16 @@ export async function routeAgentResponse(
   c: { get: (key: string) => unknown },
   response: AgentResponse,
   options: InvokeToolOptions,
-): Promise<AgentToolResult[]> {
+): Promise<RouteAgentResponseResult> {
   if (!response.toolCalls || response.toolCalls.length === 0) {
-    return [];
+    return { results: [], pendingApprovals: [] };
   }
   const request = parseAgentRequest({ calls: response.toolCalls });
-  const result = await runAgentRequest(c, request, options);
-  return result.results;
+  const agentResult = await runAgentRequest(c, request, options);
+  return {
+    results: agentResult.results,
+    pendingApprovals: agentResult.pendingApprovals,
+  };
 }
 
 /**
@@ -221,6 +242,6 @@ export async function runAgentTurn(
     tools: turn.tools,
   });
 
-  const results = await routeAgentResponse(c, response, options);
+  const { results } = await routeAgentResponse(c, response, options);
   return { text: response.text, results };
 }

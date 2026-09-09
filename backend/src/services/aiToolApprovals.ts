@@ -42,6 +42,7 @@ import {
   createToolApproval,
   getPendingToolApproval,
   getToolApproval,
+  listPendingToolApprovals as listPendingToolApprovalsRepo,
   resolveToolApproval,
   type ToolApprovalRecord,
 } from "../database/repositories/aiToolApprovals.js";
@@ -174,10 +175,7 @@ export function validateToolApprovalArguments(
   const record = args as Record<string, unknown>;
   for (const key of schema.required ?? []) {
     if (!(key in record)) {
-      throw new ToolApprovalInvalidArgumentsError(
-        toolName,
-        `missing required argument "${key}".`,
-      );
+      throw new ToolApprovalInvalidArgumentsError(toolName, `missing required argument "${key}".`);
     }
   }
   for (const [key, property] of Object.entries(schema.properties ?? {})) {
@@ -329,6 +327,97 @@ export async function rejectAiToolApproval(
 }
 
 // ---------------------------------------------------------------------------
+// Idempotent resolve for the authenticated API (Phase 10.28D)
+// ---------------------------------------------------------------------------
+//
+// The API must return a consistent terminal state rather than error when the
+// same decision is submitted twice (or a decision is re-submitted after the
+// approval already resolved). These wrappers resolve through the existing
+// contract and, on an `AlreadyResolvedError`, load and return the OWNED record
+// — so a repeated approve/reject is safe and idempotent, and a foreign/missing
+// approval stays a clean 404 (the repository returns null → NotFoundError).
+
+/**
+ * Approve a pending approval idempotently. Resolves the approval through the
+ * existing contract; if it was already resolved, returns the existing terminal
+ * record instead of erroring. Ownership is enforced by the repository on both
+ * the resolve and the fallback load, so a foreign/missing approval throws
+ * `ToolApprovalNotFoundError`.
+ *
+ * @throws `ToolApprovalValidationError` on a malformed id.
+ * @throws `ToolApprovalNotFoundError` when the approval does not exist for
+ *         `userId` (indistinguishable from foreign ownership).
+ * @throws `ToolApprovalExpiredError` when the approval window has elapsed.
+ */
+export async function approveToolApproval(
+  userId: string,
+  approvalId: unknown,
+  now: Date = new Date(),
+): Promise<ToolApprovalRecord> {
+  if (typeof userId !== "string" || userId.length === 0) {
+    throw new ToolApprovalValidationError("A non-empty userId is required.");
+  }
+  if (!isUuid(approvalId)) {
+    throw new ToolApprovalValidationError("A valid approvalId is required.");
+  }
+  try {
+    return await resolveToolApproval(userId, approvalId, ToolApprovalDecision.Approve, now);
+  } catch (error) {
+    if (error instanceof ToolApprovalAlreadyResolvedError) {
+      const existing = await getToolApproval(userId, approvalId);
+      if (existing === null) throw new ToolApprovalNotFoundError();
+      return existing;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Reject a pending approval idempotently. Mirrors `approveToolApproval`: resolves
+ * through the existing contract and returns the owned terminal record on a
+ * repeat decision.
+ *
+ * @throws `ToolApprovalValidationError` on a malformed id.
+ * @throws `ToolApprovalNotFoundError` when the approval does not exist for
+ *         `userId` (indistinguishable from foreign ownership).
+ * @throws `ToolApprovalExpiredError` when the approval window has elapsed.
+ */
+export async function rejectToolApproval(
+  userId: string,
+  approvalId: unknown,
+  now: Date = new Date(),
+): Promise<ToolApprovalRecord> {
+  if (typeof userId !== "string" || userId.length === 0) {
+    throw new ToolApprovalValidationError("A non-empty userId is required.");
+  }
+  if (!isUuid(approvalId)) {
+    throw new ToolApprovalValidationError("A valid approvalId is required.");
+  }
+  try {
+    return await resolveToolApproval(userId, approvalId, ToolApprovalDecision.Reject, now);
+  } catch (error) {
+    if (error instanceof ToolApprovalAlreadyResolvedError) {
+      const existing = await getToolApproval(userId, approvalId);
+      if (existing === null) throw new ToolApprovalNotFoundError();
+      return existing;
+    }
+    throw error;
+  }
+}
+
+/**
+ * List the authenticated user's pending tool approvals, oldest-first. Ownership
+ * is structural; only `pending` rows are returned. Pure projection — the
+ * repository record is already safe (validated arguments only, no secrets).
+ */
+export async function listPendingToolApprovals(userId: string): Promise<ToolApprovalRecord[]> {
+  if (typeof userId !== "string" || userId.length === 0) {
+    throw new ToolApprovalValidationError("A non-empty userId is required.");
+  }
+  return listPendingToolApprovalsRepo(userId);
+}
+
+// ---------------------------------------------------------------------------
 // Execution gate (no filesystem work happens here)
 // ---------------------------------------------------------------------------
 
@@ -336,13 +425,9 @@ export async function rejectAiToolApproval(
  * Whether an approval currently authorizes execution: it must be `approved`
  * AND inside its window (`now < expiresAt`). Pure.
  */
-export function isToolApprovalExecutable(
-  approval: ToolApprovalRecord,
-  now: Date,
-): boolean {
+export function isToolApprovalExecutable(approval: ToolApprovalRecord, now: Date): boolean {
   return (
-    approval.status === ToolApprovalStatus.Approved &&
-    now.getTime() < approval.expiresAt.getTime()
+    approval.status === ToolApprovalStatus.Approved && now.getTime() < approval.expiresAt.getTime()
   );
 }
 
@@ -353,10 +438,7 @@ export function isToolApprovalExecutable(
  *         `approved`; `ToolApprovalExpiredError` when the approval window has
  *         elapsed (an expired approval cannot be executed).
  */
-export function assertToolApprovalExecutable(
-  approval: ToolApprovalRecord,
-  now: Date,
-): void {
+export function assertToolApprovalExecutable(approval: ToolApprovalRecord, now: Date): void {
   if (approval.status !== ToolApprovalStatus.Approved) {
     throw new ToolApprovalNotExecutableError(approval.status);
   }
