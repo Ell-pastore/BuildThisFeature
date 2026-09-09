@@ -61,6 +61,7 @@ model User {
   aiAnalyses       AiAnalysis[]
   aiInstructions   AiInstruction[]
   aiActions        AiAction[]
+  aiToolApprovals  AiToolApproval[]
   sessions         Session[]
 
   @@map("users")
@@ -381,6 +382,7 @@ model AiConversation {
   messages       AiMessage[]
   fileReferences AiFileReference[]
   actions        AiAction[]
+  toolApprovals  AiToolApproval[]
 
   @@index([userId, updatedAt(sort: Desc)]) // conversation list
   @@map("ai_conversations")
@@ -414,6 +416,7 @@ model AiMessage {
   conversation   AiConversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   fileReferences AiFileReference[]
   actions        AiAction[]
+  toolApprovals  AiToolApproval[]
 
   @@index([conversationId, createdAt]) // ordered transcript read
   @@map("ai_messages")
@@ -593,4 +596,48 @@ model AiAction {
   @@index([targetFileId])
   @@index([targetFolderId])
   @@map("ai_actions")
+}
+
+// ---------------------------------------------------------------------------
+// Generic AI tool-approval requests. SCHEMA.md §6.8 — a request for an
+// explicit user decision before an AI-requested tool call executes. Unlike
+// ai_actions (§6.7), this is NOT a filesystem-operations contract: it records
+// the REGISTERED TOOL NAME and its validated arguments, and applies to any
+// tool (read/write/destructive) the application-layer approval contract marks
+// as needing confirmation. Records are transient conversation state: deleting
+// the owning conversation (or message) deletes its approvals (CASCADE) — the
+// opposite of ai_actions' audit-survival SET NULL (§6.8/§7).
+// SECURITY (§6.8): `arguments` holds only the validated tool arguments needed
+// to identify the proposed operation — never provider responses, arbitrary
+// model output, API keys, credential handles, raw file contents, filesystem
+// paths, or provider secrets.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.8:
+//   - CHECK (status IN ('pending','approved','rejected','expired'))
+//   - partial (user_id, expires_at) WHERE status = 'pending' — the pending
+//     approval queue plus expiry sweep
+// State machine (application-enforced, §6.8): pending → approved | rejected |
+// expired. decided_at records the moment a terminal decision is made.
+// ---------------------------------------------------------------------------
+
+model AiToolApproval {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  messageId      String   @map("message_id") @db.Uuid // the persisted turn that produced the tool request
+  toolName       String   @map("tool_name")
+  arguments      Json // validated tool arguments that identify the proposed operation
+  status         String
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz
+  expiresAt      DateTime @map("expires_at") @db.Timestamptz
+  decidedAt      DateTime? @map("decided_at") @db.Timestamptz // set only on a terminal decision
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      AiMessage     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt]) // user's approvals by state
+  @@index([conversationId, createdAt]) // per-conversation approval history
+  @@index([messageId]) // per-turn approvals
+  @@map("ai_tool_approvals")
 }

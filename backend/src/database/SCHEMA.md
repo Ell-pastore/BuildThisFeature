@@ -85,6 +85,7 @@ erDiagram
     users ||--o{ ai_analyses : "requests"
     users ||--o{ ai_instructions : "defines"
     users ||--o{ ai_actions : "approves"
+    users ||--o{ ai_tool_approvals : "owns pending decisions"
 
     folders |o--o{ folders : "parent_folder_id"
     folders ||--o{ files : "contains"
@@ -105,13 +106,15 @@ erDiagram
     ai_analyses ||--o{ ai_file_references : "cited by"
     ai_actions |o--o{ ai_file_references : "cites"
     ai_instructions ||--o{ ai_instruction_versions : "version history"
+    ai_conversations ||--o{ ai_tool_approvals : "spawns"
+    ai_messages ||--o{ ai_tool_approvals : "requests"
     files ||--o{ ai_analyses : "analyzed as"
     file_versions ||--o{ ai_analyses : "exact version"
     files |o--o{ ai_actions : "target"
     folders |o--o{ ai_actions : "target or destination"
 ```
 
-**Cardinality summary:** one user → many devices / folders / files / tags / conversations / analyses / instructions / actions; one folder → many subfolders and files (self-referencing `parent_folder_id`, `NULL` = root); one file → many versions with exactly one current; files ↔ tags and folders ↔ tags many-to-many (separate link tables); devices ↔ files many-to-many via per-device sync state; one conversation → many messages; one instruction → many instruction versions; analyses, references, and actions all pin files, versions, folders, conversations, and messages by FK. The full FK/cascade matrix is in §7.
+**Cardinality summary:** one user → many devices / folders / files / tags / conversations / analyses / instructions / actions; one folder → many subfolders and files (self-referencing `parent_folder_id`, `NULL` = root); one file → many versions with exactly one current; files ↔ tags and folders ↔ tags many-to-many (separate link tables); devices ↔ files many-to-many via per-device sync state; one conversation → many messages; one instruction → many instruction versions; analyses, references, and actions all pin files, versions, folders, conversations, and messages by FK; generic tool-approval requests are owned by a conversation and the message that produced them. The full FK/cascade matrix is in §7.
 
 ## 5. Core tables
 
@@ -468,6 +471,41 @@ An AI-proposed filesystem operation awaiting user decision. Rows are **inert dat
 - **SET NULL on conversation/message/targets is deliberate:** the audit record "this action happened" survives deletions, while `proposed_params` preserves what was proposed.
 - **Execution path (§12):** service validates ownership and re-validates preconditions (target still exists, name free, no folder cycle) → performs the operation through the same code path as user-driven operations → appends `activity_events` → records the outcome on this row.
 
+### 6.8 `ai_tool_approvals` — generic AI tool-approval requests
+
+A request for an explicit user decision before an **AI-requested tool call** may execute. Rows are **inert data**: nothing executes a tool call here; a service resolves the approval and only then may the tool proceed through the normal permission/execution path (Phase 10.29 application-layer contract). This table is the persistence half of the tool-approval contract — the `requiresApproval` metadata that *marks* which tools need confirmation lives on tool definitions at the application layer, not in this schema.
+
+| Field | Type | Req | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `user_id` | uuid | required | FK → `users` **ON DELETE CASCADE** (D3) |
+| `conversation_id` | uuid | required | FK → `ai_conversations` **ON DELETE CASCADE** — transient conversation state |
+| `message_id` | uuid | required | FK → `ai_messages` **ON DELETE CASCADE** — the persisted turn that produced the tool request |
+| `tool_name` | text | required | Registered tool name; validated against the tool registry at the application layer |
+| `arguments` | jsonb | required | Validated tool arguments that identify the proposed operation — only what is needed to present and (on approval) execute the request |
+| `status` | text | required | CHECK: `pending`, `approved`, `rejected`, `expired` |
+| `created_at` / `updated_at` | timestamptz | required | |
+| `expires_at` | timestamptz | required | Approval window; a `pending` approval past this instant no longer represents a valid authorization |
+| `decided_at` | timestamptz | nullable | Set only when a terminal decision (`approved` / `rejected` / `expired`) is recorded |
+
+**Constraints & rules**
+
+- **Indexes:** `(user_id, status, created_at)` — per-user approvals by state; `(conversation_id, created_at)` — conversation approval history; `(message_id)` — per-turn approvals; partial `(user_id, expires_at)` `WHERE status = 'pending'` — the pending-approval queue plus the expiry sweep.
+- **Ownership:** structural `user_id` (D3); every approval belongs to exactly one user, one conversation, and one message.
+- **State machine (application-enforced):** `pending` → `approved` | `rejected` | `expired`. Only services transition states; `decided_at` is set on the first terminal transition. A `pending` approval is never executed once its window has passed.
+- **Expiry semantics:** `expires_at` is required for every row. The transition `pending` → `expired` is a service concern (Phase 10.29) driven by the partial `(user_id, expires_at)` index — no trigger or scheduled job in the DB.
+- **Relationship behavior — CASCADE, deliberately opposite to `ai_actions`:** deleting a conversation or its message deletes its approvals. Approvals are transient conversation state, not durable audit (unlike `ai_actions`' audit-survival SET NULL, §6.7). Approvals reference **no files or folders**, so deleting a conversation can never delete or mutate user files.
+- **Security (§2.2/§13):** `arguments` stores only the validated tool arguments that identify the proposed operation. It must never contain API keys, credential handles, raw file contents, filesystem paths, or provider secrets; provider responses and arbitrary model output never land in this table.
+
+**Distinction from `ai_actions` (§6.7):**
+
+| | `ai_actions` | `ai_tool_approvals` |
+|---|---|---|
+| **What it records** | A proposed **filesystem-organization operation** (rename/move/delete/star/tag/…) that a service executes, mutating the tree and appending `activity_events` | A requested **tool call** gated on user confirmation, recorded before any execution |
+| **Tool scope** | Closed CHECK of organization verbs (`action_type`) | Any registered tool name (`tool_name`), read or write |
+| **Lifecycle** | Survives deletion (SET NULL provenance, audit) | Dies with its conversation (CASCADE) |
+| **After approval** | Service executes the action through the filesystem paths | Application-layer gate releases the tool call into the normal permission/execution path |
+
 ## 7. Relationships and constraints
 
 | Parent | Child / link | Cardinality | On parent delete |
@@ -492,6 +530,8 @@ An AI-proposed filesystem operation awaiting user decision. Rows are **inert dat
 | `ai_conversations` | `ai_messages` | 1 : N | CASCADE |
 | `ai_conversations` / `ai_messages` | `ai_actions` (provenance) | 0..1 : N | SET NULL (audit survives) |
 | `ai_conversations` / `ai_messages` / `ai_analyses` / `ai_actions` | `ai_file_references` | 1 : 0..N | CASCADE |
+| `ai_conversations` | `ai_tool_approvals` | 1 : N | CASCADE (transient conversation state) |
+| `ai_messages` | `ai_tool_approvals` | 1 : N | CASCADE |
 | `files` / `folders` | `ai_actions` (targets) | 0..1 : N | SET NULL |
 | `files` | `ai_analyses` | 1 : N | CASCADE |
 | `file_versions` | `ai_analyses` | 1 : N | CASCADE |
@@ -502,7 +542,7 @@ An AI-proposed filesystem operation awaiting user decision. Rows are **inert dat
 1. **Migration A:** create `files` *without* `current_version_id`; create `file_versions` with its `file_id` FK.
 2. **Migration B:** add `files.current_version_id` with its FK.
 
-**Business rules the DB cannot express (application-enforced):** folder-move cycle prevention via ancestor walk (§5.3); ownership re-validation on every mutation (§13); the `ai_actions` state machine (§6.7); "at least one of `file_id`/`folder_id` per filesystem activity event" (§5.9); the `ai_instructions.instruction` = latest version invariant (§6.5).
+**Business rules the DB cannot express (application-enforced):** folder-move cycle prevention via ancestor walk (§5.3); ownership re-validation on every mutation (§13); the `ai_actions` and `ai_tool_approvals` state machines (§6.7/§6.8); "at least one of `file_id`/`folder_id` per filesystem activity event" (§5.9); the `ai_instructions.instruction` = latest version invariant (§6.5).
 
 ## 8. Indexing strategy
 
@@ -510,7 +550,7 @@ Every index exists for a named query pattern; there are no speculative indexes:
 
 - **Ownership-first composites:** every listing/filter starts from `user_id` (D3) — e.g. `(user_id, parent_folder_id)` for directory listings, `(user_id, updated_at DESC)` for conversations, `(user_id, occurred_at DESC)` for the Recent feed.
 - **Partial unique constraints double as indexes:** sibling-name uniqueness, one-root-per-user, and tag-name uniqueness are all partial indexes that also serve their own lookups.
-- **Partial work-queue indexes:** non-`synced` device states (retry queue), `pending` analyses, `proposed`/`approved` actions — each queue reads a tiny, hot slice of its table.
+- **Partial work-queue indexes:** non-`synced` device states (retry queue), `pending` analyses, `proposed`/`approved` actions, `pending` tool approvals (queue + expiry sweep) — each queue reads a tiny, hot slice of its table.
 - **Content identity:** `(sha256)` on `file_versions` serves duplicate detection and sync comparison.
 - **Cursor-friendly events:** `activity_events.id` is a monotonic `bigint`; the future `sync_events` table (§14) follows the same pattern so devices can pull incrementally with `WHERE user_id = :me AND id > :cursor`.
 - **FK indexes only where queried:** reverse lookups that matter are indexed (file → versions, `(tag_id)` for tag → files, file → references); unqueried FK directions are not.
@@ -563,8 +603,8 @@ Every index exists for a named query pattern; there are no speculative indexes:
 
 **AI must operate through application services — never directly:**
 
-- AI never writes `files`, `folders`, `file_tags`, `folder_tags`, `device_file_state`, or sync state directly; it only creates `ai_analyses` (facts/observations) and `ai_actions` (proposals).
-- `ai_actions` rows are inert: no trigger, job, or DB mechanism executes them; a service must validate and perform each one.
+- AI never writes `files`, `folders`, `file_tags`, `folder_tags`, `device_file_state`, or sync state directly; it only creates `ai_analyses` (facts/observations), `ai_actions` (proposals), and `ai_tool_approvals` (tool-approval requests, §6.8).
+- `ai_actions` rows are inert: no trigger, job, or DB mechanism executes them; a service must validate and perform each one. `ai_tool_approvals` rows are likewise inert — only a service resolves them and releases the tool call.
 - The sync engine is likewise manipulated only through services — AI cannot enqueue, pause, or alter sync transfers directly.
 
 **Large AI-derived artifacts follow the storage boundary (§2.2):** `ai_analyses.extracted_text_key` points into object storage for extracted document text; future embeddings/semantic indexes get the same treatment (reference, not `bytea`/blobs). Only small structured results (`result_data` `jsonb`) live in PostgreSQL. `ai_messages.content` stays in the DB because transcripts are text-sized by nature.
@@ -579,6 +619,7 @@ Every index exists for a named query pattern; there are no speculative indexes:
 - **Secrets stay server-side:** `users.password_hash` is never exposed by any API; credentials/configuration live only in backend environment config, never in frontend or desktop code.
 - **Object references are non-guessable:** storage keys are UUID-based (`u/{user_id}/{version_id}`); download flows will verify ownership before issuing any storage access (Phase 8).
 - **Authorization boundary:** until Phase 7 authentication exists, nothing authenticated can be enforced; until then the API surface stays minimal and unauthenticated endpoints expose no user data (currently only `GET /api/health`).
+- **Generic tool approvals store no secrets (§6.8):** `ai_tool_approvals.arguments` holds only validated tool arguments identifying the proposed operation — never API keys, credential handles, raw file contents, filesystem paths, or provider secrets; provider responses never enter the table.
 - **Sharing/ACL is deferred (§14):** single-owner semantics today; the `user_id`-everywhere design is what makes adding `shares`/ACL a clean later extension rather than a rewrite.
 
 ## 14. Deferred areas — NOT IMPLEMENTED YET
@@ -607,7 +648,7 @@ None of the following exists in code or migrations; each is listed with its sche
 - **Full-text search arrives additively (Phase 11):** a generated `tsvector` column + GIN index on file names (and later extracted text) requires no change to this model — designed now only to prevent premature search tables.
 - **Row-level security** can be enabled later thanks to `user_id` on every row; application-level enforcement remains the primary defense regardless.
 - **`storage_key` UNIQUE** may be relaxed if Phase 8 adopts content-addressed dedupe (identical bytes → shared object, refcounted versions).
-- **`jsonb` columns** (`detail`, `metadata`, `result_data`, `proposed_params`) are intentionally schemaless; their validation belongs in application services, and none of them stores file content.
+- **`jsonb` columns** (`detail`, `metadata`, `result_data`, `proposed_params`, `arguments`) are intentionally schemaless; their validation belongs in application services, and none of them stores file content.
 - **ORM and migration tooling are deliberately unchosen**; nothing in this model assumes a particular ORM's conveniences or limitations.
 
 ## Appendix A — Mapping to the shared `FileItem` model (`src/types/index.ts`)
