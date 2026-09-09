@@ -33,6 +33,7 @@ import type { AiRuntimeStatus } from "../services/aiStatus.js";
 import type { AiInstructionResponse } from "../services/aiInstructions.js";
 import { parseAiInstructionInput } from "../services/aiInstructions.js";
 import type {
+  AiConversationArchiveResult,
   AiConversationDeletionResult,
   AiConversationDetail,
   AiConversationSummary,
@@ -53,6 +54,8 @@ const mocks = vi.hoisted(() => ({
   getAiConversation: vi.fn(),
   deleteAiConversation: vi.fn(),
   renameAiConversation: vi.fn(),
+  archiveAiConversation: vi.fn(),
+  unarchiveAiConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/sessions.js", () => ({
@@ -91,6 +94,8 @@ vi.mock("../services/aiConversations.js", async (importOriginal) => {
     getAiConversation: mocks.getAiConversation,
     deleteAiConversation: mocks.deleteAiConversation,
     renameAiConversation: mocks.renameAiConversation,
+    archiveAiConversation: mocks.archiveAiConversation,
+    unarchiveAiConversation: mocks.unarchiveAiConversation,
   };
 });
 
@@ -260,6 +265,34 @@ beforeEach(() => {
         throw AppError.notFound("Agent conversation");
       }
       return { conversationId, title };
+    },
+  );
+  mocks.archiveAiConversation.mockImplementation(
+    async (userId: string, conversationId: string): Promise<AiConversationArchiveResult> => {
+      // The REAL shared UUID validator runs → malformed ids get 400; owned
+      // ids archive with the stable safe metadata; foreign/missing collapse
+      // to the same 404.
+      validateConversationId(conversationId);
+      if (conversationId !== HISTORY_CONVERSATION_ID || userId !== ACTIVE_USER.id) {
+        throw AppError.notFound("Agent conversation");
+      }
+      return {
+        conversationId,
+        title: CANNED_SUMMARY.title,
+        archivedAt: "2026-01-04T00:00:00.000Z",
+      };
+    },
+  );
+  mocks.unarchiveAiConversation.mockImplementation(
+    async (userId: string, conversationId: string): Promise<AiConversationArchiveResult> => {
+      // The REAL shared UUID validator runs → malformed ids get 400; owned
+      // ids unarchive with archivedAt null; foreign/missing collapse to the
+      // same 404.
+      validateConversationId(conversationId);
+      if (conversationId !== HISTORY_CONVERSATION_ID || userId !== ACTIVE_USER.id) {
+        throw AppError.notFound("Agent conversation");
+      }
+      return { conversationId, title: CANNED_SUMMARY.title, archivedAt: null };
     },
   );
 });
@@ -1248,5 +1281,371 @@ describe("PATCH /api/ai/conversations/:conversationId — no network / no provid
 
     expect(res.status).toBe(200);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. PATCH /.../archive & /unarchive — archive controls (Phase 10.26B)
+// ---------------------------------------------------------------------------
+
+describe("PATCH /api/ai/conversations/:conversationId/archive — authenticated", () => {
+  it("archives an owned conversation and returns the stable safe metadata", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AiConversationArchiveResult;
+    expect(body).toEqual({
+      conversationId: HISTORY_CONVERSATION_ID,
+      title: CANNED_SUMMARY.title,
+      archivedAt: "2026-01-04T00:00:00.000Z",
+    });
+    expect(mocks.archiveAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+    );
+  });
+
+  it("scopes identity to the authenticated SESSION — request identity is ignored", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive?userId=99999999-9999-9999-9999-999999999999&user=attacker`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    // The route consults only the session user; the request cannot self-identify.
+    expect(mocks.archiveAiConversation).toHaveBeenCalledWith(ACTIVE_USER.id, HISTORY_CONVERSATION_ID);
+  });
+
+  it("returns the same generic 404 for a foreign and a nonexistent conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const foreignRes = await app.request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999/archive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+    const missingRes = await app.request(
+      "/api/ai/conversations/00000000-0000-0000-0000-000000000000/archive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    const foreign = await foreignRes.json();
+    const missing = await missingRes.json();
+    expect(foreign).toEqual(missing);
+    expect(foreign).toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+    expect(foreignRes.status).toBe(404);
+    expect(missingRes.status).toBe(404);
+    expect(mocks.archiveAiConversation).toHaveBeenNthCalledWith(
+      1,
+      ACTIVE_USER.id,
+      "99999999-9999-9999-9999-999999999999",
+    );
+  });
+
+  it("rejects a malformed conversationId with the existing 400 envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/not-a-uuid!/archive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "A valid conversationId is required." },
+    });
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId/unarchive — authenticated", () => {
+  it("unarchives an owned conversation and clears archivedAt", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AiConversationArchiveResult;
+    expect(body).toEqual({
+      conversationId: HISTORY_CONVERSATION_ID,
+      title: CANNED_SUMMARY.title,
+      archivedAt: null,
+    });
+    expect(mocks.unarchiveAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+    );
+  });
+
+  it("scopes identity to the authenticated SESSION — request identity is ignored", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive?userId=99999999-9999-9999-9999-999999999999&user=attacker`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.unarchiveAiConversation).toHaveBeenCalledWith(ACTIVE_USER.id, HISTORY_CONVERSATION_ID);
+  });
+
+  it("returns the same generic 404 for a foreign and a nonexistent conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const foreignRes = await app.request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999/unarchive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+    const missingRes = await app.request(
+      "/api/ai/conversations/00000000-0000-0000-0000-000000000000/unarchive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    const foreign = await foreignRes.json();
+    const missing = await missingRes.json();
+    expect(foreign).toEqual(missing);
+    expect(foreign).toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+    expect(foreignRes.status).toBe(404);
+    expect(missingRes.status).toBe(404);
+  });
+
+  it("rejects a malformed conversationId with the existing 400 envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/not-a-uuid!/unarchive",
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "A valid conversationId is required." },
+    });
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId/archive — idempotency", () => {
+  it("archiving an already-archived conversation safely succeeds the same way", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.archiveAiConversation
+      .mockResolvedValueOnce({
+        conversationId: HISTORY_CONVERSATION_ID,
+        title: CANNED_SUMMARY.title,
+        archivedAt: "2026-01-04T00:00:00.000Z",
+      })
+      .mockResolvedValueOnce({
+        conversationId: HISTORY_CONVERSATION_ID,
+        title: CANNED_SUMMARY.title,
+        archivedAt: "2026-01-04T00:00:00.000Z",
+      });
+    const app = makeApp();
+
+    const first = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+    const second = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(await first.json()).toEqual(await second.json());
+    expect(mocks.archiveAiConversation).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId/unarchive — idempotency", () => {
+  it("unarchiving an already-active conversation safely succeeds the same way", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.unarchiveAiConversation
+      .mockResolvedValueOnce({
+        conversationId: HISTORY_CONVERSATION_ID,
+        title: CANNED_SUMMARY.title,
+        archivedAt: null,
+      })
+      .mockResolvedValueOnce({
+        conversationId: HISTORY_CONVERSATION_ID,
+        title: CANNED_SUMMARY.title,
+        archivedAt: null,
+      });
+    const app = makeApp();
+
+    const first = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+    const second = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(await first.json()).toEqual(await second.json());
+    expect(mocks.unarchiveAiConversation).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId/archive — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 without calling the service", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Bearer x y" }, authorizedHeaders("unknown")]) {
+      const res = await app.request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+        { method: "PATCH", headers },
+      );
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.archiveAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing generic 401 for an inactive user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(PENDING_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    expect(mocks.archiveAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing generic 401 for an expired session", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue({
+      id: "session-expired",
+      expiresAt: new Date("2020-01-01T00:00:00Z"),
+      user: ACTIVE_USER,
+    });
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    expect(mocks.archiveAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId/unarchive — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 without calling the service", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Bearer x y" }, authorizedHeaders("unknown")]) {
+      const res = await app.request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+        { method: "PATCH", headers },
+      );
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.unarchiveAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("archive/unarchive — unexpected failures use the generic envelope", () => {
+  it("archive reduces a raw service error to internal/error without leaking internals", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.archiveAiConversation.mockRejectedValueOnce(
+      new Error("SECRET provider key sk-LIVE-leak from /Users/builder/src/db.ts:12"),
+    );
+
+    const res = await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+        { method: "PATCH", headers: authorizedHeaders() },
+      )
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("SECRET");
+    expect(JSON.stringify(res)).not.toContain("sk-LIVE");
+    expect(JSON.stringify(res)).not.toContain("/Users/builder");
+  });
+
+  it("unarchive reduces a raw service error to internal/error without leaking internals", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.unarchiveAiConversation.mockRejectedValueOnce(
+      new Error("SECRET credential handle credential-99 leaked"),
+    );
+
+    const res = await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+        { method: "PATCH", headers: authorizedHeaders() },
+      )
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("credential-99");
+  });
+});
+
+describe("archive/unarchive — no network / no provider invocation", () => {
+  it("performs no provider or network call while archiving and unarchiving", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const app = makeApp();
+
+    const archiveRes = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+    const unarchiveRes = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/unarchive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(archiveRes.status).toBe(200);
+    expect(unarchiveRes.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+  });
+});
+
+describe("archive/unarchive — no filesystem or data mutation beyond the conversation row", () => {
+  it("archive does not modify files or file versions", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}/archive`,
+      { method: "PATCH", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    // The archive service contract: only the conversation's archivedAt is
+    // touched. File/version ids are references only — never write targets.
+    const body = (await res.json()) as AiConversationArchiveResult;
+    expect(JSON.stringify(body)).not.toContain("fileId");
+    expect(JSON.stringify(body)).not.toContain("versionId");
+    expect(JSON.stringify(body)).not.toContain("message");
+    expect(mocks.archiveAiConversation).toHaveBeenCalledTimes(1);
   });
 });

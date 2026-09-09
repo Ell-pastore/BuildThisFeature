@@ -41,10 +41,12 @@ import { AppError } from "../core/errors.js";
 import { getAiRuntimeStatus } from "../services/aiStatus.js";
 import { runAiInstruction } from "../services/aiInstructions.js";
 import {
+  archiveAiConversation,
   deleteAiConversation,
   getAiConversation,
   listAiConversations,
   renameAiConversation,
+  unarchiveAiConversation,
 } from "../services/aiConversations.js";
 
 export const aiRoutes = new Hono<AppVariables>()
@@ -122,4 +124,21 @@ export const aiRoutes = new Hono<AppVariables>()
       await renameAiConversation(user.id, conversationId, body.title as string),
       200,
     );
+  })
+  .patch("/conversations/:conversationId/archive", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session. Archive is
+    // ownership-scoped by the service/repository; a foreign or missing
+    // conversation is indistinguishable and both produce the existing 404.
+    // Only the stable safe metadata is returned — never transcript contents.
+    const user = getCurrentUser(c);
+    const conversationId = c.req.param("conversationId");
+    return c.json(await archiveAiConversation(user.id, conversationId), 200);
+  })
+  .patch("/conversations/:conversationId/unarchive", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session. Unarchive is
+    // ownership-scoped by the service/repository; a foreign or missing
+    // conversation is indistinguishable and both produce the existing 404.
+    const user = getCurrentUser(c);
+    const conversationId = c.req.param("conversationId");
+    return c.json(await unarchiveAiConversation(user.id, conversationId), 200);
   });

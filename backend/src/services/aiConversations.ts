@@ -41,10 +41,12 @@
 import { AppError } from "../core/errors.js";
 import {
   AgentConversationNotFoundError,
+  archiveAgentConversation,
   deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
   renameAgentConversation,
+  unarchiveAgentConversation,
   type StoredConversation,
   type StoredMessageRecord,
 } from "../database/repositories/agentConversations.js";
@@ -411,6 +413,99 @@ export async function renameAiConversation(
     }
     // Unexpected repository/database failures propagate raw so the HTTP
     // layer's generic `internal/error` envelope hides the details.
+    throw error;
+  }
+}
+// ---------------------------------------------------------------------------
+// Archive / unarchive (Phase 10.26B)
+// ---------------------------------------------------------------------------
+
+/** Stable success response for `PATCH /api/ai/conversations/:conversationId/archive`. */
+export interface AiConversationArchiveResult {
+  conversationId: string;
+  title: string | null;
+  archivedAt: string | null;
+}
+
+/**
+ * Archive ONE conversation owned by `userId` (Phase 10.26B): set its
+ * `archivedAt` to the current timestamp. Idempotent — archiving an already
+ * archived conversation succeeds silently.
+ *
+ * Ownership is enforced in the repository (a single ownership-scoped update);
+ * a foreign OR missing conversation is indistinguishable and both collapse to
+ * the existing 404 `common/not-found` envelope. Only the `archivedAt` (and
+ * maintained `updatedAt`) changes — messages, tool calls/results, file/version
+ * references, title, and ownership are never modified.
+ *
+ * Identity is exclusively the authenticated session user; the route never
+ * accepts a body-supplied identity.
+ *
+ * Returns the stable safe metadata of the archived conversation (id, title,
+ * `archivedAt`). No tool results, message contents, or provider/credential info.
+ *
+ * @throws `AppError.badRequest` (400 `common/bad-request`) on a malformed
+ *         conversationId.
+ * @throws `AppError.notFound` (404 `common/not-found`) when the conversation
+ *         does not exist for `userId`.
+ * @throws the generic `internal/error` worst-case envelope on unexpected
+ *         repository/database failures (propagated raw).
+ */
+export async function archiveAiConversation(
+  userId: string,
+  conversationIdParam: string,
+): Promise<AiConversationArchiveResult> {
+  const conversationId = validateConversationId(conversationIdParam);
+  try {
+    const archived = await archiveAgentConversation(userId, conversationId, new Date());
+    return {
+      conversationId: archived.id,
+      title: archived.title,
+      archivedAt: archived.archivedAt === null ? null : archived.archivedAt.toISOString(),
+    };
+  } catch (error) {
+    if (error instanceof AgentConversationNotFoundError) {
+      throw AppError.notFound("Agent conversation was not found.");
+    }
+    throw error;
+  }
+}
+
+/**
+ * Unarchive ONE conversation owned by `userId` (Phase 10.26B): clear its
+ * `archivedAt` back to `NULL`. Idempotent — unarchiving an already-active
+ * conversation succeeds silently.
+ *
+ * Ownership is enforced in the repository; a foreign OR missing conversation
+ * is indistinguishable and both collapse to the existing 404
+ * `common/not-found` envelope. Only the `archivedAt` (and maintained
+ * `updatedAt`) changes — no other state is modified.
+ *
+ * Identity is exclusively the authenticated session user.
+ *
+ * @throws `AppError.badRequest` (400 `common/bad-request`) on a malformed
+ *         conversationId.
+ * @throws `AppError.notFound` (404 `common/not-found`) when the conversation
+ *         does not exist for `userId`.
+ * @throws the generic `internal/error` worst-case envelope on unexpected
+ *         repository/database failures (propagated raw).
+ */
+export async function unarchiveAiConversation(
+  userId: string,
+  conversationIdParam: string,
+): Promise<AiConversationArchiveResult> {
+  const conversationId = validateConversationId(conversationIdParam);
+  try {
+    const unarchived = await unarchiveAgentConversation(userId, conversationId, new Date());
+    return {
+      conversationId: unarchived.id,
+      title: unarchived.title,
+      archivedAt: unarchived.archivedAt === null ? null : unarchived.archivedAt.toISOString(),
+    };
+  } catch (error) {
+    if (error instanceof AgentConversationNotFoundError) {
+      throw AppError.notFound("Agent conversation was not found.");
+    }
     throw error;
   }
 }

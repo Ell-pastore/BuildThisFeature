@@ -71,6 +71,7 @@ export interface StoredConversation {
   maxToolRounds: number;
   createdAt: Date;
   updatedAt: Date;
+  archivedAt: Date | null;
 }
 
 export interface CreateAgentConversationInput {
@@ -145,6 +146,7 @@ export async function createAgentConversation(
     maxToolRounds: created.maxToolRounds,
     createdAt: created.createdAt,
     updatedAt: created.updatedAt,
+    archivedAt: created.archivedAt,
   };
 }
 
@@ -430,6 +432,7 @@ function toStoredConversation(row: {
   maxToolRounds: number;
   createdAt: Date;
   updatedAt: Date;
+  archivedAt: Date | null;
 }): StoredConversation {
   return {
     id: row.id,
@@ -438,6 +441,7 @@ function toStoredConversation(row: {
     maxToolRounds: row.maxToolRounds,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    archivedAt: row.archivedAt,
   };
 }
 
@@ -481,7 +485,9 @@ export async function listAgentConversations(
 ): Promise<StoredConversation[]> {
   const db = getDatabase();
   const rows = await db.aiConversation.findMany({
-    where: { userId },
+    // Phase 10.26B: the NORMAL conversation list excludes archived
+    // conversations by default (archived_at IS NULL).
+    where: { userId, archivedAt: null },
     orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "asc" }],
     select: {
       id: true,
@@ -490,6 +496,7 @@ export async function listAgentConversations(
       maxToolRounds: true,
       createdAt: true,
       updatedAt: true,
+      archivedAt: true,
     },
   });
   return rows.map(toStoredConversation);
@@ -517,6 +524,7 @@ export async function getAgentConversation(
       maxToolRounds: true,
       createdAt: true,
       updatedAt: true,
+      archivedAt: true,
     },
   });
   if (conversation === null) return null;
@@ -702,4 +710,91 @@ export async function renameAgentConversation(
       updatedAt: conversation.updatedAt.toISOString(),
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Archive / unarchive conversation (Phase 10.26B)
+// ---------------------------------------------------------------------------
+
+/** Stable success response for an archive/unarchive title-free write. */
+export interface AiConversationArchiveResult {
+  id: string;
+  title: string | null;
+  archivedAt: Date | null;
+}
+
+/**
+ * Archive ONE conversation owned by `userId` (Phase 10.26B): set its
+ * `archived_at` to the current timestamp. Idempotent — archiving an already
+ * archived conversation is a safe no-op success.
+ *
+ * Ownership is enforced by the update predicate (`where: { id, userId }`): a
+ * conversation whose owner differs, OR that does not exist, updates nothing and
+ * throws `AgentConversationNotFoundError` — both are deliberately
+ * indistinguishable. Only the `archived_at` column (and the maintained
+ * `updated_at`) is touched; messages, tool data, file/version references,
+ * title, and ownership are never modified.
+ *
+ * @throws `AgentConversationNotFoundError` when the conversation does not exist
+ *         for `userId` (indistinguishable from foreign ownership).
+ */
+export async function archiveAgentConversation(
+  userId: string,
+  conversationId: string,
+  now: Date,
+): Promise<AiConversationArchiveResult> {
+  const db = getDatabase();
+  const updated = await db.aiConversation.updateMany({
+    where: { id: conversationId, userId },
+    data: { archivedAt: now, updatedAt: now },
+  });
+  if (updated.count === 0) {
+    throw new AgentConversationNotFoundError();
+  }
+  const conversation = await db.aiConversation.findFirstOrThrow({
+    where: { id: conversationId, userId },
+    select: { id: true, title: true, archivedAt: true },
+  });
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    archivedAt: conversation.archivedAt,
+  };
+}
+
+/**
+ * Unarchive ONE conversation owned by `userId` (Phase 10.26B): clear its
+ * `archived_at` back to `NULL`. Idempotent — unarchiving an already-active
+ * conversation is a safe no-op success.
+ *
+ * Ownership is enforced by the update predicate (`where: { id, userId }`); a
+ * foreign OR missing conversation is indistinguishable and both throw
+ * `AgentConversationNotFoundError`. Only the `archived_at` column (and the
+ * maintained `updated_at`) is touched; no other state changes.
+ *
+ * @throws `AgentConversationNotFoundError` when the conversation does not exist
+ *         for `userId` (indistinguishable from foreign ownership).
+ */
+export async function unarchiveAgentConversation(
+  userId: string,
+  conversationId: string,
+  now: Date,
+): Promise<AiConversationArchiveResult> {
+  const db = getDatabase();
+  const updated = await db.aiConversation.updateMany({
+    where: { id: conversationId, userId },
+    data: { archivedAt: null, updatedAt: now },
+  });
+  if (updated.count === 0) {
+    throw new AgentConversationNotFoundError();
+  }
+  const conversation = await db.aiConversation.findFirstOrThrow({
+    where: { id: conversationId, userId },
+    select: { id: true, title: true, archivedAt: true },
+  });
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    archivedAt: conversation.archivedAt,
+  };
 }

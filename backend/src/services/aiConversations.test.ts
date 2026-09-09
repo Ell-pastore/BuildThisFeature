@@ -20,11 +20,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppError } from "../core/errors.js";
 import {
+  archiveAiConversation,
   deleteAiConversation,
   getAiConversation,
   listAiConversations,
   renameAiConversation,
   projectStructuredValue,
+  unarchiveAiConversation,
+  type AiConversationArchiveResult,
   type AiConversationDetail,
   type AiConversationDeletionResult,
   type AiConversationRenameResult,
@@ -37,6 +40,8 @@ const mocks = vi.hoisted(() => ({
   getAgentConversation: vi.fn(),
   deleteAgentConversation: vi.fn(),
   renameAgentConversation: vi.fn(),
+  archiveAgentConversation: vi.fn(),
+  unarchiveAgentConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", async (importOriginal) => {
@@ -48,6 +53,8 @@ vi.mock("../database/repositories/agentConversations.js", async (importOriginal)
     getAgentConversation: mocks.getAgentConversation,
     deleteAgentConversation: mocks.deleteAgentConversation,
     renameAgentConversation: mocks.renameAgentConversation,
+    archiveAgentConversation: mocks.archiveAgentConversation,
+    unarchiveAgentConversation: mocks.unarchiveAgentConversation,
   };
 });
 
@@ -626,6 +633,180 @@ describe("renameAiConversation", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
     await renameAiConversation(ALICE, CONVERSATION_ID, "Safe");
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.26B archive / unarchive
+// ---------------------------------------------------------------------------
+
+describe("archiveAiConversation", () => {
+  it("archives an owned conversation and returns the stable safe metadata", async () => {
+    const archivedAt = new Date("2026-01-04T00:00:00Z");
+    mocks.archiveAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt,
+    });
+
+    const result: AiConversationArchiveResult = await archiveAiConversation(
+      ALICE,
+      CONVERSATION_ID,
+    );
+
+    expect(mocks.archiveAgentConversation).toHaveBeenCalledWith(
+      ALICE,
+      CONVERSATION_ID,
+      expect.any(Date),
+    );
+    expect(result).toEqual({
+      conversationId: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: "2026-01-04T00:00:00.000Z",
+    });
+    // The stable result is an explicit projection — no userId, no contents.
+    expect(Object.keys(result).sort()).toEqual(["archivedAt", "conversationId", "title"]);
+  });
+
+  it("maps a foreign AND a missing conversation to the same 404 not-found", async () => {
+    mocks.archiveAgentConversation.mockImplementation(() => {
+      throw new AgentConversationNotFoundError();
+    });
+
+    const foreign = await archiveAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+    const missing = await archiveAiConversation(
+      ALICE,
+      "ddd11111-1111-1111-1111-111111111111",
+    ).catch((e) => e);
+
+    expect(foreign).toBeInstanceOf(AppError);
+    expect(foreign).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(missing).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(foreign).toEqual(missing);
+  });
+
+  it("rejects a malformed conversationId with 400 before any repository call", async () => {
+    for (const bad of ["", "not-a-uuid", "../etc/passwd", "GGGG"]) {
+      await expect(archiveAiConversation(ALICE, bad)).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.archiveAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("propagates unexpected repository failures raw for the generic internal-error envelope", async () => {
+    const raw = new Error("SECRET SQL: SELECT * FROM internal.creds at db.ts:9");
+    mocks.archiveAgentConversation.mockRejectedValueOnce(raw);
+
+    const outcome = await archiveAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+
+    expect(outcome).toBe(raw);
+    expect(outcome).not.toBeInstanceOf(AppError);
+  });
+
+  it("confirms no provider/network/filesystem operations occur", async () => {
+    mocks.archiveAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: new Date(),
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await archiveAiConversation(ALICE, CONVERSATION_ID);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+  });
+
+  it("returns only safe metadata — no userId, message, or provider internals", async () => {
+    mocks.archiveAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: new Date("2026-01-04T00:00:00Z"),
+    });
+
+    const result = await archiveAiConversation(ALICE, CONVERSATION_ID);
+    const serialized = JSON.stringify(result);
+
+    expect(serialized).not.toContain(ALICE);
+    expect(serialized).not.toContain("message");
+    expect(serialized).not.toContain("sk-");
+    expect(serialized).not.toContain("credential");
+  });
+});
+
+describe("unarchiveAiConversation", () => {
+  it("unarchives an owned conversation and returns archivedAt null", async () => {
+    mocks.unarchiveAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: null,
+    });
+
+    const result = await unarchiveAiConversation(ALICE, CONVERSATION_ID);
+
+    expect(mocks.unarchiveAgentConversation).toHaveBeenCalledWith(
+      ALICE,
+      CONVERSATION_ID,
+      expect.any(Date),
+    );
+    expect(result).toEqual({
+      conversationId: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: null,
+    });
+  });
+
+  it("maps a foreign AND a missing conversation to the same 404 not-found", async () => {
+    mocks.unarchiveAgentConversation.mockImplementation(() => {
+      throw new AgentConversationNotFoundError();
+    });
+
+    const foreign = await unarchiveAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+    const missing = await unarchiveAiConversation(
+      ALICE,
+      "ddd11111-1111-1111-1111-111111111111",
+    ).catch((e) => e);
+
+    expect(foreign).toBeInstanceOf(AppError);
+    expect(foreign).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(missing).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(foreign).toEqual(missing);
+  });
+
+  it("rejects a malformed conversationId with 400 before any repository call", async () => {
+    for (const bad of ["", "not-a-uuid", "../etc/passwd", "GGGG"]) {
+      await expect(unarchiveAiConversation(ALICE, bad)).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.unarchiveAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("propagates unexpected repository failures raw for the generic internal-error envelope", async () => {
+    const raw = new Error("SECRET SQL: SELECT * FROM internal.creds at db.ts:9");
+    mocks.unarchiveAgentConversation.mockRejectedValueOnce(raw);
+
+    const outcome = await unarchiveAiConversation(ALICE, CONVERSATION_ID).catch((e) => e);
+
+    expect(outcome).toBe(raw);
+    expect(outcome).not.toBeInstanceOf(AppError);
+  });
+
+  it("confirms no provider/network/filesystem operations occur", async () => {
+    mocks.unarchiveAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Invoice review",
+      archivedAt: null,
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await unarchiveAiConversation(ALICE, CONVERSATION_ID);
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());

@@ -23,6 +23,7 @@ import {
   AgentConversationNotFoundError,
   appendAgentFinal,
   appendAgentTurn,
+  archiveAgentConversation,
   createAgentConversation,
   deleteAgentConversation,
   getAgentConversation,
@@ -30,6 +31,7 @@ import {
   loadAgentConversationState,
   persistAgentTurn,
   reconstructConversationState,
+  unarchiveAgentConversation,
 } from "./agentConversations.js";
 import { ToolError } from "../../tools/errors.js";
 import type { AgentToolResult } from "../../services/agent.js";
@@ -84,6 +86,7 @@ function createFakeDb() {
           id: `conv-${convSeq}`,
           createdAt: new Date(1_700_000_000_000 + convSeq),
           updatedAt: new Date(1_700_000_000_000 + convSeq),
+          archivedAt: null,
           ...data,
         };
         conversations.push(row);
@@ -97,11 +100,32 @@ function createFakeDb() {
         );
         return row ?? null;
       }),
+      findFirstOrThrow: vi.fn(async ({ where = {} }: { where?: AnyRecord }) => {
+        const row = conversations.find(
+          (c) =>
+            (where.id === undefined || c.id === where.id) &&
+            (where.userId === undefined || c.userId === where.userId),
+        );
+        if (row === undefined) throw new Error(`Conversation not found (fake).`);
+        return row;
+      }),
       findMany: vi.fn(async ({ where = {}, orderBy }: { where?: AnyRecord; orderBy?: AnyRecord[] }) => {
         const rows = conversations.filter(
-          (c) => where.userId === undefined || c.userId === where.userId,
+          (c) =>
+            (where.userId === undefined || c.userId === where.userId) &&
+            (where.archivedAt === undefined || c.archivedAt === where.archivedAt),
         );
         return sortBy(rows, orderBy);
+      }),
+      updateMany: vi.fn(async ({ where = {}, data }: { where?: AnyRecord; data: AnyRecord }) => {
+        const matches = conversations.filter(
+          (c) =>
+            (where.id === undefined || c.id === where.id) &&
+            (where.userId === undefined || c.userId === where.userId),
+        );
+        if (matches.length === 0) return { count: 0 };
+        for (const row of matches) Object.assign(row, data);
+        return { count: matches.length };
       }),
       deleteMany: vi.fn(async ({ where = {} }: { where?: AnyRecord }) => {
         const matches = conversations.filter(
@@ -893,6 +917,166 @@ describe("agentConversations repository", () => {
       // No message-level cleanup delegate exists — cascade reuse, never
       // manual duplicate logic.
       expect("deleteMany" in db.delegates.aiMessage).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10.26B archive / unarchive
+  // ---------------------------------------------------------------------------
+
+  describe("archiveAgentConversation / unarchiveAgentConversation", () => {
+    async function seedOwned(title = "Archiv me"): Promise<string> {
+      const { id } = await persistAgentTurn({
+        userId: ALICE,
+        instruction: "List my files.",
+        maxToolRounds: 2,
+        title,
+        rounds: [
+          {
+            text: "Looking…",
+            toolCalls: [{ id: "c1", toolName: "read_file_metadata", input: {} }],
+            toolResults: [
+              {
+                ok: true,
+                callId: "c1",
+                data: {
+                  fileId: "f0000000-0000-0000-0000-0000000000f0",
+                  versionId: "v0000000-0000-0000-0000-0000000000v0",
+                  name: "bill.pdf",
+                },
+              },
+            ],
+          },
+        ],
+        finalText: "Done.",
+      });
+      return id;
+    }
+
+    it("archives an owned conversation, stamping a new archived_at", async () => {
+      const id = await seedOwned();
+      const now = new Date(1_705_000_001_000);
+
+      const result = await archiveAgentConversation(ALICE, id, now);
+
+      expect(result).toMatchObject({ id, title: "Archiv me", archivedAt: now });
+      const row = db.conversations.find((c) => c.id === id);
+      expect(row?.archivedAt).toEqual(now);
+      // A single ownership-scoped update — no reads-before-write race.
+      expect(db.delegates.aiConversation.updateMany).toHaveBeenCalledTimes(1);
+      expect(db.delegates.aiConversation.updateMany).toHaveBeenCalledWith({
+        where: { id, userId: ALICE },
+        data: { archivedAt: now, updatedAt: expect.any(Date) },
+      });
+    });
+
+    it("is idempotent: archiving an already archived conversation succeeds", async () => {
+      const id = await seedOwned();
+      const first = new Date(1_705_000_001_000);
+      await archiveAgentConversation(ALICE, id, first);
+
+      const second = new Date(1_705_000_002_000);
+      await expect(archiveAgentConversation(ALICE, id, second)).resolves.toMatchObject({
+        id,
+        archivedAt: second,
+      });
+    });
+
+    it("hides archived conversations from the list, leaving the row intact", async () => {
+      const archivedId = await seedOwned("Old invoices");
+      const activeId = await seedOwned("Active notes");
+      await archiveAgentConversation(ALICE, archivedId, new Date(1_705_000_001_000));
+
+      const rows = await listAgentConversations(ALICE);
+
+      expect(rows.map((r) => r.id)).toEqual([activeId]);
+      expect(db.conversations.find((c) => c.id === archivedId)).toBeDefined();
+      // Transcript and refs are untouched by archiving.
+      expect(db.messages.filter((m) => m.conversationId === archivedId)).toHaveLength(3);
+    });
+
+    it("unarchives a conversation, clearing archived_at back to null", async () => {
+      const id = await seedOwned();
+      await archiveAgentConversation(ALICE, id, new Date(1_705_000_001_000));
+
+      const result = await unarchiveAgentConversation(ALICE, id, new Date(1_705_000_001_500));
+
+      expect(result).toMatchObject({ id, title: "Archiv me", archivedAt: null });
+      expect(db.conversations.find((c) => c.id === id)?.archivedAt).toBeNull();
+    });
+
+    it("is idempotent: unarchiving an active conversation succeeds with no-op semantics", async () => {
+      const id = await seedOwned();
+
+      await expect(
+        unarchiveAgentConversation(ALICE, id, new Date(1_705_000_001_000)),
+      ).resolves.toMatchObject({
+        id,
+        archivedAt: null,
+      });
+    });
+
+    it("restores an unarchived conversation to the normal list", async () => {
+      const archivedId = await seedOwned("Old invoices");
+      await archiveAgentConversation(ALICE, archivedId, new Date(1_705_000_001_000));
+      expect((await listAgentConversations(ALICE)).map((r) => r.id)).not.toContain(archivedId);
+
+      await unarchiveAgentConversation(ALICE, archivedId, new Date(1_705_000_002_000));
+
+      expect((await listAgentConversations(ALICE)).map((r) => r.id)).toContain(archivedId);
+    });
+
+    it("still returns an archived conversation by id to its owner", async () => {
+      const id = await seedOwned();
+      await archiveAgentConversation(ALICE, id, new Date(1_705_000_001_000));
+
+      const detail = await getAgentConversation(ALICE, id);
+
+      expect(detail).not.toBeNull();
+      expect(detail?.conversation.archivedAt).toEqual(new Date(1_705_000_001_000));
+      expect(detail?.messages).toHaveLength(3);
+    });
+
+    it("enforces ownership: a foreign or missing owner is indistinguishable (404 contract)", async () => {
+      const id = await seedOwned();
+
+      const foreign = archiveAgentConversation(BOB, id, new Date(1_705_000_001_000)).catch((e) => e);
+      const missing = archiveAgentConversation(
+        ALICE,
+        "00000000-0000-0000-0000-000000000000",
+        new Date(1_705_000_001_000),
+      ).catch((e) => e);
+
+      await expect(foreign).resolves.toBeInstanceOf(AgentConversationNotFoundError);
+      await expect(missing).resolves.toBeInstanceOf(AgentConversationNotFoundError);
+      expect(db.conversations.find((c) => c.id === id)?.archivedAt).toBeNull();
+      // Nothing was written for the missing id.
+      expect(db.delegates.aiConversation.updateMany).toHaveBeenCalledTimes(2);
+      expect(db.delegates.aiConversation.updateMany).toHaveBeenNthCalledWith(2, {
+        where: { id: "00000000-0000-0000-0000-000000000000", userId: ALICE },
+        data: { archivedAt: expect.any(Date), updatedAt: expect.any(Date) },
+      });
+    });
+
+    it("never touches transcripts, tool data, or file references", async () => {
+      const id = await seedOwned();
+      const beforeMessages = db.messages.map((m) => ({ ...m }));
+      const round = db.messages.find((m) => m.conversationId === id && m.toolResults !== null);
+      const beforeToolResults = round?.toolResults;
+      db.delegates.$transaction.mockClear();
+
+      await archiveAgentConversation(ALICE, id, new Date(1_705_000_001_000));
+      await unarchiveAgentConversation(ALICE, id, new Date(1_705_000_002_000));
+
+      expect(db.messages).toEqual(beforeMessages);
+      expect(round?.toolResults).toEqual(beforeToolResults);
+      // Only conversation-level writes happened — no message or file delegates.
+      expect(db.delegates.$transaction).not.toHaveBeenCalled();
+      expect(Object.keys(db.delegates)).toEqual([
+        "aiConversation",
+        "aiMessage",
+        "$transaction",
+      ]);
     });
   });
 });
