@@ -37,12 +37,28 @@ import { createToolExecutionContext, type ToolExecutionContext } from "./policy.
  * actor. The policy layer (Phase 9.5) validates the identity at
  * dispatch time — inactive users are denied there.
  *
+ * When a persistent agent turn has already committed its conversation
+ * and the round's assistant/tool-call message (Phase 10.28C-prep), the
+ * caller threads those REAL persisted ids via `turn` so they are bound
+ * to the context at the invocation boundary. Absent `turn` → the
+ * context carries no conversation/message ids (direct, non-persistent
+ * invocations are unchanged).
+ *
  * @param c — a Hono request context that has been through `requireAuth`.
+ * @param turn — optional authenticated, persisted turn provenance
+ *               (`conversationId` / `messageId`), never taken from the
+ *               session or the untrusted input.
  * @returns a `ToolExecutionContext` with the authenticated session identity.
  */
 export function createSessionExecutionContext(
   c: { get: (key: string) => unknown },
+  turn?: { conversationId?: string; messageId?: string },
 ): ToolExecutionContext {
   const user: AuthUser = getCurrentUser(c);
-  return createToolExecutionContext(user);
+  return createToolExecutionContext(user, "ai-agent", {
+    ...(turn?.conversationId !== undefined
+      ? { conversationId: turn.conversationId }
+      : {}),
+    ...(turn?.messageId !== undefined ? { messageId: turn.messageId } : {}),
+  });
 }

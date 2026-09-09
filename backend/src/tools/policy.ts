@@ -178,13 +178,31 @@ export function authenticatedAiAgent(
 export function createToolExecutionContext(
   user: AuthenticatedUserLike,
   actorKind: "ai-agent" | "user" = "ai-agent",
-  options: { deviceId?: string; sessionId?: string } = {},
+  options: {
+    deviceId?: string;
+    sessionId?: string;
+    /**
+     * Authenticated, persisted conversation id. Bound only when a
+     * persistent agent turn has already committed its conversation
+     * (Phase 10.28C-prep) — never taken from provider output or input.
+     */
+    conversationId?: string;
+    /**
+     * Persisted assistant/tool-call message id that owns the round being
+     * executed. Bound only after the message row is committed.
+     */
+    messageId?: string;
+  } = {},
 ): ToolExecutionContext {
   return {
     actor:
       actorKind === "user"
         ? { kind: "user" }
         : authenticatedAiAgent(user, options),
+    ...(options.conversationId !== undefined
+      ? { conversationId: options.conversationId }
+      : {}),
+    ...(options.messageId !== undefined ? { messageId: options.messageId } : {}),
   };
 }
 
@@ -205,6 +223,21 @@ export interface ToolExecutionContext {
    * caller).
    */
   actor: ToolActor;
+  /**
+   * Persisted conversation id the call belongs to (Phase 10.28C-prep).
+   * Set only for tool calls executed inside a persistent agent turn
+   * whose conversation has been committed BEFORE the round ran; absent
+   * for direct / non-persistent invocations. Reserved for the future
+   * approval stage, which requires a real (non-nullable) conversation
+   * id at the invocation boundary.
+   */
+  conversationId?: string;
+  /**
+   * Persisted assistant/tool-call message id that owns this round's
+   * execution (Phase 10.28C-prep). Committed before the round's intents
+   * execute; absent for direct / non-persistent invocations.
+   */
+  messageId?: string;
 }
 
 /**

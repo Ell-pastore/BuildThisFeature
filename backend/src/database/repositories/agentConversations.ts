@@ -361,6 +361,284 @@ export async function persistAgentTurn(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Eager turn persistence (Phase 10.28C-prep)
+// ---------------------------------------------------------------------------
+//
+// The approval contract (Phase 10.28A/B) requires a REAL persisted
+// conversationId + messageId at the tool-invocation boundary, but tool
+// execution happens BEFORE the turn ends. A persistent turn therefore
+// persists eagerly, in three ordered steps:
+//
+//   1. beginAgentTurn            — conversation (new or owned) + instruction
+//                                  message + FIRST round assistant message
+//                                  (committed, real ids returned);
+//   2. appendAgentTurnRoundMessage — each LATER round's assistant message,
+//                                  committed before that round's intents run;
+//   3. completeAgentTurn         — ONE transaction: attach every round's
+//                                  `tool_results` to its message, append the
+//                                  is_final reply, bump updated_at.
+//
+// If the turn fails after any eager commit, the caller compensates with
+// cancelAgentTurn: a newly created conversation is deleted (cascade), or a
+// resumed conversation has exactly the turn's own messages removed — so the
+// failure restores the conversation to its prior state (no partial turn).
+
+export interface BeginAgentTurnInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** Resume this conversation (ownership enforced). Omit to create one. */
+  conversationId?: string;
+  /** The user's instruction, persisted as the first message. */
+  instruction: string;
+  /** Strict loop bound. */
+  maxToolRounds: number;
+  /** Optional display title for newly created conversations. */
+  title?: string;
+  /** The first round's free-form provider text (when present). */
+  text?: string;
+  /** The first round's validated tool-call intents. */
+  toolCalls: readonly AgentToolCall[];
+}
+
+export interface BeginAgentTurnResult {
+  /** The conversation id (existing or newly created). */
+  conversationId: string;
+  /** True when this turn created the conversation. */
+  created: boolean;
+  /** Persisted user-instruction message id (for failure cleanup). */
+  instructionMessageId: string;
+  /** Persisted FIRST-round assistant/tool-call message id. */
+  messageId: string;
+}
+
+/**
+ * Begin a persistent agent turn: create the conversation (when `conversationId`
+ * is absent) or verify ownership (when resuming), persist the user's
+ * instruction message, and persist the FIRST tool-call round's assistant
+ * message — all in ONE transaction. The returned `messageId` is a real
+ * committed row id ready for tool execution. Ownership is enforced inside
+ * the same transaction.
+ *
+ * @throws `AgentConversationNotFoundError` when resuming a conversation that
+ *         does not exist for `userId` (indistinguishable from foreign).
+ * @throws `TypeError` when `instruction`, `toolCalls`, or `maxToolRounds` are
+ *         invalid (validated before any write, via the Phase 10.6 guards).
+ */
+export async function beginAgentTurn(
+  input: BeginAgentTurnInput,
+): Promise<BeginAgentTurnResult> {
+  const state = createConversationState({
+    instruction: input.instruction,
+    maxToolRounds: input.maxToolRounds,
+  });
+  const text = assertStoredText(input.text, "provider text");
+  const toolCalls = validateToolCalls(input.toolCalls);
+
+  const db = getDatabase();
+  return db.$transaction(async (tx) => {
+    let id: string;
+    let created: boolean;
+    if (input.conversationId === undefined) {
+      const conversation = await tx.aiConversation.create({
+        data: {
+          userId: input.userId,
+          maxToolRounds: state.maxToolRounds,
+          title: input.title ?? null,
+        },
+      });
+      id = conversation.id;
+      created = true;
+    } else {
+      const owned = await tx.aiConversation.findFirst({
+        where: { id: input.conversationId, userId: input.userId },
+        select: { id: true },
+      });
+      if (owned === null) throw new AgentConversationNotFoundError();
+      id = owned.id;
+      created = false;
+    }
+    const instruction = await tx.aiMessage.create({
+      data: {
+        conversationId: id,
+        role: "user",
+        content: state.instruction,
+      },
+    });
+    const round = await tx.aiMessage.create({
+      data: {
+        conversationId: id,
+        role: "assistant",
+        content: text ?? "",
+        toolCalls: asJson(toolCalls),
+      },
+    });
+    return {
+      conversationId: id,
+      created,
+      instructionMessageId: instruction.id,
+      messageId: round.id,
+    };
+  });
+}
+
+export interface AppendAgentRoundInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** Owned conversation to append to. */
+  conversationId: string;
+  /** The round's free-form provider text (when present). */
+  text?: string;
+  /** The round's validated tool-call intents. */
+  toolCalls: readonly AgentToolCall[];
+}
+
+export interface AppendAgentRoundResult {
+  /** Persisted assistant/tool-call message id for this round. */
+  messageId: string;
+}
+
+/**
+ * Persist ONE later tool-call round's assistant message (Phase 10.28C-prep)
+ * in its OWN transaction, BEFORE that round's intents execute. Ownership is
+ * verified inside the same transaction that writes.
+ *
+ * @throws `AgentConversationNotFoundError` when the conversation does not
+ *         exist for `userId` (indistinguishable from foreign ownership).
+ * @throws `TypeError` on invalid tool calls (validated before any write).
+ */
+export async function appendAgentTurnRoundMessage(
+  input: AppendAgentRoundInput,
+): Promise<AppendAgentRoundResult> {
+  const text = assertStoredText(input.text, "provider text");
+  const toolCalls = validateToolCalls(input.toolCalls);
+
+  const db = getDatabase();
+  return db.$transaction(async (tx) => {
+    const owned = await tx.aiConversation.findFirst({
+      where: { id: input.conversationId, userId: input.userId },
+      select: { id: true },
+    });
+    if (owned === null) throw new AgentConversationNotFoundError();
+    const round = await tx.aiMessage.create({
+      data: {
+        conversationId: input.conversationId,
+        role: "assistant",
+        content: text ?? "",
+        toolCalls: asJson(toolCalls),
+      },
+    });
+    return { messageId: round.id };
+  });
+}
+
+export interface CompleteAgentTurnRound {
+  /** Persisted assistant message id for the round (from begin/append). */
+  messageId: string;
+  /** Structured results of executing that round's intents. */
+  toolResults: readonly AgentToolResult[];
+}
+
+export interface CompleteAgentTurnInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** Owned conversation the eager rows were created in. */
+  conversationId: string;
+  /** Executed rounds, in order, each mapped to its persisted message. */
+  rounds: readonly CompleteAgentTurnRound[];
+  /** The terminal agent reply (becomes the is_final message). */
+  finalText: string;
+}
+
+/**
+ * Complete an eagerly-begun persistent turn in ONE transaction: attach each
+ * round's `tool_results` to its persisted assistant message, append the
+ * `is_final` reply, and bump `updated_at`. Ownership is verified inside the
+ * transaction; a round message that vanished (e.g. concurrent delete) throws
+ * `AgentConversationNotFoundError` and rolls everything back.
+ *
+ * @throws `AgentConversationNotFoundError` on missing/foreign conversation or
+ *         an unknown round message id.
+ * @throws `TypeError` on invalid tool results / missing final text.
+ */
+export async function completeAgentTurn(
+  input: CompleteAgentTurnInput,
+): Promise<void> {
+  const finalText = assertStoredText(input.finalText, "final text");
+  if (finalText === undefined) {
+    throw new TypeError("final text must be a non-empty string.");
+  }
+  const rounds = input.rounds.map((round) => ({
+    messageId: round.messageId,
+    toolResults: validateToolResults(round.toolResults),
+  }));
+
+  const db = getDatabase();
+  await db.$transaction(async (tx) => {
+    const owned = await tx.aiConversation.findFirst({
+      where: { id: input.conversationId, userId: input.userId },
+      select: { id: true },
+    });
+    if (owned === null) throw new AgentConversationNotFoundError();
+    for (const round of rounds) {
+      const updated = await tx.aiMessage.updateMany({
+        where: { id: round.messageId, conversationId: input.conversationId },
+        data: { toolResults: asJson(round.toolResults) },
+      });
+      if (updated.count === 0) throw new AgentConversationNotFoundError();
+    }
+    await tx.aiMessage.create({
+      data: {
+        conversationId: input.conversationId,
+        role: "assistant",
+        content: finalText,
+        isFinal: true,
+      },
+    });
+    await bumpUpdatedAt(tx, input.conversationId);
+  });
+}
+
+export interface CancelAgentTurnInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** The conversation the eager rows were created in. */
+  conversationId: string;
+  /** True when this turn created the conversation (delete it entirely). */
+  created: boolean;
+  /** Message ids this turn wrote (deleted when resuming a conversation). */
+  messageIds: readonly string[];
+}
+
+/**
+ * Compensate a failed eagerly-begun turn so NO partial turn state remains
+ * (Phase 10.28C-prep). A turn that created its conversation deletes that
+ * conversation (the schema's ON DELETE CASCADE removes its messages); a
+ * resumed turn deletes exactly the instruction + round messages this turn
+ * wrote — the conversation returns to its prior state. Idempotent and
+ * ownership-scoped: deleting a foreign/missing conversation or already
+ * removed messages is a safe no-op.
+ */
+export async function cancelAgentTurn(
+  input: CancelAgentTurnInput,
+): Promise<void> {
+  const db = getDatabase();
+  if (input.created) {
+    await db.aiConversation.deleteMany({
+      where: { id: input.conversationId, userId: input.userId },
+    });
+    return;
+  }
+  if (input.messageIds.length === 0) return;
+  await db.aiMessage.deleteMany({
+    where: {
+      id: { in: [...input.messageIds] },
+      conversationId: input.conversationId,
+      conversation: { is: { userId: input.userId } },
+    },
+  });
+}
+
 /** Bump `updated_at` (the schema promises it bumps on new messages). */
 async function bumpUpdatedAt(
   tx: Prisma.TransactionClient,

@@ -38,9 +38,10 @@
  *     same authenticated, policy-gated path a single turn uses.
  */
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
-import type { AgentProviderRequest } from "./provider.js";
+import type { AgentProviderRequest, AgentResponse } from "./provider.js";
 import { routeAgentResponse } from "./provider.js";
 import type { OrchestratedTurnOptions } from "./orchestrator.js";
+import type { AgentTurnContext } from "./tools.js";
 import { createSessionExecutionContext } from "../tools/sessionContext.js";
 
 /**
@@ -88,7 +89,24 @@ export interface AgentLoopOptions extends OrchestratedTurnOptions {
    * existing callers are unaffected when it is omitted. Lets persistence
    * record the transcript without re-implementing the loop.
    */
+  /**
+   * Observer invoked AFTER each executed tool round with its text,
+   * tool-call intents, structured results, and the running round count.
+   */
   onRound?: (round: AgentLoopRound) => void;
+  /**
+   * Optional async hook invoked BEFORE each tool-call round executes its
+   * intents (Phase 10.28C-prep). The caller uses it to establish the
+   * PERSISTED conversation/message context the round's tool executions
+   * belong to: for a persistent turn it commits the round's
+   * assistant/tool-call message and returns its real
+   * `{ conversationId, messageId }`. That context is threaded through
+   * `routeAgentResponse` → `invokeTool` and bound to every tool's
+   * `ToolExecutionContext` in the round. When the hook returns
+   * `undefined` — or is absent entirely — no turn context is threaded
+   * (non-persistent loops are unchanged).
+   */
+  prepareRound?: (response: AgentResponse) => Promise<AgentTurnContext | undefined>;
 }
 
 /** What one executed tool round looked like, for observers. */
@@ -170,7 +188,21 @@ export async function runAgentLoop(
     }
 
     toolRounds += 1;
-    const roundResults = await routeAgentResponse(c, response, options);
+
+    // Phase 10.28C-prep: before the round's intents execute, allow the
+    // caller to establish the PERSISTED conversation/message context the
+    // executions belong to. The returned ids are threaded through the
+    // same `routeAgentResponse` → `invokeTool` pipeline as every other
+    // option — nothing here bypasses policy or the authenticated path.
+    let roundContext: AgentTurnContext | undefined;
+    if (options.prepareRound !== undefined) {
+      const prepared = await options.prepareRound(response);
+      if (prepared !== undefined) roundContext = prepared;
+    }
+    const roundResults = await routeAgentResponse(c, response, {
+      ...options,
+      ...(roundContext !== undefined ? { turnContext: roundContext } : {}),
+    });
     toolResults = [...toolResults, ...roundResults];
     options.onRound?.({
       text: response.text,

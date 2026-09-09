@@ -20,6 +20,9 @@
  *   5. Unauthenticated request → rejected (AppError.unauthorized).
  *   6. Request-supplied identity in the input is ignored.
  *   7. Inactive session user → denied (defense in depth).
+ *   8. Persistent-turn context (Phase 10.28C-prep): a supplied `turnContext`
+ *      binds the persisted conversation/message ids to the execution context,
+ *      while direct invocations carry none (behavior unchanged).
  */
 import { describe, expect, it } from "vitest";
 
@@ -301,6 +304,75 @@ describe("invokeTool — inactive session user", () => {
     if (result.ok) return;
     expect(result.error.category).toBe("security");
     expect(result.error.code).toBe(ToolErrorCode.IdentityInvalid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Persistent-turn context at the invocation boundary (Phase 10.28C-prep)
+// ---------------------------------------------------------------------------
+
+describe("invokeTool — persistent turn context (Phase 10.28C-prep)", () => {
+  it("binds the persisted conversationId + messageId to the execution context when turnContext is supplied", async () => {
+    const seen: ToolExecutionContext[] = [];
+    const capturingPolicy: ToolPolicy = (definition, context) => {
+      seen.push(context);
+      return defaultToolPolicy()(definition, context);
+    };
+
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      {
+        registry: makeRegistry(),
+        filesystem: makeFilesystem(),
+        policy: capturingPolicy,
+        turnContext: {
+          conversationId: "conv-1",
+          messageId: "msg-r1",
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    const context = seen[0];
+    expect(context).toBeDefined();
+    if (!context) return;
+    // The REAL persisted turn context reached the invocation boundary.
+    expect(context.conversationId).toBe("conv-1");
+    expect(context.messageId).toBe("msg-r1");
+    // Authenticated identity is preserved, never replaced by the ids.
+    expect(context.actor.kind).toBe("ai-agent");
+    if (context.actor.kind === "ai-agent") {
+      expect(context.actor.identity.userId).toBe(ACTIVE_USER.id);
+    }
+  });
+
+  it("carries no conversation/message ids for direct (non-persistent) invocations", async () => {
+    const seen: ToolExecutionContext[] = [];
+    const capturingPolicy: ToolPolicy = (definition, context) => {
+      seen.push(context);
+      return defaultToolPolicy()(definition, context);
+    };
+
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "search_files",
+      { query: "notes" },
+      { registry: makeRegistry(), filesystem: makeFilesystem(), policy: capturingPolicy },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    const context = seen[0];
+    expect(context).toBeDefined();
+    if (!context) return;
+    // Existing non-persistent behavior is unchanged: no turn ids, no policy
+    // change — the default policy evaluates exactly as before.
+    expect(context.conversationId).toBeUndefined();
+    expect(context.messageId).toBeUndefined();
+    expect(context.actor.kind).toBe("ai-agent");
   });
 });
 

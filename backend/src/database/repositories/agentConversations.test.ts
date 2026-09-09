@@ -23,7 +23,11 @@ import {
   AgentConversationNotFoundError,
   appendAgentFinal,
   appendAgentTurn,
+  appendAgentTurnRoundMessage,
   archiveAgentConversation,
+  beginAgentTurn,
+  cancelAgentTurn,
+  completeAgentTurn,
   createAgentConversation,
   deleteAgentConversation,
   getAgentConversation,
@@ -191,6 +195,44 @@ function createFakeDb() {
         }) => {
           const rows = messages.filter((m) => m.conversationId === where?.conversationId);
           return sortBy(rows, orderBy);
+        },
+      ),
+      update: vi.fn(async ({ where, data }: { where: AnyRecord; data: AnyRecord }) => {
+        const row = messages.find((m) => m.id === where.id);
+        if (row === undefined) throw new Error(`Message ${String(where.id)} not found (fake).`);
+        Object.assign(row, data);
+        return row;
+      }),
+      updateMany: vi.fn(
+        async ({ where = {}, data }: { where?: AnyRecord; data: AnyRecord }) => {
+          const idFilter = where.id as string | { in?: unknown[] } | undefined;
+          const idIn = typeof idFilter === "object" && idFilter !== null ? idFilter.in : undefined;
+          const idEq = typeof idFilter === "string" ? idFilter : undefined;
+          const matches = messages.filter(
+            (m) =>
+              (idIn !== undefined
+                ? idIn.includes(m.id)
+                : idEq === undefined || m.id === idEq) &&
+              (where.conversationId === undefined || m.conversationId === where.conversationId),
+          );
+          for (const row of matches) Object.assign(row, data);
+          return { count: matches.length };
+        },
+      ),
+      deleteMany: vi.fn(
+        async ({ where = {} }: { where?: AnyRecord }) => {
+          const idIn = (where.id as { in?: unknown[] } | undefined)?.in;
+          const matches = messages.filter(
+            (m) =>
+              (idIn === undefined || idIn.includes(m.id)) &&
+              (where.conversationId === undefined || m.conversationId === where.conversationId),
+          );
+          if (matches.length === 0) return { count: 0 };
+          for (const row of matches) {
+            const idx = messages.indexOf(row);
+            if (idx !== -1) messages.splice(idx, 1);
+          }
+          return { count: matches.length };
         },
       ),
     },
@@ -1018,9 +1060,11 @@ describe("agentConversations repository", () => {
       expect(db.delegates.aiConversation.deleteMany).toHaveBeenCalledWith({
         where: { id, userId: ALICE },
       });
-      // No message-level cleanup delegate exists — cascade reuse, never
-      // manual duplicate logic.
-      expect("deleteMany" in db.delegates.aiMessage).toBe(false);
+      // deleteAgentConversation itself never performs manual message
+      // cleanup — cascade reuse, never duplicate logic. (`aiMessage.deleteMany`
+      // exists for the Phase 10.28C-prep turn compensation, not for
+      // conversation deletion.)
+      expect(db.delegates.aiMessage.deleteMany).not.toHaveBeenCalled();
     });
   });
 
@@ -1181,6 +1225,276 @@ describe("agentConversations repository", () => {
         "aiMessage",
         "$transaction",
       ]);
+    });
+  });
+
+  describe("eager turn persistence — begin/append/complete/cancel (Phase 10.28C-prep)", () => {
+    beforeEach(() => {
+      db = createFakeDb();
+      mocks.getDatabase.mockReturnValue(db.delegates);
+    });
+
+    it("beginAgentTurn commits a conversation, instruction, and first round with real ids", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "List my docs.",
+        maxToolRounds: 2,
+        title: "Docs listing",
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: { path: "/home" } }],
+      });
+
+      expect(begun.created).toBe(true);
+      expect(begun.conversationId).toBe("conv-1");
+      expect(begun.instructionMessageId).toBe("msg-1");
+      expect(begun.messageId).toBe("msg-2");
+      // The ids are REAL committed rows, immediately readable.
+      const loaded = await loadAgentConversationState(ALICE, begun.conversationId);
+      expect(loaded).not.toBeNull();
+      if (loaded === null) return;
+      expect(loaded.instruction).toBe("List my docs.");
+      expect(loaded.maxToolRounds).toBe(2);
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.messages[0]).toMatchObject({ kind: "provider", toolCalls: [{ id: "c1" }] });
+    });
+
+    it("resumes an owned conversation without creating a new one", async () => {
+      const created = await createAgentConversation({
+        userId: ALICE,
+        instruction: "First turn",
+        maxToolRounds: 2,
+      });
+      const before = db.messages.length;
+
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        conversationId: created.id,
+        instruction: "Second turn",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "search_files", input: { query: "x" } }],
+      });
+
+      expect(begun.created).toBe(false);
+      expect(begun.conversationId).toBe(created.id);
+      // Only the instruction + first round rows were appended.
+      expect(db.messages).toHaveLength(before + 2);
+      expect(db.conversations).toHaveLength(1);
+    });
+
+    it("rejects a foreign conversation for begin and writes nothing", async () => {
+      const beforeMessages = db.messages.length;
+      await expect(
+        beginAgentTurn({
+          userId: ALICE,
+          conversationId: "conv-foreign",
+          instruction: "sneak",
+          maxToolRounds: 1,
+          toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+      expect(db.messages).toHaveLength(beforeMessages);
+      expect(db.conversations).toHaveLength(0);
+    });
+
+    it("appendAgentTurnRoundMessage commits a later round message", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      const appended = await appendAgentTurnRoundMessage({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        text: "second round",
+        toolCalls: [{ id: "c2", toolName: "search_files", input: { query: "y" } }],
+      });
+
+      expect(appended.messageId).toBeDefined();
+      const round = db.messages.find((m) => m.id === appended.messageId);
+      expect(round).toMatchObject({
+        conversationId: begun.conversationId,
+        role: "assistant",
+        content: "second round",
+      });
+      expect(round?.toolCalls).toEqual([
+        { id: "c2", toolName: "search_files", input: { query: "y" } },
+      ]);
+    });
+
+    it("appendAgentTurnRoundMessage enforces ownership before writing", async () => {
+      await expect(
+        appendAgentTurnRoundMessage({
+          userId: ALICE,
+          conversationId: "conv-foreign",
+          toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+    });
+
+    it("completeAgentTurn attaches each round's results and appends the final reply atomically", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      const appended = await appendAgentTurnRoundMessage({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        toolCalls: [{ id: "c2", toolName: "search_files", input: { query: "y" } }],
+      });
+
+      const updatedBefore = db.conversations[0]?.updatedAt as Date;
+      await completeAgentTurn({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        rounds: [
+          {
+            messageId: begun.messageId,
+            toolResults: [{ ok: true, callId: "c1", data: { items: [] } }],
+          },
+          { messageId: appended.messageId, toolResults: [{ ok: true, callId: "c2", data: [] }] },
+        ],
+        finalText: "Done.",
+      });
+
+      const rows = db.messages;
+      expect(rows).toHaveLength(4);
+      // Round results land on the EXACT eager messages.
+      expect(rows.find((m) => m.id === begun.messageId)?.toolResults).toEqual([
+        { ok: true, callId: "c1", data: { items: [] } },
+      ]);
+      expect(rows.find((m) => m.id === appended.messageId)?.toolResults).toEqual([
+        { ok: true, callId: "c2", data: [] },
+      ]);
+      expect(rows.at(-1)).toMatchObject({ role: "assistant", content: "Done.", isFinal: true });
+      // updated_at was bumped.
+      expect(db.conversations[0]?.updatedAt).not.toEqual(updatedBefore);
+    });
+
+    it("completeAgentTurn rejects a foreign conversation and writes nothing", async () => {
+      await expect(
+        completeAgentTurn({
+          userId: ALICE,
+          conversationId: "conv-foreign",
+          rounds: [],
+          finalText: "Done.",
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+      expect(db.messages).toHaveLength(0);
+    });
+
+    it("completeAgentTurn rolls back when a round message vanished", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+
+      await expect(
+        completeAgentTurn({
+          userId: ALICE,
+          conversationId: begun.conversationId,
+          rounds: [
+            { messageId: "msg-ghost", toolResults: [{ ok: true, callId: "c1", data: null }] },
+          ],
+          finalText: "Done.",
+        }),
+      ).rejects.toThrow(AgentConversationNotFoundError);
+
+      // Nothing from the completion write landed (no final row, no results).
+      const rows = db.messages;
+      expect(rows).toHaveLength(2);
+      expect(rows.every((m) => !m.isFinal)).toBe(true);
+      expect(rows.every((m) => m.toolResults === null || m.toolResults === undefined)).toBe(true);
+    });
+
+    it("cancelAgentTurn deletes a turn-created conversation (cascade removes its rows)", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+
+      await cancelAgentTurn({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        created: true,
+        messageIds: [begun.instructionMessageId, begun.messageId],
+      });
+
+      // The whole partial turn is gone — nothing invalid remains.
+      expect(db.conversations).toHaveLength(0);
+      expect(db.messages).toHaveLength(0);
+    });
+
+    it("cancelAgentTurn on a resumed turn removes ONLY this turn's messages", async () => {
+      const created = await createAgentConversation({
+        userId: ALICE,
+        instruction: "First turn",
+        maxToolRounds: 2,
+      });
+      const priorMessages = db.messages.map((m) => ({ id: m.id }));
+
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        conversationId: created.id,
+        instruction: "Second turn",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      expect(db.messages.length).toBe(priorMessages.length + 2);
+
+      await cancelAgentTurn({
+        userId: ALICE,
+        conversationId: created.id,
+        created: false,
+        messageIds: [begun.instructionMessageId, begun.messageId],
+      });
+
+      // The conversation and its PRIOR transcript survive untouched; only the
+      // failed turn's own rows are removed.
+      expect(db.conversations).toHaveLength(1);
+      expect(db.messages.map((m) => m.id)).toEqual(priorMessages.map((m) => m.id));
+    });
+
+    it("cancelAgentTurn is a safe no-op for a foreign conversation", async () => {
+      await expect(
+        cancelAgentTurn({
+          userId: ALICE,
+          conversationId: "conv-foreign",
+          created: true,
+          messageIds: ["msg-1"],
+        }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("an interrupted turn (begin+append, no complete) still loads as a valid transcript", async () => {
+      // The crash window: eager rows committed but the turn never completed.
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Interrupted turn",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      await appendAgentTurnRoundMessage({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        toolCalls: [{ id: "c2", toolName: "search_files", input: { query: "y" } }],
+      });
+
+      const loaded = await loadAgentConversationState(ALICE, begun.conversationId);
+      expect(loaded).not.toBeNull();
+      if (loaded === null) return;
+      // Valid-but-incomplete: instruction + two provider rounds, no final,
+      // toolRounds not advanced. Never corrupt.
+      expect(loaded.instruction).toBe("Interrupted turn");
+      expect(loaded.messages).toHaveLength(2);
+      expect(loaded.messages.every((m) => m.kind === "provider")).toBe(true);
+      expect(loaded.finalText).toBeUndefined();
+      expect(loaded.toolRounds).toBe(0);
     });
   });
 });

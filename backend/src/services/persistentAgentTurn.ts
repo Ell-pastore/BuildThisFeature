@@ -16,17 +16,23 @@
  *   3. LOOP (Phase 10.4): the existing bounded tool loop runs against the
  *      provider with the registered tool metadata. An `onRound` observer
  *      (additive, added in 10.8) records each executed round's transcript in
- *      memory — the loop's execution, routing, policy, and `invokeTool()`
- *      pipeline are untouched. The provider stays a pure abstraction.
+ *      memory, and a `prepareRound` hook (added in 10.28C-prep) EAGERLY
+ *      persists — BEFORE each round's intents execute — the conversation
+ *      (first round) and the round's assistant/tool-call message, so a REAL
+ *      persisted `messageId` exists for every tool execution. That context is
+ *      threaded through `routeAgentResponse` → `invokeTool` and bound to each
+ *      tool's `ToolExecutionContext` (the Phase 10.28 approval boundary).
  *   4. STATE (Phase 10.6): the transcript is replayed through the immutable
  *      `ConversationState` transitions — the same validators persistence
  *      uses — to produce the updated state (and to reject malformed rounds
- *      before anything is written).
- *   5. PERSIST (Phase 10.7 repository): the ENTIRE turn — instruction,
- *      provider rounds, terminal reply — is committed in ONE transaction via
- *      `persistAgentTurn`. The instruction and the whole transcript are
- *      all-or-nothing: a provider failure, loop error, or validation failure
- *      leaves NO partial or corrupt state behind.
+ *      before the final write).
+ *   5. PERSIST (Phase 10.7 repository): a tool round's eager rows are the
+ *      REAL committed transcript; on success `completeAgentTurn` attaches the
+ *      results + final reply in ONE transaction. Text-only turns (no tools)
+ *      keep the original all-or-nothing `persistAgentTurn` write. If the turn
+ *      fails AFTER eager persistence, `cancelAgentTurn` compensates so NO
+ *      partial turn state remains: a new conversation is deleted (cascade),
+ *      a resumed conversation loses exactly this turn's messages.
  *
  * Phase 10.20 — COMPOSED STACK INTEGRATION: production turns obtain the
  * provider through the composed provider stack (`ComposedProviderStack` from
@@ -41,17 +47,21 @@
  *
  * Design rules:
  *
- *   - OWNERSHIP EVERYWHERE: load and persist are keyed by the authenticated
- *     user derived from the session, never from provider/request data. A
- *     foreign conversation looks identical to a missing one.
+ *   - OWNERSHIP EVERYWHERE: load, eager-write, complete, and cancel are keyed
+ *     by the authenticated user derived from the session, never from
+ *     provider/request data. A foreign conversation looks identical to a
+ *     missing one.
  *   - NO DUPLICATED LOOP: this service does not re-implement the bounded loop;
- *     it observes it and persists what it records.
- *   - NO PROVIDER COUPLING: the provider is injected — either as a ready
- *     `AgentProvider`, or (preferred, Phase 10.20) as the composed provider
- *     stack whose `provider` facade this service obtains. No API keys, no
- *     network, no real AI provider decisions here.
+ *     it observes it, persists what it records, and threads persisted
+ *     turn context through the loop's existing invocation path.
  *   - NO POLICY BYPASS: tool execution stays in the Phase 10.2/9.8
- *     `invokeTool()` pipeline on every round.
+ *     `invokeTool()` pipeline on every round; the only new data is the
+ *     persisted `conversationId`/`messageId` bound to the execution context.
+ *   - CONSISTENCY: eager rows are committed ONLY for tool rounds that will
+ *     actually execute; a failure afterwards compensates via `cancelAgentTurn`
+ *     so a failed turn leaves no partial state (a hard process crash in that
+ *     window can leave a valid-but-incomplete transcript — never corrupt —
+ *     which the load/reconstruct path handles and a later turn appends to).
  *   - NO I/O OUTSIDE THE REPOSITORY: the service performs no direct Prisma
  *     access; it goes through the Phase 10.7 repository functions.
  */
@@ -59,6 +69,7 @@ import { AppError } from "../core/errors.js";
 import type { AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
 import type { InvokeToolOptions } from "./tools.js";
+import type { AgentToolResult } from "./agent.js";
 import { buildAgentContext } from "./agentContext.js";
 import { runAgentLoop, type AgentLoopRound } from "./agentLoop.js";
 import type { ComposedProviderStack } from "./providerComposition.js";
@@ -71,6 +82,10 @@ import {
 } from "./conversation.js";
 import {
   AgentConversationNotFoundError,
+  appendAgentTurnRoundMessage,
+  beginAgentTurn,
+  cancelAgentTurn,
+  completeAgentTurn,
   loadAgentConversationState,
   persistAgentTurn,
   type AgentTurnRecord,
@@ -156,16 +171,33 @@ function toTurnRecord(round: AgentLoopRound): AgentTurnRecord {
 /**
  * Run one durable agent turn for the authenticated session user.
  *
+ * Persistence ORDER (Phase 10.28C-prep):
+ *
+ *   - Text-only turns (the provider never requests tools) are persisted the
+ *     original way: the ENTIRE turn atomically via `persistAgentTurn`; a
+ *     failure before that write leaves nothing.
+ *   - Tool turns EAGERLY persist round by round: `beginAgentTurn` (first
+ *     round: conversation + instruction + round message committed) and
+ *     `appendAgentTurnRoundMessage` (later rounds) run BEFORE that round's
+ *     intents execute, so every tool execution has a REAL persisted
+ *     `conversationId` + `messageId` bound to its `ToolExecutionContext`.
+ *     `completeAgentTurn` then attaches the results + final reply in ONE
+ *     transaction.
+ *   - If the turn fails after eager persistence, `cancelAgentTurn`
+ *     compensates: a new conversation is deleted, or a resumed conversation
+ *     loses exactly this turn's messages — no partial turn state remains.
+ *
  * @throws `AppError.unauthorized()` when `c` has no valid session (fail
  *         closed before the provider is contacted).
  * @throws `AgentConversationNotFoundError` when `conversationId` is not
  *         owned by the authenticated user (or does not exist).
- * @throws `ProviderError` when the provider fails — nothing is persisted for
- *         the failed turn (no conversation, no partial transcript).
+ * @throws `ProviderError` when the provider fails — the eager rows of the
+ *         failed turn are compensated away (nothing new remains).
  * @throws `AgentLoopError` when the provider requests tools past the bound —
- *         the skipped tools are never executed and nothing is persisted.
+ *         the skipped tools are never executed and the executed rounds'
+ *         eager rows are compensated away.
  * @throws `TypeError` on malformed provider rounds / missing final text —
- *         nothing is persisted.
+ *         any eager rows are compensated away.
  */
 export async function runPersistentTurn(
   c: { get: (key: string) => unknown },
@@ -202,55 +234,154 @@ export async function runPersistentTurn(
   }
   const maxToolRounds = bound ?? options.maxToolRounds ?? 1;
 
-  // 3. Run the existing bounded loop (Phase 10.4), recording the transcript
-  //    of each executed round via the observer. Nothing is persisted yet.
-  const observed: AgentLoopRound[] = [];
-  const output = await runAgentLoop(c, context.instruction, {
-    provider,
-    tools: context.tools,
-    registry: options.registry,
-    filesystem: options.filesystem,
-    ...(options.policy !== undefined ? { policy: options.policy } : {}),
-    maxToolRounds,
-    onRound: (round) => observed.push(round),
-  });
-  const rounds = observed.map(toTurnRecord);
+  // Eager-persistence state (Phase 10.28C-prep). `engaged` turns true once
+  // the FIRST tool round is committed; from then on every failure path
+  // compensates so no partial turn state survives.
+  let engaged = false;
+  let conversationId: string | undefined;
+  let created = false;
+  let instructionMessageId: string | undefined;
+  let currentSlot:
+    | { messageId: string; toolResults?: readonly AgentToolResult[] }
+    | undefined;
+  const roundSlots: { messageId: string; toolResults?: readonly AgentToolResult[] }[] = [];
 
-  // 4. Replay the transcript through the Phase 10.6 transitions. This both
-  //    validates (reusing the same guards persistence uses) and produces the
-  //    updated state returned to the caller.
-  let state = createConversationState({
-    instruction: context.instruction,
-    maxToolRounds,
-  });
-  for (const round of rounds) {
-    state = recordProviderTurn(state, {
-      text: round.text,
-      toolCalls: round.toolCalls,
+  try {
+    // 3. Run the existing bounded loop (Phase 10.4): the `onRound` observer
+    //    records the transcript, while `prepareRound` PERSISTS each round's
+    //    assistant message (and, on the first round, its conversation +
+    //    instruction) BEFORE that round's intents execute — giving every tool
+    //    execution a real persisted messageId.
+    const observed: AgentLoopRound[] = [];
+    const output = await runAgentLoop(c, context.instruction, {
+      provider,
+      tools: context.tools,
+      registry: options.registry,
+      filesystem: options.filesystem,
+      ...(options.policy !== undefined ? { policy: options.policy } : {}),
+      maxToolRounds,
+      onRound: (round) => {
+        observed.push(round);
+        // The loop calls prepareRound → execute → onRound in strict order,
+        // so `currentSlot` is exactly the round just executed.
+        if (currentSlot !== undefined) currentSlot.toolResults = round.results;
+        currentSlot = undefined;
+      },
+      prepareRound: async (response) => {
+        if (engaged) {
+          const appended = await appendAgentTurnRoundMessage({
+            userId,
+            conversationId: conversationId as string,
+            ...(response.text !== undefined ? { text: response.text } : {}),
+            toolCalls: response.toolCalls ?? [],
+          });
+          currentSlot = { messageId: appended.messageId };
+          roundSlots.push(currentSlot);
+          return {
+            conversationId: conversationId as string,
+            messageId: appended.messageId,
+          };
+        }
+        const begun = await beginAgentTurn({
+          userId,
+          ...(input.conversationId !== undefined
+            ? { conversationId: input.conversationId }
+            : {}),
+          instruction: context.instruction,
+          maxToolRounds,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+          ...(response.text !== undefined ? { text: response.text } : {}),
+          toolCalls: response.toolCalls ?? [],
+        });
+        conversationId = begun.conversationId;
+        created = begun.created;
+        instructionMessageId = begun.instructionMessageId;
+        engaged = true;
+        currentSlot = { messageId: begun.messageId };
+        roundSlots.push(currentSlot);
+        return {
+          conversationId: begun.conversationId,
+          messageId: begun.messageId,
+        };
+      },
     });
-    if (round.toolResults !== undefined) {
-      state = recordToolResults(state, round.toolResults);
+    const rounds = observed.map(toTurnRecord);
+
+    // 4. Replay the transcript through the Phase 10.6 transitions. This both
+    //    validates (reusing the same guards persistence uses) and produces the
+    //    updated state returned to the caller.
+    let state = createConversationState({
+      instruction: context.instruction,
+      maxToolRounds,
+    });
+    for (const round of rounds) {
+      state = recordProviderTurn(state, {
+        text: round.text,
+        toolCalls: round.toolCalls,
+      });
+      if (round.toolResults !== undefined) {
+        state = recordToolResults(state, round.toolResults);
+      }
     }
+    state = finalizeConversation(state, output.text ?? undefined);
+
+    // 5. Persist the final result. Tool turns: attach each round's
+    //    tool_results to its eager message and append the is_final reply in
+    //    ONE transaction (ownership re-verified inside). Text-only turns keep
+    //    the original all-or-nothing `persistAgentTurn` write.
+    if (engaged) {
+      await completeAgentTurn({
+        userId,
+        conversationId: conversationId as string,
+        rounds: roundSlots.map((slot) => ({
+          messageId: slot.messageId,
+          toolResults: slot.toolResults ?? [],
+        })),
+        finalText: state.finalText ?? "",
+      });
+      return { conversationId: conversationId as string, created, state };
+    }
+
+    const persisted = await persistAgentTurn({
+      userId,
+      ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
+      instruction: context.instruction,
+      maxToolRounds,
+      ...(input.title !== undefined ? { title: input.title } : {}),
+      rounds,
+      finalText: state.finalText ?? "",
+    });
+
+    return {
+      conversationId: persisted.id,
+      created: persisted.created,
+      state,
+    };
+  } catch (error) {
+    // 6. Compensation: a failed turn that already committed eager rows must
+    //    not leave partial state. A new conversation is deleted (cascade); a
+    //    resumed conversation loses exactly this turn's messages. The
+    //    compensation is best-effort so the ORIGINAL error always governs.
+    if (engaged) {
+      try {
+        await cancelAgentTurn({
+          userId,
+          conversationId: conversationId as string,
+          created,
+          messageIds: [
+            ...(instructionMessageId !== undefined ? [instructionMessageId] : []),
+            ...roundSlots.map((slot) => slot.messageId),
+          ],
+        });
+      } catch {
+        // A failed compensation (e.g. the database is down) cannot mask the
+        // original failure. The rows left behind are valid-but-incomplete
+        // transcript entries — never corrupt — and a later successful turn
+        // appends to the conversation normally.
+      }
+    }
+    throw error;
   }
-  state = finalizeConversation(state, output.text ?? undefined);
-
-  // 5. Persist the complete turn atomically (instruction → rounds → final) in
-  //    one transaction. Ownership is re-verified inside the transaction.
-  const persisted = await persistAgentTurn({
-    userId,
-    ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
-    instruction: context.instruction,
-    maxToolRounds,
-    ...(input.title !== undefined ? { title: input.title } : {}),
-    rounds,
-    finalText: state.finalText ?? "",
-  });
-
-  return {
-    conversationId: persisted.id,
-    created: persisted.created,
-    state,
-  };
 }
 
 // ---------------------------------------------------------------------------

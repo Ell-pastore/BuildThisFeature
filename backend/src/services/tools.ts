@@ -45,6 +45,28 @@ export interface InvokeToolOptions {
    * Phase 9.5 default policy.
    */
   policy?: ToolPolicy;
+  /**
+   * Optional persistent-turn provenance (Phase 10.28C-prep). A bounded
+   * persistent turn eagerly commits its conversation and the round's
+   * assistant/tool-call message BEFORE the round's intents execute, then
+   * threads the two REAL persisted ids here so `invokeTool` can bind them
+   * to the `ToolExecutionContext` at the invocation boundary. Absent for
+   * direct / non-persistent invocations — behavior is unchanged.
+   */
+  turnContext?: AgentTurnContext;
+}
+
+/**
+ * The authenticated, PERSISTED conversation/message context a tool call
+ * belongs to. Produced only by the persistent-turn layer from committed
+ * repository rows — these ids are never supplied by provider output or
+ * by the untrusted tool input.
+ */
+export interface AgentTurnContext {
+  /** Persisted owning conversation id (UUID, repository-assigned). */
+  conversationId: string;
+  /** Persisted assistant/tool-call message id owning the current round. */
+  messageId: string;
 }
 
 /**
@@ -53,6 +75,11 @@ export interface InvokeToolOptions {
  * Throws `AppError.unauthorized()` when no session identity is present;
  * otherwise every outcome is returned as a structured
  * `ToolExecutionResult` (never thrown).
+ *
+ * When `options.turnContext` is present (persistent agent turns only), the
+ * authenticated, persisted conversation + message ids are bound to the
+ * `ToolExecutionContext` so the future approval stage has real ids at the
+ * invocation boundary. Identity still comes exclusively from the session.
  */
 export async function invokeTool(
   c: { get: (key: string) => unknown },
@@ -60,7 +87,7 @@ export async function invokeTool(
   input: RawToolInput,
   options: InvokeToolOptions,
 ): Promise<ToolExecutionResult> {
-  const executionContext = createSessionExecutionContext(c);
+  const executionContext = createSessionExecutionContext(c, options.turnContext);
   return dispatchTool(
     options.registry,
     toolName,

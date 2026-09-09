@@ -56,11 +56,19 @@ import {
 const mocks = vi.hoisted(() => ({
   loadAgentConversationState: vi.fn(),
   persistAgentTurn: vi.fn(),
+  beginAgentTurn: vi.fn(),
+  appendAgentTurnRoundMessage: vi.fn(),
+  completeAgentTurn: vi.fn(),
+  cancelAgentTurn: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
   loadAgentConversationState: mocks.loadAgentConversationState,
   persistAgentTurn: mocks.persistAgentTurn,
+  beginAgentTurn: mocks.beginAgentTurn,
+  appendAgentTurnRoundMessage: mocks.appendAgentTurnRoundMessage,
+  completeAgentTurn: mocks.completeAgentTurn,
+  cancelAgentTurn: mocks.cancelAgentTurn,
   AgentConversationNotFoundError: class AgentConversationNotFoundError extends Error {
     readonly code = "agent-conversation/not-found-or-not-owned";
     constructor() {
@@ -69,6 +77,24 @@ vi.mock("../database/repositories/agentConversations.js", () => ({
     }
   },
 }));
+
+/**
+ * Reset every repository mock; tool rounds are defaulted to REAL persisted
+ * ids so the eager begin/append/complete wiring works unless overridden.
+ */
+function resetPersistenceMocks(): void {
+  mocks.loadAgentConversationState.mockReset();
+  mocks.persistAgentTurn.mockReset().mockResolvedValue({ id: "conv-stack", created: true });
+  mocks.beginAgentTurn.mockReset().mockResolvedValue({
+    conversationId: "conv-stack",
+    created: true,
+    instructionMessageId: "inst-1",
+    messageId: "msg-r1",
+  });
+  mocks.appendAgentTurnRoundMessage.mockReset().mockResolvedValue({ messageId: "msg-r2" });
+  mocks.completeAgentTurn.mockReset().mockResolvedValue(undefined);
+  mocks.cancelAgentTurn.mockReset().mockResolvedValue(undefined);
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -202,7 +228,7 @@ function unavailable(): ProviderError {
 
 describe("runPersistentTurn — provider source validation (Phase 10.20)", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("throws TypeError when neither stack nor provider is supplied", async () => {
@@ -243,7 +269,7 @@ describe("runPersistentTurn — provider source validation (Phase 10.20)", () =>
 
 describe("runPersistentTurn — primary provider success via stack", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("creates a conversation via the stack's single provider and persists", async () => {
@@ -288,7 +314,7 @@ describe("runPersistentTurn — primary provider success via stack", () => {
 
 describe("runPersistentTurn — credential rotation inside the stack", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("rotates a failing credential to the next and persists the winning turn", async () => {
@@ -331,7 +357,7 @@ describe("runPersistentTurn — credential rotation inside the stack", () => {
 
 describe("runPersistentTurn — provider fallback inside the stack", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("falls back to gemini when grok fails and persists the fallback turn", async () => {
@@ -367,8 +393,7 @@ describe("runPersistentTurn — provider fallback inside the stack", () => {
 
 describe("runPersistentTurn — exhaustion persists nothing", () => {
   beforeEach(() => {
-    mocks.loadAgentConversationState.mockReset();
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("rejects with a fallback ProviderError when every provider is unavailable", async () => {
@@ -449,8 +474,7 @@ describe("runPersistentTurn — exhaustion persists nothing", () => {
 
 describe("runPersistentTurn — provider switching preserves tool continuation", () => {
   beforeEach(() => {
-    mocks.loadAgentConversationState.mockReset();
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("skips the cooled-down provider and continues tool rounds on the fallback", async () => {
@@ -481,7 +505,6 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
       },
     });
     mocks.loadAgentConversationState.mockResolvedValue(null);
-    mocks.persistAgentTurn.mockResolvedValue({ id: "conv-loop", created: true });
 
     const result = await runPersistentTurn(sessionContext(ACTIVE_USER), { instruction: INSTRUCTION }, {
       tools: TOOLS,
@@ -508,17 +531,21 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
       { provider: ProviderId.Gemini, credentialValue: "gemini-key-1" },
     ]);
 
-    expect(mocks.persistAgentTurn).toHaveBeenCalledWith(
+    // Eagerly began on the first tool round, then completed against that
+    // conversation with the round's persisted message id.
+    expect(mocks.beginAgentTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.completeAgentTurn).toHaveBeenCalledWith(
       expect.objectContaining({
         rounds: [
           {
-            toolCalls: [call("c1", "list_directory", { path: "/home" })],
+            messageId: "msg-r1",
             toolResults: [{ ok: true, callId: "c1", data: homeListing() }],
           },
         ],
         finalText: "Everything listed.",
       }),
     );
+    expect(mocks.persistAgentTurn).not.toHaveBeenCalled();
   });
 
   it("runs the invokeTool pipeline through the stack and persists tool results", async () => {
@@ -535,7 +562,12 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
         }),
       }),
     });
-    mocks.persistAgentTurn.mockResolvedValue({ id: "conv-exec", created: true });
+    mocks.beginAgentTurn.mockResolvedValue({
+      conversationId: "conv-exec",
+      created: true,
+      instructionMessageId: "inst-exec",
+      messageId: "msg-r1",
+    });
 
     const result = await runPersistentTurn(sessionContext(ACTIVE_USER), { instruction: INSTRUCTION }, {
       tools: TOOLS,
@@ -545,21 +577,27 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
       maxToolRounds: 2,
     });
 
+    expect(result.conversationId).toBe("conv-exec");
     expect(result.state.toolRounds).toBe(1);
     expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", data: homeListing() }]);
     expect(result.state.finalText).toBe("Everything listed.");
 
-    expect(mocks.persistAgentTurn).toHaveBeenCalledWith(
+    // The tool round was EAGERLY begun (real persisted ids), then completed
+    // against that conversation with the persisted message id.
+    expect(mocks.beginAgentTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.completeAgentTurn).toHaveBeenCalledWith(
       expect.objectContaining({
+        conversationId: "conv-exec",
         rounds: [
           {
-            toolCalls: [call("c1", "list_directory", { path: "/home" })],
+            messageId: "msg-r1",
             toolResults: [{ ok: true, callId: "c1", data: homeListing() }],
           },
         ],
         finalText: "Everything listed.",
       }),
     );
+    expect(mocks.persistAgentTurn).not.toHaveBeenCalled();
   });
 });
 
@@ -569,8 +607,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
 
 describe("runPersistentTurn — auth with composed stack", () => {
   beforeEach(() => {
-    mocks.loadAgentConversationState.mockReset();
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("rejects an unauthenticated session before running the stack", async () => {
@@ -619,7 +656,7 @@ describe("runPersistentTurn — auth with composed stack", () => {
 
 describe("runPersistentTurn — loop bound via stack", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("rejects with the typed loop error and persists nothing", async () => {
@@ -646,6 +683,14 @@ describe("runPersistentTurn — loop bound via stack", () => {
     });
 
     expect(mocks.persistAgentTurn).not.toHaveBeenCalled();
+    // The executed round's eager rows are compensated away: no partial state.
+    expect(mocks.cancelAgentTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.cancelAgentTurn).toHaveBeenCalledWith({
+      userId: USER_ID,
+      conversationId: "conv-stack",
+      created: true,
+      messageIds: ["inst-1", "msg-r1"],
+    });
   });
 });
 
@@ -655,7 +700,7 @@ describe("runPersistentTurn — loop bound via stack", () => {
 
 describe("runPersistentTurn — secret containment", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("never puts credential values or fallback details into state or persistence", async () => {
@@ -692,7 +737,7 @@ describe("runPersistentTurn — secret containment", () => {
 
 describe("createPersistentTurnRuntime (Phase 10.20)", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("runs a durable turn through the bound composed stack", async () => {
@@ -748,7 +793,7 @@ describe("createPersistentTurnRuntime (Phase 10.20)", () => {
 
 describe("runPersistentTurn — through the real Grok adapter", () => {
   beforeEach(() => {
-    mocks.persistAgentTurn.mockReset();
+    resetPersistenceMocks();
   });
 
   it("persists a response obtained from a real adapter via the composed stack", async () => {
