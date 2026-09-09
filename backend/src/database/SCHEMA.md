@@ -473,7 +473,7 @@ An AI-proposed filesystem operation awaiting user decision. Rows are **inert dat
 
 ### 6.8 `ai_tool_approvals` — generic AI tool-approval requests
 
-A request for an explicit user decision before an **AI-requested tool call** may execute. Rows are **inert data**: nothing executes a tool call here; a service resolves the approval and only then may the tool proceed through the normal permission/execution path (Phase 10.29 application-layer contract). This table is the persistence half of the tool-approval contract — the `requiresApproval` metadata that *marks* which tools need confirmation lives on tool definitions at the application layer, not in this schema.
+A request for an explicit user decision before an **AI-requested tool call** may execute. Rows are **inert data**: nothing executes a tool call here; a service resolves the approval and only then may the tool proceed through the normal permission/execution path. This table is the persistence half of the tool-approval contract — the `requiresApproval` metadata that *marks* which tools need confirmation lives on `ToolDefinition` at the application layer (Phase 10.28B), not in this schema.
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
@@ -492,7 +492,7 @@ A request for an explicit user decision before an **AI-requested tool call** may
 
 - **Indexes:** `(user_id, status, created_at)` — per-user approvals by state; `(conversation_id, created_at)` — conversation approval history; `(message_id)` — per-turn approvals; partial `(user_id, expires_at)` `WHERE status = 'pending'` — the pending-approval queue plus the expiry sweep.
 - **Ownership:** structural `user_id` (D3); every approval belongs to exactly one user, one conversation, and one message.
-- **State machine (application-enforced):** `pending` → `approved` | `rejected` | `expired`. Only services transition states; `decided_at` is set on the first terminal transition. A `pending` approval is never executed once its window has passed.
+- **State machine (application-enforced):** `pending` → `approved` | `rejected` | `expired`. Only services transition states; `decided_at` is set on the first terminal transition. A `pending` approval is never executed once its window has passed. The Phase 10.28B contract creates an approval only for tools marked `requiresApproval`, resolves with explicit approve/reject only, and gates the future execution path with an `approved`-and-in-window check.
 - **Expiry semantics:** `expires_at` is required for every row. The transition `pending` → `expired` is a service concern (Phase 10.29) driven by the partial `(user_id, expires_at)` index — no trigger or scheduled job in the DB.
 - **Relationship behavior — CASCADE, deliberately opposite to `ai_actions`:** deleting a conversation or its message deletes its approvals. Approvals are transient conversation state, not durable audit (unlike `ai_actions`' audit-survival SET NULL, §6.7). Approvals reference **no files or folders**, so deleting a conversation can never delete or mutate user files.
 - **Security (§2.2/§13):** `arguments` stores only the validated tool arguments that identify the proposed operation. It must never contain API keys, credential handles, raw file contents, filesystem paths, or provider secrets; provider responses and arbitrary model output never land in this table.

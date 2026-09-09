@@ -44,4 +44,19 @@ export interface ToolDefinition {
   readonly description: string;
   readonly inputSchema: ToolInputSchema;
   readonly permission: ToolPermission;
+  /**
+   * True when a tool call may execute only after explicit user approval
+   * (Phase 10.28B). Absent/`false` means no approval is required — the safe
+   * default that keeps existing (read-only) tools unchanged. Metadata only:
+   * the approval contract decides with this flag, never the tool itself.
+   */
+  readonly requiresApproval?: boolean;
+}
+
+/**
+ * Whether a tool definition demands explicit user approval before execution.
+ * Absent `requiresApproval` safely defaults to `false` (no approval).
+ */
+export function requiresToolApproval(definition: ToolDefinition): boolean {
+  return definition.requiresApproval === true;
 }
