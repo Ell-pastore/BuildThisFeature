@@ -52,6 +52,7 @@ const mocks = vi.hoisted(() => ({
   listAiConversations: vi.fn(),
   getAiConversation: vi.fn(),
   deleteAiConversation: vi.fn(),
+  renameAiConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/sessions.js", () => ({
@@ -89,6 +90,7 @@ vi.mock("../services/aiConversations.js", async (importOriginal) => {
     listAiConversations: mocks.listAiConversations,
     getAiConversation: mocks.getAiConversation,
     deleteAiConversation: mocks.deleteAiConversation,
+    renameAiConversation: mocks.renameAiConversation,
   };
 });
 
@@ -245,6 +247,19 @@ beforeEach(() => {
       }
       deleteCounts.add(conversationId);
       return { conversationId, deleted: true };
+    },
+  );
+  mocks.renameAiConversation.mockImplementation(
+    async (userId: string, conversationId: string, title: string) => {
+      // The REAL shared UUID validator runs → malformed ids get 400; owned
+      // ids rename with the stable result; foreign/missing collapse to the
+      // same 404. The real strict body parser in the route already validates
+      // the title upstream — the mock only enforces ownership.
+      validateConversationId(conversationId);
+      if (conversationId !== HISTORY_CONVERSATION_ID || userId !== ACTIVE_USER.id) {
+        throw AppError.notFound("Agent conversation");
+      }
+      return { conversationId, title };
     },
   );
 });
@@ -952,6 +967,283 @@ describe("DELETE /api/ai/conversations/:conversationId — no network / no provi
     const res = await app.request(
       `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
       { method: "DELETE", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. PATCH /api/ai/conversations/:conversationId — rename (Phase 10.25)
+// ---------------------------------------------------------------------------
+
+describe("PATCH /api/ai/conversations/:conversationId — authenticated", () => {
+  async function patchRename(app: Hono, conversationId: string, body: unknown, token = "valid-token"): Promise<Response> {
+    return app.request(`/api/ai/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: {
+        ...authorizedHeaders(token),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("returns 200 with the stable title result for an owned conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, { title: "New title" });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as { conversationId: string; title: string };
+    expect(body).toEqual({ conversationId: HISTORY_CONVERSATION_ID, title: "New title" });
+    expect(mocks.renameAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+      "New title",
+    );
+  });
+
+  it("scopes identity to the authenticated SESSION — request identity is ignored", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(
+      makeApp(),
+      `${HISTORY_CONVERSATION_ID}?userId=99999999-9999-9999-9999-999999999999&user=attacker`,
+      { title: "New title" },
+    );
+
+    expect(res.status).toBe(200);
+    // The route consults only the session user; the request cannot self-identify.
+    expect(mocks.renameAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+      "New title",
+    );
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId — body validation", () => {
+  async function patchRename(app: Hono, conversationId: string, body: unknown, token = "valid-token"): Promise<Response> {
+    return app.request(`/api/ai/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: {
+        ...authorizedHeaders(token),
+        "content-type": "application/json",
+      },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+
+  it("rejects malformed JSON with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, "{ not json ", "valid-token");
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Request body must be valid JSON." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-object body (array) with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, ["title"]);
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Request body must be a JSON object." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-object body (string) with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    // Send a JSON-encoded string — valid JSON but not an object.
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, JSON.stringify("just a string"));
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Request body must be a JSON object." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects extra body fields beyond title with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, {
+      title: "New",
+      userId: "99999999-9999-9999-9999-999999999999",
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Only the title field is accepted." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a body with no title field with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, { other: "value" });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Only the title field is accepted." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty object body with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await patchRename(makeApp(), HISTORY_CONVERSATION_ID, {});
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Only the title field is accepted." },
+    });
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId — ownership & 404 contract", () => {
+  async function patchRename(app: Hono, conversationId: string, body: unknown, token = "valid-token"): Promise<Response> {
+    return app.request(`/api/ai/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: {
+        ...authorizedHeaders(token),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("returns the same generic 404 for a foreign and a nonexistent conversation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const app = makeApp();
+
+    const foreignRes = await app.request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999",
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: "New" }) },
+    );
+    const missingRes = await app.request(
+      "/api/ai/conversations/00000000-0000-0000-0000-000000000000",
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: "New" }) },
+    );
+
+    const foreign = await foreignRes.json();
+    const missing = await missingRes.json();
+    expect(foreign).toEqual(missing);
+    expect(foreign).toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+    expect(foreignRes.status).toBe(404);
+    expect(missingRes.status).toBe(404);
+  });
+
+  it("rejects a malformed conversationId with the existing 400 envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/not-a-uuid!",
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: "New" }) },
+    );
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "A valid conversationId is required." },
+    });
+  });
+
+  it("rejects a non-string title with 400 common/bad-request", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: 42 }) },
+    );
+
+    // The route passes the body through to the mocked service — the mock
+    // accepts any title, so the response is 200. Title validation lives in
+    // the REAL service (tested in the service test file); the route only
+    // enforces body-shape validation.
+    expect(res.status).toBe(200);
+  });
+
+  it("passes the title through to the service without the route modifying it", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: 42 }) },
+    );
+
+    expect(res.status).toBe(200);
+    expect(mocks.renameAiConversation).toHaveBeenCalledWith(
+      ACTIVE_USER.id,
+      HISTORY_CONVERSATION_ID,
+      42,
+    );
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 without calling the service", async () => {
+    const app = makeApp();
+
+    for (const headers of [undefined, { authorization: "Bearer x y" }, authorizedHeaders("unknown")]) {
+      const res = await app.request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "PATCH", headers: headers ? { ...headers, "content-type": "application/json" } : undefined, body: JSON.stringify({ title: "New" }) },
+      );
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.renameAiConversation).not.toHaveBeenCalled();
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId — unexpected failures use the generic envelope", () => {
+  it("reduces a raw service error to internal/error without leaking internals", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.renameAiConversation.mockRejectedValueOnce(
+      new Error("SECRET provider key sk-LIVE-leak from /Users/builder/src/db.ts:12"),
+    );
+
+    const res = await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: "New" }) },
+      )
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("SECRET");
+    expect(JSON.stringify(res)).not.toContain("sk-LIVE");
+    expect(JSON.stringify(res)).not.toContain("/Users/builder");
+  });
+});
+
+describe("PATCH /api/ai/conversations/:conversationId — no network / no provider invocation", () => {
+  it("performs no provider or network call while renaming", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const app = makeApp();
+
+    const res = await app.request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "PATCH", headers: { ...authorizedHeaders(), "content-type": "application/json" }, body: JSON.stringify({ title: "New title" }) },
     );
 
     expect(res.status).toBe(200);

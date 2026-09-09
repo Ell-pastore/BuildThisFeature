@@ -44,6 +44,7 @@ import {
   deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
+  renameAgentConversation,
   type StoredConversation,
   type StoredMessageRecord,
 } from "../database/repositories/agentConversations.js";
@@ -338,4 +339,78 @@ export async function deleteAiConversation(
     throw error;
   }
   return { conversationId, deleted: true };
+}
+// ---------------------------------------------------------------------------
+// Rename (Phase 10.25)
+// ---------------------------------------------------------------------------
+
+/** Stable response for `PATCH /api/ai/conversations/:conversationId`. */
+export interface AiConversationRenameResult {
+  conversationId: string;
+  title: string;
+}
+
+/**
+ * Rename ONE conversation owned by `userId`. Ownership is enforced in the
+ * repository (single `where: { userId, id }` update); the service validates
+ * only the input (title) upstream and maps the database errors to the existing
+ * stable envelopes downstream.
+ *
+ * A foreign OR missing conversation is indistinguishable: both collapse to
+ * the existing 404 `common/not-found` envelope. A duplicate rename of an
+ * already-renamed conversation succeeds silently (idempotent title write).
+ *
+ * Identity is the authenticated session user. No body-supplied identity is ever
+ * accepted (the route strips unexpected body fields first).
+ *
+ * Returns the stable safe summary of the renamed conversation. No tool call
+ * results, no message contents, no provider/credential info.
+ *
+ * @throws `AppError.badRequest` on a malformed conversationId (400),
+ *         non-string title, empty/whitespace-only title, or overlong title
+ *         (> 255 characters after trimming).
+ * @throws `AppError.notFound` (404 `common/not-found`) when the conversation
+ *         does not exist for `userId`.
+ * @throws the generic `internal/error` worst-case envelope on unexpected
+ *         repository/database failures (propagated raw so the HTTP layer's
+ *         envelope hides the details).
+ */
+export async function renameAiConversation(
+  userId: string,
+  conversationIdParam: string,
+  title: string,
+): Promise<AiConversationRenameResult> {
+  // --- input validation -----------------------------------------------------------------
+  const conversationId = validateConversationId(conversationIdParam);
+
+  if (typeof title !== "string") {
+    throw AppError.badRequest("Title must be a string.");
+  }
+
+  const trimmed = title.trim();
+  if (trimmed.length === 0) {
+    throw AppError.badRequest("Title must not be empty.");
+  }
+
+  if (trimmed.length > 255) {
+    throw AppError.badRequest(
+      "Title must be 255 characters or fewer.",
+    );
+  }
+
+  // --- rename -----------------------------------------------------------------------------------
+  try {
+    const renamed = await renameAgentConversation(userId, conversationId, trimmed);
+    return {
+      conversationId: renamed.id,
+      title: renamed.title,
+    };
+  } catch (error) {
+    if (error instanceof AgentConversationNotFoundError) {
+      throw AppError.notFound("Agent conversation was not found.");
+    }
+    // Unexpected repository/database failures propagate raw so the HTTP
+    // layer's generic `internal/error` envelope hides the details.
+    throw error;
+  }
 }

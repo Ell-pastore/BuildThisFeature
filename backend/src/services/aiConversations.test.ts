@@ -23,9 +23,11 @@ import {
   deleteAiConversation,
   getAiConversation,
   listAiConversations,
+  renameAiConversation,
   projectStructuredValue,
   type AiConversationDetail,
   type AiConversationDeletionResult,
+  type AiConversationRenameResult,
   type AiConversationSummary,
 } from "./aiConversations.js";
 import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
@@ -34,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   listAgentConversations: vi.fn(),
   getAgentConversation: vi.fn(),
   deleteAgentConversation: vi.fn(),
+  renameAgentConversation: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", async (importOriginal) => {
@@ -44,6 +47,7 @@ vi.mock("../database/repositories/agentConversations.js", async (importOriginal)
     listAgentConversations: mocks.listAgentConversations,
     getAgentConversation: mocks.getAgentConversation,
     deleteAgentConversation: mocks.deleteAgentConversation,
+    renameAgentConversation: mocks.renameAgentConversation,
   };
 });
 
@@ -456,5 +460,174 @@ describe("deleteAiConversation", () => {
     // the conversation id. Anything beyond that is the repository's domain.
     expect(mocks.deleteAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID);
     expect(mocks.deleteAgentConversation).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.25 rename
+// ---------------------------------------------------------------------------
+
+describe("renameAiConversation", () => {
+  it("renames an owned conversation and returns the stable title result", async () => {
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "New title",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const result: AiConversationRenameResult = await renameAiConversation(
+      ALICE,
+      CONVERSATION_ID,
+      "New title",
+    );
+
+    expect(mocks.renameAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID, "New title");
+    expect(result).toEqual({ conversationId: CONVERSATION_ID, title: "New title" });
+    // The stable result is an explicit projection — no updatedAt, userId,
+    // or other repository columns leak.
+    expect(Object.keys(result).sort()).toEqual(["conversationId", "title"]);
+  });
+
+  it("trims leading and trailing whitespace from the title", async () => {
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Trimmed",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const result = await renameAiConversation(ALICE, CONVERSATION_ID, "  Trimmed  ");
+
+    expect(mocks.renameAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID, "Trimmed");
+    expect(result.title).toBe("Trimmed");
+  });
+
+  it("passes the 255-character trimmed title to the repository", async () => {
+    const maxTitle = "a".repeat(255);
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: maxTitle,
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const result = await renameAiConversation(ALICE, CONVERSATION_ID, maxTitle);
+
+    expect(mocks.renameAgentConversation).toHaveBeenCalledWith(ALICE, CONVERSATION_ID, maxTitle);
+    expect(result.title).toBe(maxTitle);
+  });
+
+  it("rejects a non-string title with 400 common/bad-request", async () => {
+    for (const bad of [42, true, null, undefined, {}, []]) {
+      await expect(renameAiConversation(ALICE, CONVERSATION_ID, bad as unknown as string)).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.renameAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty or whitespace-only title with 400 common/bad-request", async () => {
+    for (const bad of ["", "   ", "\t\n"]) {
+      await expect(renameAiConversation(ALICE, CONVERSATION_ID, bad)).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.renameAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a title exceeding 255 characters after trimming with 400", async () => {
+    await expect(
+      renameAiConversation(ALICE, CONVERSATION_ID, "x".repeat(256)),
+    ).rejects.toMatchObject({ status: 400, code: "common/bad-request" });
+    // Exactly 255 after trim is valid
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "x".repeat(255),
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+    await expect(
+      renameAiConversation(ALICE, CONVERSATION_ID, "x".repeat(255)),
+    ).resolves.toMatchObject({ title: "x".repeat(255) });
+    expect(mocks.renameAgentConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a malformed conversationId with 400 before any repository call", async () => {
+    for (const bad of ["", "not-a-uuid", "../etc/passwd", "GGGG"]) {
+      await expect(renameAiConversation(ALICE, bad, "ok")).rejects.toMatchObject({
+        status: 400,
+        code: "common/bad-request",
+      });
+    }
+    expect(mocks.renameAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("maps a foreign AND a missing conversation to the same 404 not-found", async () => {
+    mocks.renameAgentConversation.mockImplementation(() => {
+      throw new AgentConversationNotFoundError();
+    });
+
+    const foreign = await renameAiConversation(ALICE, CONVERSATION_ID, "New").catch((e) => e);
+    const missing = await renameAiConversation(
+      ALICE,
+      "ddd11111-1111-1111-1111-111111111111",
+      "New",
+    ).catch((e) => e);
+
+    expect(foreign).toBeInstanceOf(AppError);
+    expect(foreign).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(missing).toMatchObject({ status: 404, code: "common/not-found" });
+    expect(foreign).toEqual(missing);
+  });
+
+  it("propagates unexpected repository failures raw for the generic internal-error envelope", async () => {
+    const raw = new Error("SECRET SQL: SELECT * FROM internal.creds at db.ts:9");
+    mocks.renameAgentConversation.mockRejectedValueOnce(raw);
+
+    const outcome = await renameAiConversation(ALICE, CONVERSATION_ID, "New").catch((e) => e);
+
+    expect(outcome).toBe(raw);
+    expect(outcome).not.toBeInstanceOf(AppError);
+  });
+
+  it("returns ONLY the conversationId and title — no updatedAt, no userId, no extra fields", async () => {
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Updated",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const result = await renameAiConversation(ALICE, CONVERSATION_ID, "Updated");
+
+    expect(Object.keys(result)).toEqual(["conversationId", "title"]);
+    expect(JSON.stringify(result)).not.toContain(ALICE);
+    expect(JSON.stringify(result)).not.toContain("updatedAt");
+  });
+
+  it("confirms the same title can be written twice (idempotent)", async () => {
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Stable",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const first = await renameAiConversation(ALICE, CONVERSATION_ID, "Stable");
+    const second = await renameAiConversation(ALICE, CONVERSATION_ID, "Stable");
+
+    expect(first).toEqual(second);
+    expect(mocks.renameAgentConversation).toHaveBeenCalledTimes(2);
+  });
+
+  it("confirms no provider/network/filesystem operations occur", async () => {
+    mocks.renameAgentConversation.mockResolvedValue({
+      id: CONVERSATION_ID,
+      title: "Safe",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await renameAiConversation(ALICE, CONVERSATION_ID, "Safe");
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
   });
 });

@@ -44,6 +44,7 @@ import {
   deleteAiConversation,
   getAiConversation,
   listAiConversations,
+  renameAiConversation,
 } from "../services/aiConversations.js";
 
 export const aiRoutes = new Hono<AppVariables>()
@@ -90,4 +91,35 @@ export const aiRoutes = new Hono<AppVariables>()
     const user = getCurrentUser(c);
     const conversationId = c.req.param("conversationId");
     return c.json(await deleteAiConversation(user.id, conversationId), 200);
+  })
+  .patch("/conversations/:conversationId", requireAuth, async (c) => {
+    // Identity comes EXCLUSIVELY from the authenticated session. The rename
+    // service scopes the write to this user; a body-supplied identity is
+    // rejected — the route accepts ONLY the expected `title` field and
+    // rejects any extra body fields.
+    const user = getCurrentUser(c);
+    const conversationId = c.req.param("conversationId");
+
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw AppError.badRequest("Request body must be valid JSON.");
+    }
+
+    // Reject unexpected body fields early; only `title` is accepted.
+    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      const keys = Object.keys(raw as Record<string, unknown>);
+      if (keys.length !== 1 || !Object.prototype.hasOwnProperty.call(raw, "title")) {
+        throw AppError.badRequest("Only the title field is accepted.");
+      }
+    } else {
+      throw AppError.badRequest("Request body must be a JSON object.");
+    }
+
+    const body = raw as { title: unknown };
+    return c.json(
+      await renameAiConversation(user.id, conversationId, body.title as string),
+      200,
+    );
   });

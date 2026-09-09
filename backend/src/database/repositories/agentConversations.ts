@@ -647,3 +647,59 @@ function restoreToolResultError(raw: unknown): unknown {
     ),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Rename conversation title (Phase 10.25)
+// ---------------------------------------------------------------------------
+
+/** Stable success response for a title-only rename. */
+export interface AiConversationRenameResult {
+  id: string;
+  title: string;
+  updatedAt: string;
+}
+
+/**
+ * Rename ONE conversation owned by `userId`. Ownership is verified inside the
+ * same transaction that writes — a foreign owner cannot rename a conversation.
+ *
+ * Only the `title` column is modified; userId, timestamps (except updatedAt),
+ * messages, tool calls/results, and provider information are untouched.
+ *
+ * @throws `AgentConversationNotFoundError` when the conversation does not
+ *         exist for `userId` (indistinguishable from foreign ownership).
+ */
+export async function renameAgentConversation(
+  userId: string,
+  conversationId: string,
+  newTitle: string,
+): Promise<AiConversationRenameResult> {
+  return await getDatabase().$transaction(async (tx) => {
+    const owned = await tx.aiConversation.findFirst({
+      where: { id: conversationId, userId },
+      select: { id: true },
+    });
+    if (owned === null) throw new AgentConversationNotFoundError();
+    await tx.aiConversation.update({
+      where: { id: conversationId },
+      data: { title: newTitle },
+    });
+    await bumpUpdatedAt(tx, conversationId);
+
+    const conversation = await tx.aiConversation.findUnique({
+      where: { id: conversationId },
+      select: { id: true, title: true, updatedAt: true },
+    });
+    if (conversation === null) {
+      throw new AgentConversationNotFoundError();
+    }
+    if (conversation.title === null) {
+      throw new AgentConversationNotFoundError();
+    }
+    return {
+      id: conversation.id,
+      title: conversation.title,
+      updatedAt: conversation.updatedAt.toISOString(),
+    };
+  });
+}
