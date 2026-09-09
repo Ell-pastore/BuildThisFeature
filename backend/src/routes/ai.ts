@@ -52,6 +52,14 @@
  *     10.7 repository): ownership scoping, connection-id validation, safe
  *     structured projection, and the 404/400 envelopes all live there — no
  *     conversation/database logic is duplicated here.
+ *   - Phase 10.31: `GET /api/ai/conversations[/:conversationId]` also exposes
+ *     per-conversation turn state — `turnState` (`approved` / `rejected` /
+ *     `expired` / `awaiting-approval` / `completed` / `failed`) plus
+ *     `pendingApprovals` (the still-decidable approvals). Both are derived
+ *     server-side from the owned approvals and the last transcript row via
+ *     the shared `toAiApproval`/`aiConversations` projection; approval
+ *     arguments stay validated identifying references only — no new
+ *     content-bearing fields are ever returned.
  *   - Returned data is safe by construction: persisted transcript text and
  *     structured tool metadata (with exact `fileId`/`versionId` REFERENCES
  *     kept as references only) — never raw file contents, provider secrets,
@@ -75,10 +83,10 @@ import {
   approveToolApproval,
   listPendingToolApprovals,
   rejectToolApproval,
+  toAiApproval,
   ToolApprovalExpiredError,
   ToolApprovalNotFoundError,
   ToolApprovalValidationError,
-  type ToolApprovalRecord,
 } from "../services/aiToolApprovals.js";
 
 // ---------------------------------------------------------------------------
@@ -101,28 +109,6 @@ function mapApprovalError(error: unknown): AppError {
     return AppError.badRequest(error.message);
   }
   throw error;
-}
-
-/**
- * Project a persisted approval record to the safe API representation: ids, tool
- * name, validated arguments, status, timestamps, expiry, and decision
- * timestamp. The record is already safe by construction (validated arguments
- * only — no secrets, per SCHEMA.md §6.8); this merely drops the internal
- * `userId` and converts `Date`s to ISO strings.
- */
-function toApprovalResponse(record: ToolApprovalRecord) {
-  return {
-    id: record.id,
-    conversationId: record.conversationId,
-    messageId: record.messageId,
-    toolName: record.toolName,
-    arguments: record.arguments,
-    status: record.status,
-    createdAt: record.createdAt.toISOString(),
-    updatedAt: record.updatedAt.toISOString(),
-    expiresAt: record.expiresAt.toISOString(),
-    decidedAt: record.decidedAt === null ? null : record.decidedAt.toISOString(),
-  };
 }
 
 export const aiRoutes = new Hono<AppVariables>()
@@ -228,7 +214,7 @@ export const aiRoutes = new Hono<AppVariables>()
     // own pending approvals — never another user's.
     const user = getCurrentUser(c);
     try {
-      return c.json((await listPendingToolApprovals(user.id)).map(toApprovalResponse), 200);
+      return c.json((await listPendingToolApprovals(user.id)).map(toAiApproval), 200);
     } catch (error) {
       throw mapApprovalError(error);
     }
@@ -240,7 +226,7 @@ export const aiRoutes = new Hono<AppVariables>()
     const user = getCurrentUser(c);
     const approvalId = c.req.param("approvalId");
     try {
-      return c.json(toApprovalResponse(await approveToolApproval(user.id, approvalId)), 200);
+      return c.json(toAiApproval(await approveToolApproval(user.id, approvalId)), 200);
     } catch (error) {
       throw mapApprovalError(error);
     }
@@ -252,7 +238,7 @@ export const aiRoutes = new Hono<AppVariables>()
     const user = getCurrentUser(c);
     const approvalId = c.req.param("approvalId");
     try {
-      return c.json(toApprovalResponse(await rejectToolApproval(user.id, approvalId)), 200);
+      return c.json(toAiApproval(await rejectToolApproval(user.id, approvalId)), 200);
     } catch (error) {
       throw mapApprovalError(error);
     }

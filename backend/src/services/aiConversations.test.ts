@@ -22,6 +22,7 @@ import { AppError } from "../core/errors.js";
 import {
   archiveAiConversation,
   deleteAiConversation,
+  deriveConversationTurnState,
   getAiConversation,
   listAiConversations,
   renameAiConversation,
@@ -32,8 +33,10 @@ import {
   type AiConversationDeletionResult,
   type AiConversationRenameResult,
   type AiConversationSummary,
+  type AiTurnState,
 } from "./aiConversations.js";
 import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
+import type { AiToolApproval } from "./aiToolApprovals.js";
 
 const mocks = vi.hoisted(() => ({
   listAgentConversations: vi.fn(),
@@ -42,6 +45,8 @@ const mocks = vi.hoisted(() => ({
   renameAgentConversation: vi.fn(),
   archiveAgentConversation: vi.fn(),
   unarchiveAgentConversation: vi.fn(),
+  listConversationLastMessages: vi.fn(),
+  listConversationToolApprovals: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", async (importOriginal) => {
@@ -55,6 +60,17 @@ vi.mock("../database/repositories/agentConversations.js", async (importOriginal)
     renameAgentConversation: mocks.renameAgentConversation,
     archiveAgentConversation: mocks.archiveAgentConversation,
     unarchiveAgentConversation: mocks.unarchiveAgentConversation,
+    listConversationLastMessages: mocks.listConversationLastMessages,
+  };
+});
+
+vi.mock("./aiToolApprovals.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./aiToolApprovals.js")>();
+  return {
+    ...actual,
+    // The REAL status constants and safe projection stay in the pipeline; only
+    // the ownership-scoped read is stubbed so the tests stay database-free.
+    listConversationToolApprovals: mocks.listConversationToolApprovals,
   };
 });
 
@@ -83,6 +99,10 @@ function storedMessage(overrides?: object): { id: string; role: string; content:
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Turn-state enrichment defaults: no approvals, no last messages. Tests that
+  // care about a specific state override these, exactly like the repository.
+  mocks.listConversationToolApprovals.mockResolvedValue([]);
+  mocks.listConversationLastMessages.mockResolvedValue([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -105,6 +125,10 @@ describe("listAiConversations", () => {
         updatedAt: new Date("2026-01-02T00:00:00Z"),
       },
     ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+    // The first conversation ended with an assistant final reply.
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: "first-conv", messageId: "final-1", role: "assistant", isFinal: true },
+    ]);
 
     const rows: AiConversationSummary[] = await listAiConversations(ALICE);
 
@@ -116,12 +140,23 @@ describe("listAiConversations", () => {
       maxToolRounds: 3,
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-03T00:00:00.000Z",
+      turnState: "completed",
+      pendingApprovals: [],
     });
     expect(rows[1]?.title).toBeNull();
     // The summary is an explicit projection — arbitrary repo columns never
     // reach the response.
     expect(JSON.stringify(rows)).not.toContain("sk-nope");
     expect(JSON.stringify(rows)).not.toContain("userId");
+    // Turn-state enrichment is batched over the listed ids only.
+    expect(mocks.listConversationToolApprovals).toHaveBeenCalledWith(ALICE, [
+      "first-conv",
+      "second-conv",
+    ]);
+    expect(mocks.listConversationLastMessages).toHaveBeenCalledWith(ALICE, [
+      "first-conv",
+      "second-conv",
+    ]);
   });
 
   it("returns a valid empty array for empty history", async () => {
@@ -182,6 +217,9 @@ describe("listAiConversations", () => {
           updatedAt: new Date("2026-01-03T00:00:00Z"),
         },
       ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+      mocks.listConversationLastMessages.mockResolvedValue([
+        { conversationId: CONVERSATION_ID, messageId: "final-1", role: "assistant", isFinal: true },
+      ]);
 
       const rows = await listAiConversations(ALICE, "invoice");
 
@@ -192,6 +230,8 @@ describe("listAiConversations", () => {
           maxToolRounds: 3,
           createdAt: "2026-01-01T00:00:00.000Z",
           updatedAt: "2026-01-03T00:00:00.000Z",
+          turnState: "completed",
+          pendingApprovals: [],
         },
       ]);
       expect(JSON.stringify(rows)).not.toContain("userId");
@@ -889,5 +929,279 @@ describe("unarchiveAiConversation", () => {
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.31 — turn-state derivation and enrichment
+// ---------------------------------------------------------------------------
+
+describe("deriveConversationTurnState (Phase 10.31)", () => {
+  const NOW = new Date("2026-09-09T12:00:00Z");
+
+  function approval(status: string, overrides: Partial<AiToolApproval> = {}): AiToolApproval {
+    return {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      conversationId: CONVERSATION_ID,
+      messageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      toolName: "delete_file",
+      arguments: { path: "/reports/old.txt", permanent: true },
+      status,
+      createdAt: "2026-09-09T10:00:00.000Z",
+      updatedAt: "2026-09-09T11:00:00.000Z",
+      expiresAt: "2026-09-09T13:00:00.000Z",
+      decidedAt: status === "pending" ? null : "2026-09-09T11:05:00.000Z",
+      ...overrides,
+    };
+  }
+
+  function expectState(
+    isFinalReply: boolean,
+    approvals: readonly AiToolApproval[],
+    expected: AiTurnState,
+  ): void {
+    expect(deriveConversationTurnState(isFinalReply, approvals, NOW)).toBe(expected);
+  }
+
+  it("completed — a final reply with no approvals", () => {
+    expectState(true, [], "completed");
+  });
+
+  it("failed — no final reply and no approvals", () => {
+    expectState(false, [], "failed");
+  });
+
+  it("awaiting-approval — an unexpired pending approval wins even with a final reply", () => {
+    expectState(true, [approval("pending")], "awaiting-approval");
+  });
+
+  it("approved — the most recent approval was approved and nothing is pending", () => {
+    expectState(true, [approval("approved")], "approved");
+  });
+
+  it("rejected — the most recent approval was rejected", () => {
+    expectState(false, [approval("rejected")], "rejected");
+  });
+
+  it("expired — the only approval is a pending row whose window elapsed", () => {
+    expectState(true, [approval("pending", { expiresAt: "2026-09-09T11:30:00.000Z" })], "expired");
+  });
+
+  it("recency — updatedAt decides among resolved states", () => {
+    expectState(false, [
+      approval("rejected", { id: "older", updatedAt: "2026-09-09T10:30:00.000Z" }),
+      approval("approved", { id: "newer", updatedAt: "2026-09-09T11:00:00.000Z" }),
+    ], "approved");
+    expectState(false, [
+      approval("approved", { id: "older2", updatedAt: "2026-09-09T10:30:00.000Z" }),
+      approval("rejected", { id: "newer2", updatedAt: "2026-09-09T11:00:00.000Z" }),
+    ], "rejected");
+  });
+
+  it("awaiting-approval wins over a stale expired row when an actionable one exists", () => {
+    expectState(true, [
+      approval("pending", { id: "stale", expiresAt: "2026-09-09T11:30:00.000Z" }),
+      approval("pending", { id: "live", expiresAt: "2026-09-09T14:00:00.000Z" }),
+    ], "awaiting-approval");
+  });
+
+  it("boundary — an expiry instant now == expiresAt is NOT actionable, so it derives expired", () => {
+    expectState(true, [approval("pending", { expiresAt: "2026-09-09T12:00:00.000Z" })], "expired");
+  });
+});
+
+describe("listAiConversations — turn-state enrichment (Phase 10.31)", () => {
+  it("surfaces awaiting-approval with the actionable approvals for the listed members", async () => {
+    mocks.listAgentConversations.mockResolvedValue([
+      {
+        ...BASE_CONVERSATION,
+        updatedAt: new Date("2026-01-03T00:00:00Z"),
+      },
+    ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: CONVERSATION_ID, messageId: "final-1", role: "assistant", isFinal: true },
+    ]);
+    mocks.listConversationToolApprovals.mockResolvedValue([
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        conversationId: CONVERSATION_ID,
+        messageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        toolName: "delete_file",
+        arguments: { path: "/reports/old.txt", permanent: true },
+        status: "pending",
+        createdAt: "2099-01-01T00:00:00.000Z",
+        updatedAt: "2099-01-01T00:00:00.000Z",
+        expiresAt: "2099-01-01T01:00:00.000Z",
+        decidedAt: null,
+      },
+    ]);
+
+    const rows = await listAiConversations(ALICE);
+
+    // The live pending approval outranks the final reply → awaiting-approval,
+    // and the actionable approval is projected (the stale user id is dropped
+    // by the safe projection, which the service test relies on by contract).
+    expect(rows[0]?.turnState).toBe("awaiting-approval");
+    expect(rows[0]?.pendingApprovals).toEqual([
+      expect.objectContaining({ status: "pending", toolName: "delete_file" }),
+    ]);
+  });
+
+  it("derives completed vs failed per conversation from the last message, with no approvals", async () => {
+    mocks.listAgentConversations.mockResolvedValue([
+      {
+        ...BASE_CONVERSATION,
+        id: CONVERSATION_ID,
+        updatedAt: new Date("2026-01-03T00:00:00Z"),
+      },
+      {
+        ...BASE_CONVERSATION,
+        id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        title: null,
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+      },
+    ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: CONVERSATION_ID, messageId: "final-1", role: "assistant", isFinal: true },
+    ]);
+
+    const rows = await listAiConversations(ALICE);
+
+    expect(rows[0]?.turnState).toBe("completed");
+    expect(rows[0]?.pendingApprovals).toEqual([]);
+    // The second conversation's final transcript row is a still-running
+    // assistant fragment (no final reply) → failed, not completed.
+    expect(rows[1]?.turnState).toBe("failed");
+    expect(rows[1]?.pendingApprovals).toEqual([]);
+  });
+});
+
+describe("getAiConversation — turn-state enrichment (Phase 10.31)", () => {
+  const DETAIL_MESSAGES = [
+    storedMessage({ createdAt: new Date("2026-01-01T00:00:01Z") }),
+    storedMessage({
+      id: "msg-2",
+      role: "assistant",
+      content: "Done.",
+      isFinal: true,
+      createdAt: new Date("2026-01-01T00:00:02Z"),
+    }),
+  ];
+
+  it("surfaces an awaiting-approval detail with the actionable approvals", async () => {
+    mocks.getAgentConversation.mockResolvedValue({
+      conversation: BASE_CONVERSATION,
+      messages: DETAIL_MESSAGES,
+    });
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: CONVERSATION_ID, messageId: "msg-2", role: "assistant", isFinal: true },
+    ]);
+    mocks.listConversationToolApprovals.mockResolvedValue([
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        conversationId: CONVERSATION_ID,
+        messageId: "msg-1",
+        toolName: "delete_file",
+        arguments: { path: "/reports/old.txt" },
+        status: "pending",
+        createdAt: "2099-01-01T00:00:00.000Z",
+        updatedAt: "2099-01-01T00:00:00.000Z",
+        expiresAt: "2099-01-01T01:00:00.000Z",
+        decidedAt: null,
+      },
+    ]);
+
+    const detail = await getAiConversation(ALICE, CONVERSATION_ID);
+
+    expect(detail.turnState).toBe("awaiting-approval");
+    expect(detail.pendingApprovals).toHaveLength(1);
+    // The transcript is preserved unmodified.
+    expect(detail.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(mocks.listConversationToolApprovals).toHaveBeenCalledWith(ALICE, [CONVERSATION_ID]);
+    expect(mocks.listConversationLastMessages).toHaveBeenCalledWith(ALICE, [CONVERSATION_ID]);
+  });
+
+  it("reports approved after approve+resume — the consumed approval predates the resumed reply", async () => {
+    mocks.getAgentConversation.mockResolvedValue({
+      conversation: BASE_CONVERSATION,
+      messages: DETAIL_MESSAGES,
+    });
+    mocks.listConversationToolApprovals.mockResolvedValue([
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        conversationId: CONVERSATION_ID,
+        messageId: "msg-0",
+        toolName: "delete_file",
+        arguments: { path: "/reports/old.txt" },
+        status: "approved",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:03.000Z",
+        expiresAt: "2026-01-01T01:00:00.000Z",
+        decidedAt: "2026-01-01T00:00:03.000Z",
+      },
+    ]);
+
+    const detail = await getAiConversation(ALICE, CONVERSATION_ID);
+
+    // Filtering by the last segment's message id would misclassify this as
+    // completed; using ALL of the conversation's approvals keeps it approved.
+    expect(detail.turnState).toBe("approved");
+    expect(detail.pendingApprovals).toEqual([]);
+  });
+
+  it("keeps completed for a final reply with no approvals", async () => {
+    mocks.getAgentConversation.mockResolvedValue({
+      conversation: BASE_CONVERSATION,
+      messages: DETAIL_MESSAGES,
+    });
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: CONVERSATION_ID, messageId: "msg-2", role: "assistant", isFinal: true },
+    ]);
+
+    const detail = await getAiConversation(ALICE, CONVERSATION_ID);
+
+    expect(detail.turnState).toBe("completed");
+    expect(detail.pendingApprovals).toEqual([]);
+  });
+
+  it("reports expired for a pending approval that outlived its window, with nothing actionable", async () => {
+    mocks.getAgentConversation.mockResolvedValue({
+      conversation: BASE_CONVERSATION,
+      messages: DETAIL_MESSAGES,
+    });
+    const expired = new Date(Date.now() - 60_000);
+    mocks.listConversationToolApprovals.mockResolvedValue([
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        conversationId: CONVERSATION_ID,
+        messageId: "msg-1",
+        toolName: "delete_file",
+        arguments: { path: "/reports/old.txt" },
+        status: "pending",
+        createdAt: new Date(Date.now() - 120_000).toISOString(),
+        updatedAt: new Date(Date.now() - 120_000).toISOString(),
+        expiresAt: expired.toISOString(),
+        decidedAt: null,
+      },
+    ]);
+
+    const detail = await getAiConversation(ALICE, CONVERSATION_ID);
+
+    // The stale pending row is NOT surfaced as actionable and the derivation
+    // reduces it to `expired`.
+    expect(detail.turnState).toBe("expired");
+    expect(detail.pendingApprovals).toEqual([]);
+  });
+
+  it("returns the 404 before any approval or last-message query for a foreign/missing conversation", async () => {
+    mocks.getAgentConversation.mockResolvedValue(null);
+
+    await expect(getAiConversation(ALICE, CONVERSATION_ID)).rejects.toMatchObject({
+      status: 404,
+      code: "common/not-found",
+    });
+    expect(mocks.getAgentConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.listConversationToolApprovals).not.toHaveBeenCalled();
+    expect(mocks.listConversationLastMessages).not.toHaveBeenCalled();
   });
 });

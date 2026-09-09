@@ -1,85 +1,89 @@
-# Phase 10.30 — Approval Resume (execution after decision)
+# Phase 10.31 — Conversation turn-state exposure
 
-> Root: dc62d2e `AI: gate privileged tools behind user approval`
-> This phase: `AI: resume instruction after approval`
+> Root: 0eaac09 `AI: resume instruction after approval`
+> This phase: `AI: expose conversation approval state`
 
 ## Goal
 
-Continue an interrupted AI instruction turn after the user approves the gated
-tool call. The approved tool operation — and ONLY it — executes, consumes the
-approval, and the turn resumes inside the approval's own conversation, on the
-conversation's persisted round budget.
+Expose the complete turn state of every AI conversation in the authenticated
+history API so a caller can tell, for each conversation, whether the last
+turn is `completed`, blocked on a decision (`awaiting-approval`), or ended in
+a terminal tool state (`approved` after approve+resume, `rejected`, `expired`)
+or `failed` — plus every currently-actionable pending approval. Both
+`GET /api/ai/conversations` (list) and `GET /api/ai/conversations/:id`
+(detail) now return `turnState` and `pendingApprovals` alongside their
+existing shapes; nothing else about the existing response or error envelopes
+changes.
 
 ## What changed
 
-### Persistence (`ai_tool_approvals`)
-- Repo `consumeToolApproval(userId, approvalId, now)`: a transaction that
-  verifies ownership, requires `approved` status, and backdates `expires_at`
-  to `now`. The DB CHECK forbids a `consumed` status, so the row stays
-  `approved` — but every later executable guard treats the backdated window
-  as expired, so any replay fails closed. Missing/foreign → 404
-  (`ToolApprovalNotFoundError`); not-`approved` → 400
-  (`ToolApprovalAlreadyResolvedError`); elapsed window → sweeps to `expired`
-  then throws `ToolApprovalExpiredError`.
-- Service `consumeToolApproval(userId, approvalId, now = now())`: input
-  validation (non-empty user, UUID id), delegates to the repo.
+### Persistence (`agentConversations`, `aiToolApprovals`)
+- `agentConversations.listConversationLastMessages(userId, conversationIds)`
+  returns each OWNED conversation's LAST transcript row (chronological
+  `(createdAt, id)` order) as `{ conversationId, messageId, role, isFinal }`.
+  Ownership is enforced via the `conversation: { is: { userId } }` relation,
+  so a foreign conversation is indistinguishable from a missing one; empty
+  input returns `[]` without a database read.
+- `aiToolApprovals.listToolApprovalsForConversations(userId, conversationIds)`
+  returns EVERY owned approval across the conversations in ALL states
+  (pending/approved/rejected/expired), oldest-first (`createdAt` asc, then
+  stable `id`). Empty input short-circuits to `[]`.
 
-### Loop seeding (`agentLoop`)
-- `runAgentLoop` accepts optional `initialToolResults` + `initialToolRounds`
-  (non-negative integer). Seeded results are served as already-executed
-  first-request context and the seeded round count is compared against
-  `maxToolRounds` from the very first provider request. Default behavior
-  (omitted) is byte-for-byte unchanged: empty results, round zero.
+### Safe projection (`aiToolApprovals` service)
+- New shared `AiToolApproval` shape + pure `toAiApproval(record)`: ids, tool
+  name, validated arguments, status, ISO timestamps (`createdAt`/`updatedAt`/
+  `expiresAt`), `decidedAt`. The owner's `userId` is dropped (implied by
+  authentication). The route's private `toApprovalResponse` was replaced by
+  this shared projection, so the approvals API and the conversation history
+  API project through ONE content-free representation.
+- Service `listConversationToolApprovals(userId, conversationIds)` wraps the
+  repo read through `toAiApproval`.
 
-### Resume turn (`persistentAgentTurn`)
-- `PersistentTurnInput.resumeApprovalId` enters resume mode.
-- Load phase (before anything runs): resolve the approval OWNED by the
-  authenticated user (missing/foreign → 404); a supplied `conversationId`
-  must equal the approval's own conversation (else 400); assert the approval
-  is currently executable (rejected/expired/consumed → 400, nothing runs);
-  load the approval's conversation and adopt its persisted `maxToolRounds`
-  as this turn's bound. This mirrors Phase 10.28D (approval resolution) and
-  Phase 10.8/10.9 (conversation ownership via `loadAgentConversationState`).
-- Execute phase (inside the turn's try): the approved operation runs ONCE
-  through the UNCHANGED `invokeTool` gate → policy → handler → executor
-  pipeline with the approval's id (`approvalId`) and the approval's own
-  persisted conversation/message context. The caller supplies NO arguments —
-  only the approval's exact stored, validated arguments execute (this is the
-  caller-input-ignored contract of the Phase 10.28C EXECUTE path). The result
-  is recorded as this turn's first round (`callId = approval.id`), the
-  approval is consumed immediately (best-effort, so a consume failure can
-  never mask an already-executed turn), and the eager transcript is committed
-  via the same `beginAgentTurn` → `completeAgentTurn` path as any round.
-- Loop phase: the executed result is seeded (`initialToolResults`,
-  `initialToolRounds: 1`) so the provider's first request already carries the
-  result and the turn continues from round one — bounded by the
-  conversation's persisted `maxToolRounds`, never beyond it. The normal
-  failure compensation (`cancelAgentTurn`) applies on any later failure.
-
-### Instruction contract (`aiInstructions`)
-- Body gains optional `approvalId` (UUID-shaped; malformed → 400; never a
-  substitute for the required `instruction`). Anything else is still
-  rejected — the strict-body rule and identity isolation are unchanged.
-- `mapAgentTurnError` maps resume outcomes for the HTTP layer:
-  - `ToolApprovalNotFoundError` → 404 `common/not-found` (foreign equivalent
-    to missing),
-  - `ToolApprovalExpiredError` / `ToolApprovalNotExecutableError` → 400
-    `common/bad-request` (rejected / expired / consumed never execute),
-  - `AppError.badRequest` (conversation mismatch) and the existing agent-loop
-    → 502 mapping pass through unchanged.
+### Turn-state derivation (`aiConversations` service)
+- New `AiTurnState`: `completed | awaiting-approval | approved | rejected |
+  expired | failed`. `AiConversationSummary` and `AiConversationDetail` gain
+  `turnState` + `pendingApprovals` (extending a shared `AiConversationSummaryBase`).
+- `deriveConversationTurnState(isFinalReply, approvals, now)` — pure and
+  deterministic:
+  1. Any actionable pending approval (status `pending` AND `now < expiresAt`)
+     → `awaiting-approval`; `pendingApprovals` is exactly these actionable
+     rows, so an expired window is never surfaced as decidable.
+  2. Otherwise the approval with the most recent `updatedAt`: `approved` /
+     `rejected` by status, else (a pending row whose window elapsed) →
+     `expired`.
+  3. Otherwise, by the last transcript row: `is_final` assistant reply →
+     `completed`, else `failed`.
+- The derivation uses ALL of the conversation's approvals — deliberately NOT
+  the last user-message's slice — because after approve+resume (10.30) the
+  consumed approval belongs to the EARLIER segment while the persisted reply
+  is from the resumed round; per-segment filtering would misclassify a
+  resumed turn as `completed`.
+- Enrichment is batched (`list` runs `listConversationToolApprovals` +
+  `listConversationLastMessages` in parallel over the listed ids); `detail`
+  enriches AFTER the existing 404 check, so a foreign/missing conversation
+  never triggers an approvals query.
+- No tool execution, provider call, or network ever happens on these paths.
 
 ## Verification
 
-- 890/890 tests pass (`pnpm test`), including new coverage:
-  - `agentLoop.test.ts` — seeding: served as first-round context, counted
-    against the bound (a seeded budget refuses new tools with
-    `AgentLoopError`, nothing executes), negative seed rejected.
-  - `aiInstructionResume.test.ts` (real runtime + real gate/handlers + fake
-    provider and executor, mirrored in-memory repository seams):
-    happy resume (stored args only, round 1, consumed, provider saw the
-    result, no new approvals), rejected → 400, expired → 400, foreign → 404,
-    conversation mismatch → 400, replay prevention (executor runs once across
-    resume AND the invocation boundary), conversation bound → 502 +
-    `cancelAgentTurn`, malformed `approvalId` → 400 before the runtime, and
-    `approvalId` cannot replace `instruction`.
-- `pnpm typecheck` clean; `pnpm build` clean; oxfmt applied.
+- 918/918 tests pass (`pnpm test`), including new coverage:
+  - `agentConversations.test.ts` — `listConversationLastMessages`: last row
+    per OWNED conversation (foreign excluded), owner-only rows, `[]` without
+    a DB call (fake `aiMessage.findMany` extended for `conversationId.in` +
+    relation ownership).
+  - `aiToolApprovals.test.ts` — `listToolApprovalsForConversations`: all
+    states + ownership + oldest-first ordering, `[]` without a DB call.
+  - `aiToolApprovals` service / `aiConversations` service — pure derivation
+    units (recency ordering, exact-expiry boundary, awaiting-beats-stale),
+    list enrichment (batched reads over listed ids, per-conversation
+    completed/failed), detail enrichment (awaiting/approved/expired/404-first
+    no-query), safe `toAiApproval`.
+  - `ai.test.ts` — route-level turn-state passthrough for list + detail:
+    awaiting-approval with the safe projection (no `userId`), approved after
+    resume, rejected, expired (`pendingApprovals: []`), completed default,
+    same 404 envelope, and no tool/provider/network invocation.
+- `pnpm typecheck` clean; `pnpm build` clean.
+- Note on formatting: the workspace `web/node_modules/.bin/oxfmt` (v0.2.0)
+  was verified to corrupt TypeScript (it strips object/type-member
+  separators and flags even untouched committed files), so oxfmt was NOT run;
+  the changes deliberately match the committed code style.

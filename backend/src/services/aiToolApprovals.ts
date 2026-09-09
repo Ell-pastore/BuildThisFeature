@@ -44,6 +44,7 @@ import {
   getPendingToolApproval,
   getToolApproval,
   listPendingToolApprovals as listPendingToolApprovalsRepo,
+  listToolApprovalsForConversations as listToolApprovalsForConversationsRepo,
   resolveToolApproval,
   type ToolApprovalRecord,
 } from "../database/repositories/aiToolApprovals.js";
@@ -440,6 +441,60 @@ export async function consumeToolApproval(
     throw new ToolApprovalValidationError("A valid approvalId is required.");
   }
   return consumeToolApprovalRepo(userId, approvalId, now);
+}
+
+// ---------------------------------------------------------------------------
+// Shared safe projection for the conversation history API (Phase 10.31)
+// ---------------------------------------------------------------------------
+
+/**
+ * Safe, content-free projection of one persisted approval for authenticated
+ * API responses. `arguments` are the validated tool arguments (they may carry
+ * the tool's OWN identifying fields but never raw contents); the owner's
+ * `userId` is deliberately dropped because it is implied by authentication.
+ * Timestamps are ISO strings.
+ */
+export interface AiToolApproval {
+  id: string;
+  conversationId: string;
+  messageId: string;
+  toolName: string;
+  arguments: Readonly<Record<string, unknown>>;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  decidedAt: string | null;
+}
+
+/** Pure projection of a persisted record into the safe API shape. */
+export function toAiApproval(record: ToolApprovalRecord): AiToolApproval {
+  return {
+    id: record.id,
+    conversationId: record.conversationId,
+    messageId: record.messageId,
+    toolName: record.toolName,
+    arguments: record.arguments as Readonly<Record<string, unknown>>,
+    status: record.status,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
+    expiresAt: record.expiresAt.toISOString(),
+    decidedAt: record.decidedAt === null ? null : record.decidedAt.toISOString(),
+  };
+}
+
+/**
+ * List EVERY approval owned by `userId` for `conversationIds` (all states,
+ * oldest-first), projected through `toAiApproval`. Empty input returns `[]`
+ * without a database read.
+ */
+export async function listConversationToolApprovals(
+  userId: string,
+  conversationIds: readonly string[],
+): Promise<AiToolApproval[]> {
+  if (conversationIds.length === 0) return [];
+  const records = await listToolApprovalsForConversationsRepo(userId, conversationIds);
+  return records.map(toAiApproval);
 }
 
 // ---------------------------------------------------------------------------

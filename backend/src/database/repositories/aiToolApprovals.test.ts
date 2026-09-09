@@ -25,6 +25,7 @@ import {
   ToolApprovalStatus,
   createToolApproval,
   getToolApproval,
+  listToolApprovalsForConversations,
   resolveToolApproval,
 } from "./aiToolApprovals.js";
 
@@ -63,6 +64,39 @@ function createFakeDb() {
         const row = approvals.find((a) => matches(a, where));
         return row ?? null;
       }),
+      findMany: vi.fn(
+        async ({
+          where = {},
+          orderBy,
+        }: {
+          where?: AnyRecord;
+          orderBy?: unknown;
+        }): Promise<AnyRecord[]> => {
+          const predicate = (row: AnyRecord): boolean =>
+            Object.entries(where).every(([key, value]) => {
+              if (value !== null && typeof value === "object" && "in" in value) {
+                return Array.isArray(value.in) && value.in.includes(row[key]);
+              }
+              return row[key] === value;
+            });
+          let rows = approvals.filter(predicate);
+          if (orderBy !== undefined) {
+            const clauses = Array.isArray(orderBy) ? orderBy : [orderBy];
+            rows = [...rows].sort((a, b) => {
+              for (const clause of clauses) {
+                for (const [field, direction] of Object.entries(clause as AnyRecord)) {
+                  const av = a[field] instanceof Date ? (a[field] as Date).getTime() : String(a[field]);
+                  const bv = b[field] instanceof Date ? (b[field] as Date).getTime() : String(b[field]);
+                  if (av < bv) return direction === "asc" ? -1 : 1;
+                  if (av > bv) return direction === "asc" ? 1 : -1;
+                }
+              }
+              return 0;
+            });
+          }
+          return rows;
+        },
+      ),
       update: vi.fn(async ({ where, data }: { where: { id: string }; data: AnyRecord }) => {
         const index = approvals.findIndex((a) => a.id === where.id);
         if (index === -1) throw new Error("Approval not found (fake).");
@@ -244,6 +278,60 @@ describe("aiToolApprovals repository", () => {
         resolveToolApproval(ALICE, created.id, ToolApprovalDecision.Approve, EXPIRES),
       ).rejects.toBeInstanceOf(ToolApprovalExpiredError);
       expect(db.approvals[0]!.status).toBe(ToolApprovalStatus.Expired);
+    });
+  });
+
+  describe("listToolApprovalsForConversations (Phase 10.31)", () => {
+    it("returns all OWNED approvals across the conversations, all states, oldest-first", async () => {
+      const first = await createToolApproval(createArgs());
+      const other = await createToolApproval({
+        ...createArgs(),
+        conversationId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        messageId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        now: new Date("2026-09-09T10:03:00.000Z"),
+      });
+      const second = await createToolApproval({
+        ...createArgs(),
+        messageId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        toolName: "write_file",
+        arguments: {},
+        now: new Date("2026-09-09T10:05:00.000Z"),
+      });
+      await resolveToolApproval(
+        ALICE,
+        first.id,
+        ToolApprovalDecision.Approve,
+        new Date("2026-09-09T10:07:00.000Z"),
+      );
+      // A foreign approval for Bob in the SAME conversation must never leak.
+      const foreign = await createToolApproval({
+        ...createArgs(),
+        userId: BOB,
+        now: new Date("2026-09-09T09:00:00.000Z"),
+      });
+
+      const rows = await listToolApprovalsForConversations(ALICE, [
+        CONVERSATION,
+        other.conversationId,
+      ]);
+
+      expect(rows.map((r) => r.id)).not.toContain(foreign.id);
+      expect(rows.every((r) => r.userId === ALICE)).toBe(true);
+      // All states are returned (approved + pending), newest decision included.
+      expect(rows.map((r) => r.status)).toEqual([
+        ToolApprovalStatus.Approved,
+        ToolApprovalStatus.Pending,
+        ToolApprovalStatus.Pending,
+      ]);
+      // Oldest-first, deterministic.
+      expect(rows.map((r) => r.createdAt.getTime())).toEqual(
+        [first.createdAt, other.createdAt, second.createdAt].map((d) => d.getTime()),
+      );
+    });
+
+    it("returns [] for an empty conversation list without touching the database", async () => {
+      await expect(listToolApprovalsForConversations(ALICE, [])).resolves.toEqual([]);
+      expect(mocks.getDatabase).not.toHaveBeenCalled();
     });
   });
 });

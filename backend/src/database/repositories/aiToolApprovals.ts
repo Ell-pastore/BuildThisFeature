@@ -275,6 +275,30 @@ export async function listPendingToolApprovals(userId: string): Promise<ToolAppr
   return rows.map(toRecord);
 }
 
+/**
+ * List EVERY approval OWNED by `userId` across the given conversations
+ * (Phase 10.31), in ALL states (`pending`/`approved`/`rejected`/`expired`),
+ * oldest-first (`createdAt` asc, then stable id). Used by the conversation
+ * history service to expose per-conversation turn state and actionable
+ * pending approvals. Ownership is structural (`userId`); an empty
+ * conversation list returns `[]` without touching the database.
+ */
+export async function listToolApprovalsForConversations(
+  userId: string,
+  conversationIds: readonly string[],
+): Promise<ToolApprovalRecord[]> {
+  if (conversationIds.length === 0) return [];
+  const db = getDatabase();
+  const rows = await db.aiToolApproval.findMany({
+    where: {
+      userId,
+      conversationId: { in: [...conversationIds] },
+    },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  return rows.map(toRecord);
+}
+
 // ---------------------------------------------------------------------------
 // Resolve
 // ---------------------------------------------------------------------------

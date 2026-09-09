@@ -833,6 +833,55 @@ export async function getAgentConversation(
 }
 
 // ---------------------------------------------------------------------------
+// Last-turn per conversation (Phase 10.31)
+// ---------------------------------------------------------------------------
+
+/** One owned conversation's LAST persisted transcript row. */
+export interface StoredLastMessage {
+  conversationId: string;
+  messageId: string;
+  role: string;
+  isFinal: boolean;
+}
+
+/**
+ * Return each owned conversation's LAST persisted message (chronological
+ * `(createdAt, id)` order), only for conversations belonging to `userId`.
+ * A conversation with no transcript rows (or not owned by `userId`) is
+ * omitted entirely — ownership is enforced via the `conversation` relation,
+ * so a foreign conversation is indistinguishable from a missing one. Used by
+ * the history service (Phase 10.31) to distinguish a completed turn (ends
+ * with an `is_final` reply) from a failed/incomplete one.
+ */
+export async function listConversationLastMessages(
+  userId: string,
+  conversationIds: readonly string[],
+): Promise<StoredLastMessage[]> {
+  if (conversationIds.length === 0) return [];
+  const db = getDatabase();
+  const rows = await db.aiMessage.findMany({
+    where: {
+      conversationId: { in: [...conversationIds] },
+      conversation: { is: { userId } },
+    },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { id: true, role: true, isFinal: true, conversationId: true },
+  });
+  const lastByConversation = new Map<string, StoredLastMessage>();
+  for (const row of rows) {
+    // Ascending order means each overwrite keeps the LAST row per
+    // conversation.
+    lastByConversation.set(row.conversationId, {
+      conversationId: row.conversationId,
+      messageId: row.id,
+      role: row.role,
+      isFinal: row.isFinal,
+    });
+  }
+  return [...lastByConversation.values()];
+}
+
+// ---------------------------------------------------------------------------
 // Delete (Phase 10.24)
 // ---------------------------------------------------------------------------
 

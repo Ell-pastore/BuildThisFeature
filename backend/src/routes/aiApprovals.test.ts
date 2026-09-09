@@ -71,14 +71,20 @@ vi.mock("../database/client.js", () => ({
   databaseNow: mocks.databaseNow,
 }));
 
-vi.mock("../services/aiToolApprovals.js", () => ({
-  approveToolApproval: mocks.approveToolApproval,
-  rejectToolApproval: mocks.rejectToolApproval,
-  listPendingToolApprovals: mocks.listPendingToolApprovals,
-  ToolApprovalValidationError: mocks.ToolApprovalValidationError,
-  ToolApprovalNotFoundError: mocks.ToolApprovalNotFoundError,
-  ToolApprovalExpiredError: mocks.ToolApprovalExpiredError,
-}));
+vi.mock("../services/aiToolApprovals.js", async (importOriginal) => {
+  return {
+    // Spread the REAL module so the route resolves the shared content-free
+    // `toAiApproval` projection (Phase 10.31) while only the three service
+    // entry points and the `instanceof`-matched error classes are stubbed.
+    ...(await importOriginal<typeof import("../services/aiToolApprovals.js")>()),
+    approveToolApproval: mocks.approveToolApproval,
+    rejectToolApproval: mocks.rejectToolApproval,
+    listPendingToolApprovals: mocks.listPendingToolApprovals,
+    ToolApprovalValidationError: mocks.ToolApprovalValidationError,
+    ToolApprovalNotFoundError: mocks.ToolApprovalNotFoundError,
+    ToolApprovalExpiredError: mocks.ToolApprovalExpiredError,
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures

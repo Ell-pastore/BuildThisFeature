@@ -38,6 +38,7 @@ import type {
   AiConversationDetail,
   AiConversationSummary,
 } from "../services/aiConversations.js";
+import type { AiToolApproval } from "../services/aiToolApprovals.js";
 import { validateConversationId } from "../services/conversationId.js";
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,8 @@ const CANNED_SUMMARY: AiConversationSummary = {
   maxToolRounds: 3,
   createdAt: "2026-01-01T00:00:00.000Z",
   updatedAt: "2026-01-03T00:00:00.000Z",
+  turnState: "completed",
+  pendingApprovals: [],
 };
 
 const CANNED_DETAIL: AiConversationDetail = {
@@ -1773,5 +1776,149 @@ describe("archive/unarchive — no filesystem or data mutation beyond the conver
     expect(JSON.stringify(body)).not.toContain("versionId");
     expect(JSON.stringify(body)).not.toContain("message");
     expect(mocks.archiveAiConversation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("GET /api/ai/conversations — turn state (Phase 10.31)", () => {
+  const APPROVAL_FIXTURE = (overrides: Partial<AiToolApproval> = {}): AiToolApproval => ({
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    conversationId: HISTORY_CONVERSATION_ID,
+    messageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    toolName: "delete_file",
+    arguments: { path: "/reports/old.txt", permanent: true },
+    status: "pending",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    decidedAt: null,
+    ...overrides,
+  });
+
+  it("exposes awaiting-approval plus the actionable approval projection (no userId, ISO timestamps)", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.listAiConversations.mockResolvedValueOnce([
+      {
+        ...CANNED_SUMMARY,
+        turnState: "awaiting-approval",
+        pendingApprovals: [APPROVAL_FIXTURE()],
+      },
+    ]);
+
+    const body = (await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json()) as AiConversationSummary[];
+
+    expect(body[0]!.turnState).toBe("awaiting-approval");
+    expect(body[0]!.pendingApprovals).toEqual([APPROVAL_FIXTURE()]);
+    // Safe projection: the owner's id is never returned.
+    expect(JSON.stringify(body[0]!.pendingApprovals)).not.toContain(ACTIVE_USER.id);
+  });
+
+  it("reports an approved turn after approve+resume even when a NEW round produced a reply", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.getAiConversation.mockResolvedValueOnce({
+      ...CANNED_DETAIL,
+      // The consumed approval belongs to the EARLIER segment; the persisted
+      // assistant reply is from the resumed round — the turn is still
+      // `approved`, and nothing remains actionable.
+      turnState: "approved",
+      pendingApprovals: [],
+    });
+
+    const body = (await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "GET", headers: authorizedHeaders() },
+      )
+    ).json()) as AiConversationDetail;
+
+    expect(body.turnState).toBe("approved");
+    expect(body.pendingApprovals).toEqual([]);
+  });
+
+  it("reports a rejected turn without any actionable approvals", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.listAiConversations.mockResolvedValueOnce([
+      {
+        ...CANNED_SUMMARY,
+        turnState: "rejected",
+        pendingApprovals: [],
+      },
+    ]);
+
+    const body = (await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json()) as AiConversationSummary[];
+
+    expect(body[0]!.turnState).toBe("rejected");
+    expect(body[0]!.pendingApprovals).toEqual([]);
+  });
+
+  it("reports expired for a pending approval that outlived its window — with nothing actionable", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.listAiConversations.mockResolvedValueOnce([
+      {
+        ...CANNED_SUMMARY,
+        turnState: "expired",
+        // Expiry is derived server-side; the API never surfaces the stale
+        // pending row as actionable.
+        pendingApprovals: [],
+      },
+    ]);
+
+    const body = (await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json()) as AiConversationSummary[];
+
+    expect(body[0]!.turnState).toBe("expired");
+    expect(body[0]!.pendingApprovals).toEqual([]);
+  });
+
+  it("keeps completed (final reply, no approvals) as the default shape for list and detail", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const list = (await (
+      await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() })
+    ).json()) as AiConversationSummary[];
+    const detail = (await (
+      await makeApp().request(
+        `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+        { method: "GET", headers: authorizedHeaders() },
+      )
+    ).json()) as AiConversationDetail;
+
+    expect(list[0]!.turnState).toBe("completed");
+    expect(list[0]!.pendingApprovals).toEqual([]);
+    expect(detail.turnState).toBe("completed");
+    expect(detail.pendingApprovals).toEqual([]);
+  });
+
+  it("keeps the same 404 envelope when the turn-state detail is foreign or missing", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations/99999999-9999-9999-9999-999999999999",
+      { method: "GET", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(404);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/not-found", message: "Agent conversation was not found." },
+    });
+  });
+
+  it("exposes turn state without invoking a tool, provider, or network", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+
+    await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() });
+    await makeApp().request(
+      `/api/ai/conversations/${HISTORY_CONVERSATION_ID}`,
+      { method: "GET", headers: authorizedHeaders() },
+    );
+
+    expect(mocks.runAiInstruction).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

@@ -45,24 +45,64 @@ import {
   deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
+  listConversationLastMessages,
   renameAgentConversation,
   unarchiveAgentConversation,
   type StoredConversation,
   type StoredMessageRecord,
 } from "../database/repositories/agentConversations.js";
+import {
+  ToolApprovalStatus,
+  listConversationToolApprovals,
+  type AiToolApproval,
+} from "./aiToolApprovals.js";
 import { validateConversationId } from "./conversationId.js";
 
 // ---------------------------------------------------------------------------
 // Safe response types
 // ---------------------------------------------------------------------------
 
-/** One owned conversation, newest-first (metadata only — no messages). */
-export interface AiConversationSummary {
+/**
+ * Turn-state derived from the conversation's approvals and last transcript
+ * row (Phase 10.31):
+ *
+ *   - `awaiting-approval` — at least one approval with an UNEXPIRED window is
+ *     still `pending`: the turn is blocked at a decision.
+ *   - `approved` | `rejected` | `expired` — the state of the most recent
+ *     approval decision (by `updatedAt`), including a `pending` row whose
+ *     window has elapsed (`expired`). After approve+resume (10.30) the turn
+ *     is `approved` even where the latest transcript row belongs to a NEW
+ *     round.
+ *   - `completed` — the last transcript row is an `is_final` reply and there
+ *     is nothing pending.
+ *   - `failed` — the turn ended without a final reply and nothing pending.
+ */
+export type AiTurnState =
+  | "completed"
+  | "awaiting-approval"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "failed";
+
+/** The metadata-only core shared by the summary and detail shapes. */
+export interface AiConversationSummaryBase {
   id: string;
   title: string | null;
   maxToolRounds: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * One owned conversation, newest-first — metadata plus the derived turn state
+ * and its actionable approvals (Phase 10.31).
+ */
+export interface AiConversationSummary extends AiConversationSummaryBase {
+  /** Derived terminal/pending state of the conversation's last turn. */
+  turnState: AiTurnState;
+  /** Approvals still awaiting a decision (`pending`, unexpired), oldest-first. */
+  pendingApprovals: readonly AiToolApproval[];
 }
 
 /** A persisted tool-call intent for one provider round. */
@@ -101,13 +141,10 @@ export interface AiHistoryMessage {
   toolResults?: readonly AiHistoryToolResult[];
 }
 
-/** One owned conversation with its persisted transcript. */
-export interface AiConversationDetail {
-  id: string;
-  title: string | null;
-  maxToolRounds: number;
-  createdAt: string;
-  updatedAt: string;
+/** One owned conversation with its persisted transcript and turn state. */
+export interface AiConversationDetail extends AiConversationSummaryBase {
+  turnState: AiTurnState;
+  pendingApprovals: readonly AiToolApproval[];
   messages: readonly AiHistoryMessage[];
 }
 
@@ -233,7 +270,7 @@ function toSafeToolCall(raw: unknown): AiHistoryToolCall {
 // Mapping
 // ---------------------------------------------------------------------------
 
-function toSummary(conversation: StoredConversation): AiConversationSummary {
+function toSummaryBase(conversation: StoredConversation): AiConversationSummaryBase {
   return {
     id: conversation.id,
     title: conversation.title,
@@ -260,6 +297,111 @@ function toMessage(message: StoredMessageRecord): AiHistoryMessage {
           ),
         }
       : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Turn-state derivation (Phase 10.31)
+// ---------------------------------------------------------------------------
+
+/**
+ * Approvals that still require a decision: `pending` AND inside their window
+ * (`now < expiresAt`). A pending row that outlived its window is NOT
+ * actionable — it is derived as `expired`, never as pending. Pure.
+ */
+export function actionablePendingApprovals(
+  approvals: readonly AiToolApproval[],
+  now: Date,
+): AiToolApproval[] {
+  return approvals.filter(
+    (approval) =>
+      approval.status === ToolApprovalStatus.Pending &&
+      now.getTime() < new Date(approval.expiresAt).getTime(),
+  );
+}
+
+/**
+ * The effective rank of an approval: `pending` when the window has elapsed
+ * still derives as `expired` (the only `pending` that is NOT actionable).
+ */
+function approvalRank(approval: AiToolApproval): string {
+  return approval.status;
+}
+
+/**
+ * Derive a conversation's turn state (Phase 10.31).
+ *
+ * The inputs are the conversation's LAST transcript row (`isFinalReply`) and
+ * ALL of its approvals — deliberately not per-segment approvals, because after
+ * approve+resume (10.30) the consumed approval's `messageId` belongs to the
+ * EARLIER segment while the resumed round is a NEW message. Filtering by the
+ * last user-message segment would misclassify a resumed turn as `completed`.
+ *
+ * Resolution order (pure, deterministic):
+ *
+ *   1. Any actionable (unexpired) pending approval → `awaiting-approval`;
+ *   2. otherwise the approval with the most recent `updatedAt`:
+ *      `approve` → `approved`, `reject` → `rejected`, else (pending + window
+ *      elapsed) → `expired`;
+ *   3. otherwise (no approvals at all): `completed` when the turn ended with
+ *      an `is_final` reply, else `failed`.
+ */
+export function deriveConversationTurnState(
+  isFinalReply: boolean,
+  approvals: readonly AiToolApproval[],
+  now: Date,
+): AiTurnState {
+  if (actionablePendingApprovals(approvals, now).length > 0) return "awaiting-approval";
+  if (approvals.length > 0) {
+    const mostRecent = [...approvals].sort(
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+    )[0];
+    switch (approvalRank(mostRecent!)) {
+      case ToolApprovalStatus.Approved:
+        return "approved";
+      case ToolApprovalStatus.Rejected:
+        return "rejected";
+      default:
+        return "expired";
+    }
+  }
+  return isFinalReply ? "completed" : "failed";
+}
+
+/** Index approvals by conversationId for batch enrichment. Pure. */
+export function groupApprovalsByConversation(
+  approvals: readonly AiToolApproval[],
+): ReadonlyMap<string, readonly AiToolApproval[]> {
+  const grouped = new Map<string, AiToolApproval[]>();
+  for (const approval of approvals) {
+    const list = grouped.get(approval.conversationId);
+    if (list === undefined) {
+      grouped.set(approval.conversationId, [approval]);
+    } else {
+      list.push(approval);
+    }
+  }
+  return grouped;
+}
+
+/**
+ * Attach `turnState` + `pendingApprovals` to a summary/detail base, given its
+ * approvals and whether its last transcript row is an assistant `is_final`
+ * reply. Pure.
+ */
+export function enrichTurnState<Base extends AiConversationSummaryBase>(
+  base: Base,
+  isFinalReply: boolean,
+  approvals: readonly AiToolApproval[],
+  now: Date,
+): Base & {
+  turnState: AiTurnState;
+  pendingApprovals: readonly AiToolApproval[];
+} {
+  return {
+    ...base,
+    turnState: deriveConversationTurnState(isFinalReply, approvals, now),
+    pendingApprovals: actionablePendingApprovals(approvals, now),
   };
 }
 
@@ -302,7 +444,27 @@ export async function listAiConversations(
     titleQuery === undefined
       ? await listAgentConversations(userId)
       : await listAgentConversations(userId, titleQuery);
-  return conversations.map(toSummary);
+  const summaries = conversations.map((conversation) => toSummaryBase(conversation));
+  if (summaries.length === 0) return [];
+  const conversationIds = summaries.map((summary) => summary.id);
+  const [approvals, lastMessages] = await Promise.all([
+    listConversationToolApprovals(userId, conversationIds),
+    listConversationLastMessages(userId, conversationIds),
+  ]);
+  const approvalsByConversation = groupApprovalsByConversation(approvals);
+  const finalReplyByConversation = new Map<string, boolean>();
+  for (const row of lastMessages) {
+    finalReplyByConversation.set(row.conversationId, row.role === "assistant" && row.isFinal);
+  }
+  const now = new Date();
+  return summaries.map((summary) =>
+    enrichTurnState(
+      summary,
+      finalReplyByConversation.get(summary.id) ?? false,
+      approvalsByConversation.get(summary.id) ?? [],
+      now,
+    ),
+  );
 }
 
 /**
@@ -323,10 +485,20 @@ export async function getAiConversation(
   if (detail === null) {
     throw AppError.notFound("Agent conversation");
   }
-  return {
-    ...toSummary(detail.conversation),
-    messages: detail.messages.map(toMessage),
-  };
+  const [approvals, lastMessages] = await Promise.all([
+    listConversationToolApprovals(userId, [conversationId]),
+    listConversationLastMessages(userId, [conversationId]),
+  ]);
+  const last = lastMessages[0];
+  return enrichTurnState(
+    {
+      ...toSummaryBase(detail.conversation),
+      messages: detail.messages.map(toMessage),
+    },
+    last !== undefined && last.role === "assistant" && last.isFinal,
+    approvals,
+    new Date(),
+  );
 }
 
 // ---------------------------------------------------------------------------

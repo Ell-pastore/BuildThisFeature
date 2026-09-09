@@ -32,6 +32,7 @@ import {
   deleteAgentConversation,
   getAgentConversation,
   listAgentConversations,
+  listConversationLastMessages,
   loadAgentConversationState,
   persistAgentTurn,
   reconstructConversationState,
@@ -186,14 +187,19 @@ function createFakeDb() {
         return row;
       }),
       findMany: vi.fn(
-        async ({
-          where,
-          orderBy,
-        }: {
-          where?: { conversationId?: string };
-          orderBy?: AnyRecord[];
-        }) => {
-          const rows = messages.filter((m) => m.conversationId === where?.conversationId);
+        async ({ where, orderBy }: { where?: AnyRecord; orderBy?: AnyRecord[] }) => {
+          const idIn = (where?.conversationId as { in?: unknown[] } | undefined)?.in;
+          const idEq = typeof where?.conversationId === "string" ? where.conversationId : undefined;
+          const ownerId = (where?.conversation as { is?: { userId?: string } } | undefined)?.is
+            ?.userId;
+          const rows = messages.filter(
+            (m) =>
+              (idIn !== undefined
+                ? idIn.includes(m.conversationId)
+                : idEq === undefined || m.conversationId === idEq) &&
+              (ownerId === undefined ||
+                conversations.some((c) => c.id === m.conversationId && c.userId === ownerId)),
+          );
           return sortBy(rows, orderBy);
         },
       ),
@@ -1495,6 +1501,56 @@ describe("agentConversations repository", () => {
       expect(loaded.messages.every((m) => m.kind === "provider")).toBe(true);
       expect(loaded.finalText).toBeUndefined();
       expect(loaded.toolRounds).toBe(0);
+    });
+  });
+
+  describe("listConversationLastMessages (Phase 10.31)", () => {
+    it("returns each OWNED conversation's LAST transcript row", async () => {
+      const created = await createAgentConversation({
+        userId: ALICE,
+        instruction: "Summarize.",
+        maxToolRounds: 3,
+      });
+      await appendAgentTurn(ALICE, created.id, { text: "Working…" });
+      await appendAgentFinal(ALICE, created.id, "Done.");
+      // Bob's conversation is foreign to Alice and must be excluded even
+      // though its id is in the requested list.
+      const foreign = await createAgentConversation({
+        userId: BOB,
+        instruction: "Yo",
+        maxToolRounds: 3,
+      });
+      await appendAgentTurn(BOB, foreign.id, { text: "hey" });
+
+      const rows = await listConversationLastMessages(ALICE, [created.id, foreign.id]);
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        conversationId: created.id,
+        role: "assistant",
+        isFinal: true,
+        messageId: expect.any(String),
+      });
+    });
+
+    it("returns rows only for the conversation's real owner", async () => {
+      const created = await createAgentConversation({
+        userId: BOB,
+        instruction: "Yo",
+        maxToolRounds: 3,
+      });
+      await appendAgentFinal(BOB, created.id, "Later.");
+
+      // Alice does not own the conversation → indistinguishable from absent.
+      expect(await listConversationLastMessages(ALICE, [created.id])).toEqual([]);
+      const owned = await listConversationLastMessages(BOB, [created.id]);
+      expect(owned).toHaveLength(1);
+      expect(owned[0]).toMatchObject({ conversationId: created.id, isFinal: true });
+    });
+
+    it("returns [] for an empty conversation list without touching the database", async () => {
+      await expect(listConversationLastMessages(ALICE, [])).resolves.toEqual([]);
+      expect(mocks.getDatabase).not.toHaveBeenCalled();
     });
   });
 });
