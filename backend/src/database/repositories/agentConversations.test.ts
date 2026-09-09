@@ -110,10 +110,18 @@ function createFakeDb() {
         return row;
       }),
       findMany: vi.fn(async ({ where = {}, orderBy }: { where?: AnyRecord; orderBy?: AnyRecord[] }) => {
+        const titleFilter =
+          where.title !== undefined && typeof where.title === "object" && where.title !== null
+            ? (where.title as { contains?: unknown })
+            : undefined;
         const rows = conversations.filter(
           (c) =>
             (where.userId === undefined || c.userId === where.userId) &&
-            (where.archivedAt === undefined || c.archivedAt === where.archivedAt),
+            (where.archivedAt === undefined || c.archivedAt === where.archivedAt) &&
+            (titleFilter === undefined ||
+              titleFilter.contains === undefined ||
+              // Mirrors Prisma `contains` + `mode: "insensitive"` (ILIKE).
+              String(c.title ?? "").toLowerCase().includes(String(titleFilter.contains).toLowerCase())),
         );
         return sortBy(rows, orderBy);
       }),
@@ -740,6 +748,102 @@ describe("agentConversations repository", () => {
       expect(rows[0]?.createdAt).toEqual(new Date(1_705_000_000_001));
       expect(rows[0]?.updatedAt).toEqual(new Date(1_705_000_000_001));
       expect(typeof rows[0]?.id).toBe("string");
+    });
+
+    describe("— title search (Phase 10.27)", () => {
+      it("filters by a case-insensitive title substring, newest-first", async () => {
+        const quarterId = await seedConversation(ALICE, 1_705_000_000_001, "Quarterly report");
+        const invoiceId = await seedConversation(ALICE, 1_705_000_000_002, "Invoice review");
+        const energyId = await seedConversation(ALICE, 1_705_000_000_003, "Energy invoices");
+
+        const rows = await listAgentConversations(ALICE, "invoice");
+
+        // Partial ("invoices") + case-insensitive ("Invoice") matches; only
+        // the non-matching "Quarterly report" is excluded. Order stays
+        // deterministic newest-first.
+        expect(rows.map((r) => r.id)).toEqual([energyId, invoiceId]);
+        expect(rows.map((r) => r.id)).not.toContain(quarterId);
+      });
+
+      it("matches regardless of the query's letter case", async () => {
+        const titleId = await seedConversation(ALICE, 1_705_000_000_001, "INVOICE REVIEW");
+
+        const lower = await listAgentConversations(ALICE, "invoice");
+        const upper = await listAgentConversations(ALICE, "INVOICE");
+
+        expect(lower.map((r) => r.id)).toEqual([titleId]);
+        expect(upper.map((r) => r.id)).toEqual([titleId]);
+      });
+
+      it("matches a partial substring anywhere in the title (contains)", async () => {
+        const id = await seedConversation(ALICE, 1_705_000_000_001, "Plan the annual review");
+
+        const rows = await listAgentConversations(ALICE, "nnu");
+
+        expect(rows.map((r) => r.id)).toEqual([id]);
+      });
+
+      it("returns an empty list when no title matches", async () => {
+        await seedConversation(ALICE, 1_705_000_000_001, "Invoice review");
+
+        expect(await listAgentConversations(ALICE, "zebra")).toEqual([]);
+      });
+
+      it("only matches titles — message contents, tool results, and file references are never searched", async () => {
+        const created = await createAgentConversation({
+          userId: ALICE,
+          instruction: "The invoice audit found issues in the vault.", // message content
+          maxToolRounds: 3,
+          title: "Plans",
+        });
+        await appendAgentTurn(ALICE, created.id, {
+          text: "routes to vault://secret",
+          toolCalls: [{ id: "c1", toolName: "read_file_metadata", input: { fileId: "f-1", versionId: "v-1" } }],
+          toolResults: [
+            { ok: true, callId: "c1", data: { name: "bill.pdf", sizeBytes: 5, contents: "S3CRET BODY" } },
+          ],
+        });
+
+        expect(await listAgentConversations(ALICE, "invoice")).toEqual([]);
+        expect(await listAgentConversations(ALICE, "vault")).toEqual([]);
+        expect(await listAgentConversations(ALICE, "bill")).toEqual([]);
+        expect(await listAgentConversations(ALICE, "S3CRET")).toEqual([]);
+        // The conversation is still listed when its OWN title matches.
+        const byTitle = await listAgentConversations(ALICE, "Plans");
+        expect(byTitle.map((r) => r.id)).toEqual([created.id]);
+      });
+
+      it("is scoped to the caller — another user's matching title is never returned", async () => {
+        const aliceId = await seedConversation(ALICE, 1_705_000_000_002, "Invoice review");
+        const bobId = await seedConversation(BOB, 1_705_000_000_001, "Invoice review too");
+
+        const asAlice = await listAgentConversations(ALICE, "invoice");
+        const asBob = await listAgentConversations(BOB, "invoice");
+
+        expect(asAlice.map((r) => r.id)).toEqual([aliceId]);
+        expect(asBob.map((r) => r.id)).toEqual([bobId]);
+      });
+
+      it("excludes archived conversations from search results", async () => {
+        const archivedId = await seedConversation(ALICE, 1_705_000_000_002, "Archived invoice");
+        const activeId = await seedConversation(ALICE, 1_705_000_000_001, "Active invoice");
+        await archiveAgentConversation(ALICE, archivedId, new Date(1_705_000_001_500));
+
+        const rows = await listAgentConversations(ALICE, "invoice");
+
+        expect(rows.map((r) => r.id)).toEqual([activeId]);
+      });
+
+      it("treats an empty title query like no query (defensive passthrough)", async () => {
+        await seedConversation(ALICE, 1_705_000_000_001, "Invoice review");
+        await seedConversation(ALICE, 1_705_000_000_002, "Quarterly report");
+
+        const withQuery = await listAgentConversations(ALICE, "");
+        const withoutQuery = await listAgentConversations(ALICE);
+
+        expect(withQuery).toEqual(withoutQuery);
+        expect(withQuery).toHaveLength(2);
+      });
     });
   });
 

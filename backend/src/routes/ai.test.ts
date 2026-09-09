@@ -218,8 +218,10 @@ beforeEach(() => {
       };
     },
   );
-  mocks.listAiConversations.mockImplementation(async (userId: string) => {
-    // The route consults ONLY the session user; canned ownership check.
+  mocks.listAiConversations.mockImplementation(async (userId: string, _q?: string) => {
+    // The route consults ONLY the session user; canned ownership check. The
+    // optional Phase 10.27 search query is forwarded to (and validated by) the
+    // real service — this route-level mock only proves passthrough + scoping.
     if (userId !== ACTIVE_USER.id) return [];
     return [CANNED_SUMMARY];
   });
@@ -683,6 +685,129 @@ describe("GET /api/ai/conversations — authenticated", () => {
     ).json()) as AiConversationSummary[];
 
     expect(body).toEqual([]);
+  });
+});
+
+describe("GET /api/ai/conversations — title search (Phase 10.27)", () => {
+  it("forwards a present q to the service for the authenticated session user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request("/api/ai/conversations?q=Invoice%20Review", {
+      method: "GET",
+      headers: authorizedHeaders(),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AiConversationSummary[];
+    expect(Array.isArray(body)).toBe(true);
+    // The route forwards the raw query string; trimming/validation/search live
+    // in the service/repository.
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id, "Invoice Review");
+  });
+
+  it("decodes and forwards URL-encoded search terms", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request("/api/ai/conversations?q=100%25%20done%26more", {
+      method: "GET",
+      headers: authorizedHeaders(),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id, "100% done&more");
+  });
+
+  it("keeps searching scoped to the SESSION user even with a query present", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await makeApp().request(
+      "/api/ai/conversations?q=Invoice&userId=99999999-9999-9999-9999-999999999999",
+      { method: "GET", headers: authorizedHeaders() },
+    );
+
+    expect(res.status).toBe(200);
+    // Request-supplied identity is ignored entirely.
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id, "Invoice");
+  });
+
+  it("returns the empty list for a user whose search matches nothing", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(OTHER_ACTIVE_USER));
+
+    const body = (await (
+      await makeApp().request("/api/ai/conversations?q=zebra", {
+        method: "GET",
+        headers: authorizedHeaders(),
+      })
+    ).json()) as AiConversationSummary[];
+
+    expect(body).toEqual([]);
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(OTHER_ACTIVE_USER.id, "zebra");
+  });
+
+  it("passes an empty and a whitespace-only q through untouched", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    for (const q of ["", "%20%20"]) {
+      const res = await makeApp().request(`/api/ai/conversations?q=${q}`, {
+        method: "GET",
+        headers: authorizedHeaders(),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    // The route never trims; the service turns empty/whitespace into "no query".
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id, "");
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id, "  ");
+  });
+
+  it("calls the service with NO query argument when q is absent", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    await makeApp().request("/api/ai/conversations", { method: "GET", headers: authorizedHeaders() });
+
+    expect(mocks.listAiConversations).toHaveBeenCalledWith(ACTIVE_USER.id);
+  });
+
+  it("returns the existing generic 401 for search requests without a session", async () => {
+    const res = await makeApp().request("/api/ai/conversations?q=Invoice", {
+      headers: { authorization: "Bearer unknown" },
+    });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    expect(mocks.listAiConversations).not.toHaveBeenCalled();
+  });
+
+  it("reduces an unexpected search failure to internal/error without leaks", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.listAiConversations.mockRejectedValueOnce(
+      new Error("SECRET credential handle credential-77 leaked at /Users/builder/src/search.ts:3"),
+    );
+
+    const res = await (await makeApp().request("/api/ai/conversations?q=Invoice", {
+      method: "GET",
+      headers: authorizedHeaders(),
+    })).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("credential-77");
+    expect(JSON.stringify(res)).not.toContain("/Users/builder");
+  });
+
+  it("performs no provider or network call while searching", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const res = await makeApp().request("/api/ai/conversations?q=Invoice", {
+      method: "GET",
+      headers: authorizedHeaders(),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
   });
 });
 

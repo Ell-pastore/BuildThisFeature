@@ -271,9 +271,37 @@ function toMessage(message: StoredMessageRecord): AiHistoryMessage {
  * List the authenticated user's conversations, newest-first (deterministic:
  * `updatedAt` desc, then `createdAt` desc, then stable id). Empty history
  * returns a valid empty array.
+ *
+ * Optional Phase 10.27 `query` searches the user's OWNED non-archived
+ * conversations by title (case-insensitive substring). The `query` is
+ * trimmed; empty/whitespace-only input behaves exactly like no query. The
+ * repository layer owns the `contains` filter — the service only normalizes
+ * and validates the input. Search never touches message contents, tool
+ * results, or file contents, and archived conversations stay excluded.
+ *
+ * @throws `AppError.badRequest` (400 `common/bad-request`) when `query` is a
+ *         non-string or exceeds 255 characters after trimming (consistent
+ *         with the title length limit).
  */
-export async function listAiConversations(userId: string): Promise<AiConversationSummary[]> {
-  const conversations = await listAgentConversations(userId);
+export async function listAiConversations(
+  userId: string,
+  query?: string,
+): Promise<AiConversationSummary[]> {
+  let titleQuery: string | undefined;
+  if (query !== undefined) {
+    if (typeof query !== "string") {
+      throw AppError.badRequest("Search terms must be a string.");
+    }
+    const trimmed = query.trim();
+    if (trimmed.length > 255) {
+      throw AppError.badRequest("Search terms must be 255 characters or fewer.");
+    }
+    titleQuery = trimmed.length > 0 ? trimmed : undefined;
+  }
+  const conversations =
+    titleQuery === undefined
+      ? await listAgentConversations(userId)
+      : await listAgentConversations(userId, titleQuery);
   return conversations.map(toSummary);
 }
 

@@ -479,15 +479,31 @@ function toStoredMessageRecord(row: {
  * List the conversations OWNED by `userId`, newest-first. Deterministic
  * order: most-recently-updated first, then most-recently-created, then by
  * stable id. Uses the `(user_id, updated_at DESC)` conversation-list index.
+ *
+ * Optional Phase 10.27 `titleQuery`: when a non-empty string is provided the
+ * list is additionally filtered to owned conversations whose title CONTAINS
+ * the query, case-insensitively (`ILIKE '%query%'` — a plain Postgres text
+ * scan, no new index). Search covers ONLY the visible title: raw message
+ * contents, tool results, and file contents are never matched.
  */
 export async function listAgentConversations(
   userId: string,
+  titleQuery?: string,
 ): Promise<StoredConversation[]> {
   const db = getDatabase();
   const rows = await db.aiConversation.findMany({
     // Phase 10.26B: the NORMAL conversation list excludes archived
     // conversations by default (archived_at IS NULL).
-    where: { userId, archivedAt: null },
+    where: {
+      userId,
+      archivedAt: null,
+      // Phase 10.27: title substring search (case-insensitive). Absent or
+      // empty `titleQuery` → no additional filter (preserves the existing
+      // list exactly).
+      ...(titleQuery !== undefined && titleQuery.length > 0
+        ? { title: { contains: titleQuery, mode: "insensitive" } }
+        : {}),
+    },
     orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "asc" }],
     select: {
       id: true,

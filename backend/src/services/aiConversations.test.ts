@@ -129,6 +129,85 @@ describe("listAiConversations", () => {
 
     expect(await listAiConversations(ALICE)).toEqual([]);
   });
+
+  describe("— title search (Phase 10.27)", () => {
+    it("forwards a trimmed non-empty query to the repository", async () => {
+      mocks.listAgentConversations.mockResolvedValue([]);
+
+      await listAiConversations(ALICE, "  Invoice Review  ");
+
+      expect(mocks.listAgentConversations).toHaveBeenCalledTimes(1);
+      expect(mocks.listAgentConversations).toHaveBeenCalledWith(ALICE, "Invoice Review");
+    });
+
+    it("treats an empty/whitespace-only query exactly like no query", async () => {
+      mocks.listAgentConversations.mockResolvedValue([]);
+
+      await listAiConversations(ALICE, "");
+      await listAiConversations(ALICE, "   ");
+      await listAiConversations(ALICE, "\t\n ");
+
+      // No search filter is forwarded — the no-query path is identical.
+      expect(mocks.listAgentConversations).toHaveBeenCalledTimes(3);
+      expect(mocks.listAgentConversations).toHaveBeenLastCalledWith(ALICE);
+    });
+
+    it("rejects a non-string query with 400 before any repository call", async () => {
+      for (const bad of [42, true, null, {}, []]) {
+        await expect(listAiConversations(ALICE, bad as unknown as string)).rejects.toMatchObject({
+          status: 400,
+          code: "common/bad-request",
+        });
+      }
+      expect(mocks.listAgentConversations).not.toHaveBeenCalled();
+    });
+
+    it("rejects a query exceeding 255 characters after trimming, 255 is valid", async () => {
+      await expect(
+        listAiConversations(ALICE, "".padStart(256, "x")),
+      ).rejects.toMatchObject({ status: 400, code: "common/bad-request" });
+      expect(mocks.listAgentConversations).not.toHaveBeenCalled();
+
+      mocks.listAgentConversations.mockResolvedValue([]);
+      const max = "x".repeat(255);
+      await listAiConversations(ALICE, max);
+      expect(mocks.listAgentConversations).toHaveBeenCalledWith(ALICE, max);
+    });
+
+    it("maps only the filtered results to safe summary shapes", async () => {
+      mocks.listAgentConversations.mockResolvedValue([
+        {
+          ...BASE_CONVERSATION,
+          title: "Invoice review",
+          updatedAt: new Date("2026-01-03T00:00:00Z"),
+        },
+      ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+
+      const rows = await listAiConversations(ALICE, "invoice");
+
+      expect(rows).toEqual([
+        {
+          id: CONVERSATION_ID,
+          title: "Invoice review",
+          maxToolRounds: 3,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-03T00:00:00.000Z",
+        },
+      ]);
+      expect(JSON.stringify(rows)).not.toContain("userId");
+      expect(JSON.stringify(rows)).not.toContain("archivedAt");
+    });
+
+    it("performs no provider, network, or filesystem calls while searching", async () => {
+      mocks.listAgentConversations.mockResolvedValue([]);
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      await listAiConversations(ALICE, "invoice");
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,9 @@
  * `GET  /api/ai/status`                     — safe provider capability status.
  * `POST /api/ai/instructions`               — submit one instruction to the agent runtime.
  * `GET  /api/ai/conversations`              — list the user's conversations, newest-first.
+ *                                              Optional `?q=` searches the user's own
+ *                                              non-archived conversations by title (case-
+ *                                              insensitive substring; Phase 10.27).
  * `GET  /api/ai/conversations/:conversationId` — retrieve one owned conversation
  *                                              + its chronological transcript.
  * `DELETE /api/ai/conversations/:conversationId` — delete one owned conversation
@@ -74,8 +77,15 @@ export const aiRoutes = new Hono<AppVariables>()
   .get("/conversations", requireAuth, async (c) => {
     // Identity comes EXCLUSIVELY from the authenticated session. The list
     // service scopes every read to this user; the request carries no identity.
+    // Optional `?q=` (Phase 10.27) is forwarded to the service, which trims,
+    // validates, and scopes the title search — no query/database logic lives
+    // in this route. Absent `q` is omitted so the no-search path is identical
+    // to the pre-search behavior.
     const user = getCurrentUser(c);
-    return c.json(await listAiConversations(user.id), 200);
+    const q = c.req.query("q");
+    const result =
+      q === undefined ? await listAiConversations(user.id) : await listAiConversations(user.id, q);
+    return c.json(result, 200);
   })
   .get("/conversations/:conversationId", requireAuth, async (c) => {
     // Ownership is enforced server-side: the service reads the conversation
