@@ -1,149 +1,152 @@
-import { useState } from "react";
-import { X, Sparkles, Send, FolderOpen, FileText, Search, Copy, HardDrive } from "./Icons";
-
-interface Message {
-  id: string;
-  role: "user" | "ai";
-  content: string;
-  suggestions?: { label: string; count?: number }[];
-  actions?: string[];
-}
-
-const initialMessages: Message[] = [
-  {
-    id: "0",
-    role: "ai",
-    content:
-      "Hi! I'm your Smart File Assistant.\n\nAI features aren't connected in this build yet, so I can't analyze your files today. In the meantime you can browse, search, sort, star, rename, move, and delete your real files elsewhere in the app.",
-    actions: [],
-  },
-];
-
-const quickPrompts = [
-  { label: "Organize my files", icon: FolderOpen },
-  { label: "Find duplicates", icon: Copy },
-  { label: "Clean Downloads", icon: HardDrive },
-  { label: "Find important docs", icon: FileText },
-];
+import { useEffect, useState } from "react";
+import { ChevronLeft, Sparkles, X } from "./Icons";
+import { useSession } from "../services/useSession";
+import { getAiConversation, listAiConversations } from "../services/api/aiConversations";
+import type { AiConversationDetail, AiConversationSummary } from "../types/ai";
+import ConversationList from "./conversations/ConversationList";
+import ConversationTranscript from "./conversations/ConversationTranscript";
+import SignInPanel from "./conversations/SignInPanel";
 
 interface AIAssistantProps {
   onClose: () => void;
 }
 
+/**
+ * Smart Assistant side panel (Phase 10.32) — now reads the SAME real,
+ * persisted conversation history as the main Conversations view, through the
+ * same authenticated API and session store. The previous placeholder chat
+ * (canned messages, quick prompts, and a composer that fabricated replies) is
+ * gone: this panel is read-only and executes nothing.
+ */
 export default function AIAssistant({ onClose }: AIAssistantProps) {
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
-  const [input, setInput] = useState("");
+  const { isAuthenticated } = useSession();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<readonly AiConversationSummary[] | null>(null);
+  const [listLoading, setListLoading] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<AiConversationDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
-  function send(text: string) {
-    if (!text.trim()) return;
-    const userMsg: Message = { id: Date.now().toString(), role: "user", content: text };
-    // AI backend isn't wired up yet. Reply honestly instead of inventing
-    // analysis results about files that were never actually scanned.
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: (Date.now() + 1).toString(),
-        role: "ai",
-        content: `I can't answer "${text}" with real results yet — the AI backend isn't connected in this build, and this app doesn't invent file analysis.`,
-      },
-    ]);
-    setInput("");
+  function loadList() {
+    setListLoading(true);
+    setListError(null);
+    listAiConversations()
+      .then((items) => setConversations(items))
+      .catch((err: unknown) => setListError(err instanceof Error ? err.message : "Could not load conversations."))
+      .finally(() => setListLoading(false));
   }
+
+  function openConversation(id: string) {
+    setDetailLoading(true);
+    setDetailError(null);
+    setSelectedId(id);
+    getAiConversation(id)
+      .then(setDetail)
+      .catch((err: unknown) => {
+        setDetail(null);
+        setDetailError(err instanceof Error ? err.message : "Could not load this conversation.");
+      })
+      .finally(() => setDetailLoading(false));
+  }
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setConversations(null);
+      setSelectedId(null);
+      setDetail(null);
+      setListError(null);
+      setDetailError(null);
+      return;
+    }
+    loadList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated]);
 
   return (
     <div className="h-full flex flex-col bg-card border-l border-border w-96 flex-shrink-0">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-4 border-b border-border">
-        <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-md bg-ai-bg flex items-center justify-center">
+        <div className="flex items-center gap-2 min-w-0">
+          {selectedId !== null && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedId(null);
+                setDetail(null);
+                setDetailError(null);
+              }}
+              aria-label="Back to conversation list"
+              className="w-6 h-6 flex items-center justify-center rounded-md text-muted-foreground hover:bg-secondary transition-colors flex-shrink-0"
+            >
+              <ChevronLeft size={14} />
+            </button>
+          )}
+          <div className="w-6 h-6 rounded-md bg-ai-bg flex items-center justify-center flex-shrink-0">
             <Sparkles size={12} className="text-ai-text" />
           </div>
-          <span className="text-sm font-semibold" style={{ fontFamily: "Instrument Sans, sans-serif" }}>Smart Assistant</span>
+          <span className="text-sm font-semibold truncate" style={{ fontFamily: "Instrument Sans, sans-serif" }}>
+            {selectedId !== null ? "Conversation history" : "Smart Assistant"}
+          </span>
         </div>
-        <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:bg-secondary transition-colors">
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close assistant"
+          className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground hover:bg-secondary transition-colors"
+        >
           <X size={15} />
         </button>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {messages.map((msg) => (
-          <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            {msg.role === "ai" && (
-              <div className="w-6 h-6 rounded-full bg-ai-bg flex items-center justify-center flex-shrink-0 mr-2 mt-0.5">
-                <Sparkles size={11} className="text-ai-text" />
-              </div>
-            )}
-            <div className={`max-w-[85%] ${msg.role === "user" ? "bg-foreground text-primary-foreground" : "bg-secondary text-foreground"} rounded-xl px-3.5 py-2.5 text-sm leading-relaxed`}>
-              <p className="whitespace-pre-line">{msg.content}</p>
-              {msg.suggestions && (
-                <div className="mt-3 space-y-1.5">
-                  {msg.suggestions.map((s) => (
-                    <div key={s.label} className="flex items-center justify-between bg-card rounded-lg px-3 py-2">
-                      <span className="text-sm font-medium">{s.label}</span>
-                      {s.count !== undefined && (
-                        <span className="text-xs font-mono text-muted-foreground">{s.count} files</span>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {msg.actions && msg.actions.length > 0 && (
-                <div className="mt-3 flex gap-2 flex-wrap">
-                  {msg.actions.map((a) => (
-                    <button
-                      key={a}
-                      className={`text-xs px-3 py-1.5 rounded-md font-medium transition-colors
-                        ${a === "Cancel" || a === "Dismiss"
-                          ? "bg-card text-muted-foreground border border-border hover:bg-secondary"
-                          : "bg-accent text-white hover:bg-indigo-600"
-                        }`}
-                    >
-                      {a}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+      {/* Body */}
+      <div className="flex-1 overflow-hidden">
+        {!isAuthenticated ? (
+          <SignInPanel />
+        ) : listLoading ? (
+          <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+            Loading conversations…
           </div>
-        ))}
-      </div>
-
-      {/* Quick prompts */}
-      <div className="px-4 pb-2 grid grid-cols-2 gap-1.5">
-        {quickPrompts.map(({ label, icon: Icon }) => (
-          <button
-            key={label}
-            onClick={() => send(label)}
-            className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg bg-secondary hover:bg-border text-xs text-muted-foreground hover:text-foreground transition-colors text-left"
-          >
-            <Icon size={12} />
-            <span className="truncate">{label}</span>
-          </button>
-        ))}
-      </div>
-
-      {/* Input */}
-      <div className="px-4 pb-4">
-        <form
-          onSubmit={(e) => { e.preventDefault(); send(input); }}
-          className="flex gap-2 items-center border border-border rounded-xl px-3 py-2 focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20 transition-all"
-        >
-          <Search size={14} className="text-muted-foreground flex-shrink-0" />
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask anything about your files…"
-            className="flex-1 text-sm bg-transparent outline-none text-foreground placeholder:text-muted-foreground"
-          />
-          <button
-            type="submit"
-            disabled={!input.trim()}
-            className="w-6 h-6 flex items-center justify-center rounded-md bg-accent text-white disabled:opacity-40 transition-opacity"
-          >
-            <Send size={11} />
-          </button>
-        </form>
+        ) : listError !== null ? (
+          <div className="h-full flex flex-col items-center justify-center text-center px-4">
+            <p className="text-xs text-muted-foreground">{listError}</p>
+            <button
+              type="button"
+              onClick={loadList}
+              className="mt-3 text-xs px-3 py-1.5 rounded-md bg-accent text-white hover:bg-indigo-600 transition-colors"
+            >
+              Try again
+            </button>
+          </div>
+        ) : selectedId === null ? (
+          conversations === null || conversations.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center px-4 gap-1">
+              <Sparkles size={16} className="text-ai-text" />
+              <p className="text-sm font-medium text-foreground">No conversations yet</p>
+              <p className="text-xs text-muted-foreground">Your history will appear here.</p>
+              <button
+                type="button"
+                onClick={loadList}
+                className="mt-2 text-xs px-3 py-1.5 rounded-md bg-accent text-white hover:bg-indigo-600 transition-colors"
+              >
+                Refresh
+              </button>
+            </div>
+          ) : (
+            <div className="h-full overflow-y-auto">
+              <ConversationList conversations={conversations} selectedId={null} onSelect={openConversation} />
+            </div>
+          )
+        ) : (
+          <div className="h-full overflow-y-auto">
+            <ConversationTranscript
+              conversation={detail}
+              loading={detailLoading}
+              error={detailError}
+              onRetry={() => selectedId !== null && openConversation(selectedId)}
+            />
+          </div>
+        )}
       </div>
     </div>
   );

@@ -38,4 +38,7 @@ export const authApi = {
   me(token: string): Promise<{ user: SafeUserRemote }> {
     return apiRequest("/api/auth/me", { token });
   },
+  logout(token: string): Promise<{ ok: boolean }> {
+    return apiRequest("/api/auth/logout", { method: "POST", token });
+  },
 };

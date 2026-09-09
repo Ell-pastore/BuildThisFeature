@@ -87,3 +87,119 @@ changes.
   was verified to corrupt TypeScript (it strips object/type-member
   separators and flags even untouched committed files), so oxfmt was NOT run;
   the changes deliberately match the committed code style.
+
+---
+
+# Phase 10.32 — Desktop AI conversation read-only UI foundation
+
+> Root: 925ea5e `AI: expose conversation approval state`
+> This phase: `AI: add desktop conversation view`
+
+## Goal
+
+Add the first real desktop frontend surface over the authenticated AI
+conversation/history APIs: a read-only conversation view (main `ai-assistant`
+view AND the Smart Assistant side panel) that renders ONLY persisted data —
+real user/assistant messages, the server-derived `turnState`, and, when the
+backend returns them, still-decidable approvals as read-only cards. No
+approve/reject actions, no tool execution from the frontend, no fabricated
+conversations/messages/approvals. Backend ownership/security stays
+authoritative; the frontend never infers permission or approval authority. A
+minimal, centralized, in-memory frontend session abstraction is introduced so
+the view can call the existing authenticated APIs. No backend changes were
+required — the 10.31 contract was sufficient.
+
+## Frontend changes (all under `web/`)
+
+### Session / auth (centralized, in-memory)
+- `src/services/session.ts` — the single owner of the bearer token. Rules:
+  token held in a module-level variable only; never in component state, never
+  in URL/query parameters, never persisted to localStorage/sessionStorage (no
+  secure OS-backed credential vault exists in the surrounding Tauri
+  architecture yet; after a reload the app shows the sign-in state again).
+  Reuses ONLY the existing `authApi` endpoints. Exposes `login` (stores
+  user+token, returns the user), `logout` (best-effort server revoke via the
+  EXISTING `POST /api/auth/logout`, then always clears local state),
+  `requireSessionToken` (throws `SessionNotAuthenticatedError` before any
+  unauthenticated request is issued), plus `subscribeSession`/`getSessionSnapshot`
+  for React's external store. No second authentication system.
+- `src/services/useSession.ts` — `useSyncExternalStore` binding returning
+  `{ user, isAuthenticated, login, logout }`; components never see the token.
+- `src/services/api/index.ts` — added `authApi.logout(token)` (the endpoint
+  already exists; only the typed client was missing).
+
+### Authenticated API client
+- `src/services/api/aiConversations.ts` — `listAiConversations()` and
+  `getAiConversation(id)` pull the token via `requireSessionToken()` at call
+  time and pass it to the existing `apiRequest` (`Authorization: Bearer`).
+  Unauthenticated calls fail fast with `SessionNotAuthenticatedError` and
+  never hit the network. Ownership/404 semantics come straight from the
+  backend envelope (typed `ApiClientError`).
+- `src/types/ai.ts` — frontend types mirroring the exact backend JSON for
+  `AiTurnState`, `AiConversationSummary`, `AiConversationDetail`,
+  `AiHistoryMessage`, and `AiToolApproval`.
+
+### Read-only conversation UI (shared by both surfaces)
+- `src/components/conversations/TurnStateBadge.tsx` — pill for every
+  server-derived turn state (list shows only non-completed states; the
+  transcript header always shows its badge).
+- `src/components/conversations/ConversationList.tsx` — real persisted
+  conversation rows (title or "Untitled conversation", updated date, turn
+  badge when relevant), newest-first as returned by the API.
+- `src/components/conversations/ConversationTranscript.tsx` — loading, error
+  (incl. conversation-not-found) and ready states; renders the persisted
+  messages chronologically (user right-aligned, assistant with avatar),
+  minimal safe tool-call/result metadata, a turn-state banner for every
+  relevant state (awaiting-approval/approved/rejected/expired/failed), and
+  pending approvals attached to their originating message id (strays grouped
+  under a "Pending approvals" block).
+- `src/components/conversations/ApprovalCard.tsx` — READ-ONLY card rendering
+  only safe metadata (tool name, validated arguments as key/value, status,
+  expiry). Deliberately renders NO approve/reject controls and states so.
+- `src/components/conversations/SignInPanel.tsx` — sign-in form reusing the
+  existing login abstraction; errors surface the backend message; token never
+  enters the URL or component state.
+- `src/components/views/AIHistoryView.tsx` — new main `ai-assistant` view:
+  header (user + refresh + sign out), list pane, transcript pane, auto-select
+  of the newest conversation, empty/loading/list-error/detail-error handling,
+  and a full-panel sign-in state when no session exists.
+- `src/components/AIAssistant.tsx` — the side panel now reads the SAME data
+  through the same session + API; the prior placeholder chat (canned messages,
+  quick prompts, composer, send button) was removed entirely.
+- `src/App.tsx` — `view === "ai-assistant"` now renders `<AIHistoryView />`
+  instead of the placeholder text.
+- `src/components/Icons.tsx` — added `RefreshCw` and `LogOut` (existing helper
+  pattern).
+
+### Test tooling (web)
+- Added devDependencies + `test` (`vitest run`), `test:watch`, and `typecheck`
+  (`tsc --noEmit`) scripts; `vitest.config.ts` (jsdom + `@` alias +
+  `src/test/setup.ts` importing `@testing-library/jest-dom/vitest`).
+
+## Verification
+
+- 30/30 web tests pass (`pnpm test` in `web/`):
+  - `session.test.ts` — unauth snapshot + `requireSessionToken` throws,
+    login stores only in memory (localStorage/sessionStorage stay empty),
+    login failure propagates and leaves unauthenticated state, subscriber
+    notification + snapshot replacement, logout revokes with the captured
+    token then clears, and logout clears even when the server revoke fails.
+  - `aiConversations.test.ts` — unauthenticated call fails fast with
+    `SessionNotAuthenticatedError` and issues NO request; authenticated list
+    and detail calls pass the session bearer token (URL-encoded id); backend
+    error envelopes propagate.
+  - `AIHistoryView.test.tsx` — sign-in state without fetching; sign-in
+    handoff to real history; list rows + real user/assistant message
+    rendering; all six turn-state badges/banners; non-completed list badges;
+    pending approval card with safe metadata and NO approve/reject/execute
+    buttons; empty state; loading state; list error + retry; owned-but-missing
+    conversation error; sign-out back to sign-in.
+  - `AIAssistant.test.tsx` — requires a session; the fabricated chat
+    (composer / quick prompts / send) is gone; opens a transcript from real
+    data with back navigation; close button still works.
+- `pnpm typecheck` (`tsc --noEmit`) clean; `pnpm build` (vite) clean.
+- No backend source changes were made. The workspace oxfmt (v0.2.0) defect
+  noted in 10.31 was respected: oxfmt was NOT run; new files/edits match the
+  existing committed style by hand. (Also: the local `backend/src/services/h.txt`
+  once appeared truncated to 0 bytes mid-session; it was restored from HEAD
+  before appending this report.)

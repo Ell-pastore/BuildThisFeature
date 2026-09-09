@@ -10,6 +10,7 @@ import Starred from "./components/views/Starred";
 import Trash from "./components/views/Trash";
 import Search from "./components/views/Search";
 import AIOrganization from "./components/views/AIOrganization";
+import AIHistoryView from "./components/views/AIHistoryView";
 import Duplicates from "./components/views/Duplicates";
 import SmartFolders from "./components/views/SmartFolders";
 import Storage from "./components/views/Storage";
@@ -261,11 +262,7 @@ export default function App() {
             {view === "smart-folders" && <SmartFolders />}
             {view === "storage" && <Storage diskUsage={diskUsage} />}
             {view === "settings" && <Settings />}
-            {view === "ai-assistant" && (
-              <div className="flex-1 flex items-center justify-center bg-background text-muted-foreground">
-                <p className="text-sm">AI Assistant is open in the side panel →</p>
-              </div>
-            )}
+            {view === "ai-assistant" && <AIHistoryView />}
           </div>
 
           {aiOpen && (
