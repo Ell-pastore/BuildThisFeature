@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 import {
   escapesToolScope,
+  hasControlCharacters,
   isAbsoluteToolPath,
   validateToolPath,
 } from "./paths.js";
@@ -128,5 +129,24 @@ describe("escapesToolScope", () => {
     expect(escapesToolScope("/..")).toBe(true);
     expect(escapesToolScope("/a/../../etc")).toBe(true);
     expect(escapesToolScope("C:\\..\\Windows")).toBe(true);
+  });
+});
+
+describe("hasControlCharacters", () => {
+  it("returns false for ordinary printable strings", () => {
+    expect(hasControlCharacters("/Users/alice/notes.txt")).toBe(false);
+    expect(hasControlCharacters("report")).toBe(false);
+    expect(hasControlCharacters("")).toBe(false);
+  });
+
+  it("returns true for NUL and ASCII control characters", () => {
+    expect(hasControlCharacters("/a\u0000b")).toBe(true);
+    expect(hasControlCharacters("/a\nb")).toBe(true);
+    expect(hasControlCharacters("/a\tb")).toBe(true);
+    expect(hasControlCharacters("\u001f")).toBe(true);
+  });
+
+  it("ignores characters at or above ASCII space", () => {
+    expect(hasControlCharacters("/a b\u007f")).toBe(false);
   });
 });

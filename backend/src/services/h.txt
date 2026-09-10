@@ -383,3 +383,68 @@ gate; nothing in this phase bypasses or weakens it.
 - oxfmt (workspace defect) was NOT run; edits match committed style.
   (`backend/src/services/h.txt` appeared truncated a FOURTH time; restored from
   HEAD before appending.)
+
+---
+
+# Phase 10.37 — Complete path-scope validation for the remaining read tools
+
+> Root: 8979673 `AI: add controlled move_file tool`
+> This phase: (uncommitted) — completes the Phase 10.35 `validateToolPath`
+> first-gate for the three read tools that still passed only `requireString`
+> validation. The Phase 10.36 milestone note is absent from this file (the
+> move_file commit landed without appending it; the write-tool behavior it
+> described is documented in `backend/src/tools/definitions/writeTools.ts`,
+> `backend/src/tools/handlers/moveFile.ts`, and the change's commit).
+
+## Goal
+
+Extend the deterministic tool-layer path-scope guard from `list_directory`
+(Phase 10.35, and `move_file` preflight/execution in 10.36) to `get_file_metadata`
+and `read_file`, so EVERY tool that accepts a user-controlled filesystem path
+rejects relative / control-character / root-escaping paths BEFORE the executor
+or filesystem is reached. `search_files` is included for completeness but has NO
+path argument — its `query` is a filename substring confined to the AllowList
+roots, so it is explicitly NOT path-validated; it instead rejects NUL / control
+characters via the same shared guard helper.
+
+## What changed
+
+1. `backend/src/tools/paths.ts` (EDIT) — new exported `hasControlCharacters()`
+   (ASCII < 0x20), extracted from `validateToolPath`'s loop so the control-
+   character rule is single-sourced. `validateToolPath` behavior is UNCHANGED
+   (same rejects, same codes, verbatim pass-through on success).
+2. `backend/src/tools/handlers/getFileMetadata.ts` (EDIT) — runs
+   `validateToolPath(path)` after `requireString`; the executor receives the
+   guard's verbatim path. Contract unchanged: `{ path }` → `FileMetadata`;
+   relative → `validation`/`tools/invalid-path`, traversal → `security`/
+   `tools/path-out-of-scope`, executor never called on rejection.
+3. `backend/src/tools/handlers/readFile.ts` (EDIT) — identical treatment for
+   `read_file`. Contract unchanged: `{ path }` → base64 output.
+4. `backend/src/tools/handlers/searchFiles.ts` (EDIT) — rejects NUL / control
+   characters in `query` as `validation`/`tools/invalid-input` before the
+   executor; traversal-looking queries remain valid SUBSTRINGS (never treated
+   as paths) and pass through unchanged. Read tools remain NON-approval-gated.
+5. Tests (backend, 981 passing total; `pnpm typecheck` + `pnpm build` clean):
+   - `backend/src/tools/handlers/handlers.test.ts` (EXTENDED) for
+     `get_file_metadata` and `read_file`: relative → validation/invalid-path,
+     control-character → validation/invalid-path, traversal → security/
+     path-out-of-scope, all with `fake.calls.* === []` (executor NEVER
+     reached); valid absolute path passed through UNCHANGED. For
+     `search_files`: control-character query → validation/invalid-input with
+     the executor never called; a traversal-looking query passes through as a
+     substring (documents that queries are not paths).
+   - `backend/src/tools/paths.test.ts` (EXTENDED) — unit coverage for the new
+     `hasControlCharacters` (printable/DEL accepted, NUL + C0 rejected).
+6. No changes to `backend/src/services/h.txt`'s section headers, no new tools,
+   no definition/permission/policy/approval changes — read tools stay ungated
+   (`ToolPermission.Read`, no `requiresApproval`).
+
+## Verification
+
+- 981/981 backend tests pass (`pnpm test`): 37 files; `pnpm typecheck` clean.
+- Web workspace unaffected: 54/54 web tests pass (`pnpm test` in `web/`).
+- Path normalization audit (pre-change): no handler normalizes or re-derives
+  paths; `paths.ts` returns the original string verbatim and the Rust AllowList
+  remains the single canonical-scope authority at execution. No existing
+  normalization assumptions were disturbed.
+- oxfmt (workspace defect) was NOT run; edits match committed style.

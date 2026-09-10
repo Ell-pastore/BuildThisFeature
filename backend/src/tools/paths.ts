@@ -38,6 +38,19 @@ function isWindowsAbsolute(path: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
+/**
+ * True when the string contains NUL or control characters (ASCII < 0x20).
+ * Shared by `validateToolPath` (path guard) and the query-valued read tools
+ * that have no path argument but must still reject malformed control bytes
+ * before the executor is reached.
+ */
+export function hasControlCharacters(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    if (value.charCodeAt(i) < 0x20) return true;
+  }
+  return false;
+}
+
 /** True when a `..` segment anywhere in the path climbs ABOVE the root. */
 export function escapesToolScope(path: string): boolean {
   const parts = isWindowsAbsolute(path) ? path.split(/[\\/]+/) : path.split("/");
@@ -127,17 +140,14 @@ export function validateToolPath(path: string): PathValidation {
       ),
     };
   }
-  for (let i = 0; i < path.length; i += 1) {
-    const char = path.charCodeAt(i);
-    if (char < 0x20) {
-      return {
-        ok: false,
-        error: ToolError.validation(
-          ToolErrorCode.InvalidPath,
-          "The path contains an invalid character.",
-        ),
-      };
-    }
+  if (hasControlCharacters(path)) {
+    return {
+      ok: false,
+      error: ToolError.validation(
+        ToolErrorCode.InvalidPath,
+        "The path contains an invalid character.",
+      ),
+    };
   }
   if (escapesToolScope(path)) {
     return {

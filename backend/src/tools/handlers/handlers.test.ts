@@ -564,6 +564,31 @@ describe("search_files handler", () => {
     expect(result.error.category).toBe("validation");
   });
 
+  // Phase 10.37 — `search_files` has NO path argument (the query is a filename
+  // substring; the walk stays confined to the AllowList roots), so the path
+  // scope guard does not apply to it. The one malformed-input class that does
+  // apply is a query containing NUL / control characters, rejected before the
+  // executor is reached via the shared path-guard helper.
+  it("rejects a control-character query as malformed input and never calls the executor", async () => {
+    for (const query of ["a\u0000b", "a\nb", "a\tb"]) {
+      const result = await handlers.search_files({ query }, makeContext());
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.category).toBe("validation");
+      expect(result.error.code).toBe(ToolErrorCode.InvalidInput);
+    }
+    expect(fake.calls.searchFiles).toEqual([]);
+  });
+
+  it("passes a traversal-looking query through as a substring (queries are not paths)", async () => {
+    const result = await handlers.search_files(
+      { query: "../../etc" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(true);
+    expect(fake.calls.searchFiles).toEqual(["../../etc"]);
+  });
+
   it("projects an executor 'access not permitted' to category=security", async () => {
     fake.throwFor.searchFiles = new Error(
       "Access to this path is not permitted.",
@@ -629,6 +654,56 @@ describe("get_file_metadata handler", () => {
     expect(result.error.category).toBe("validation");
   });
 
+  // Phase 10.37 — deterministic tool-layer scope guard. Relative, malformed,
+  // and root-escaping paths are rejected before the executor is reached; the
+  // original absolute path is passed through verbatim for the canonical scope
+  // check.
+  it("rejects a relative path as invalid input and never calls the executor", async () => {
+    const result = await handlers.get_file_metadata(
+      { path: "notes.txt" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidPath);
+    expect(fake.calls.getFileMetadata).toEqual([]);
+  });
+
+  it("rejects a control-character path as invalid input and never calls the executor", async () => {
+    const result = await handlers.get_file_metadata(
+      { path: "/a\u0000b" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidPath);
+    expect(fake.calls.getFileMetadata).toEqual([]);
+  });
+
+  it("rejects a traversal path that escapes the scope and never calls the executor", async () => {
+    for (const path of ["/../etc", "/home/../../etc/passwd"]) {
+      const result = await handlers.get_file_metadata({ path }, makeContext());
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.category).toBe("security");
+      expect(result.error.code).toBe(ToolErrorCode.PathOutOfScope);
+    }
+    expect(fake.calls.getFileMetadata).toEqual([]);
+  });
+
+  it("passes a valid absolute path through to the executor unchanged", async () => {
+    const result = await handlers.get_file_metadata(
+      { path: "/Users/alice/Documents/notes.txt" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(true);
+    expect(fake.calls.getFileMetadata).toEqual([
+      "/Users/alice/Documents/notes.txt",
+    ]);
+  });
+
   it("projects an executor 'not found' to category=not_found", async () => {
     fake.throwFor.getFileMetadata = new Error(
       "The file or folder does not exist.",
@@ -689,6 +764,54 @@ describe("read_file handler", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.category).toBe("validation");
+  });
+
+  // Phase 10.37 — deterministic tool-layer scope guard. Relative, malformed,
+  // and root-escaping paths are rejected before the executor is reached; the
+  // original absolute path is passed through verbatim for the canonical scope
+  // check.
+  it("rejects a relative path as invalid input and never calls the executor", async () => {
+    const result = await handlers.read_file({ path: "notes.txt" }, makeContext());
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidPath);
+    expect(fake.calls.readFile).toEqual([]);
+  });
+
+  it("rejects a control-character path as invalid input and never calls the executor", async () => {
+    const result = await handlers.read_file({ path: "/a\u0000b" }, makeContext());
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.InvalidPath);
+    expect(fake.calls.readFile).toEqual([]);
+  });
+
+  it("rejects a traversal path that escapes the scope and never calls the executor", async () => {
+    for (const path of ["/../etc", "/home/../../etc/passwd"]) {
+      const result = await handlers.read_file({ path }, makeContext());
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.category).toBe("security");
+      expect(result.error.code).toBe(ToolErrorCode.PathOutOfScope);
+    }
+    expect(fake.calls.readFile).toEqual([]);
+  });
+
+  it("passes a valid absolute path through to the executor unchanged", async () => {
+    fake.respondWith.readFile = {
+      encoding: "base64",
+      data: Buffer.from("hi", "utf8").toString("base64"),
+    };
+    const result = await handlers.read_file(
+      { path: "/Users/alice/Documents/notes.txt" },
+      makeContext(),
+    );
+    expect(result.ok).toBe(true);
+    expect(fake.calls.readFile).toEqual([
+      "/Users/alice/Documents/notes.txt",
+    ]);
   });
 
   it("projects an executor 'not a file' to category=validation", async () => {
