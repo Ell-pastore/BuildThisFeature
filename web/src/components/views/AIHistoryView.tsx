@@ -6,8 +6,15 @@ import {
   listAiConversations,
 } from "../../services/api/aiConversations";
 import { submitAiInstruction } from "../../services/api/aiInstructions";
-import type { AiConversationDetail, AiConversationSummary } from "../../types/ai";
+import { getAiRuntimeStatus } from "../../services/api/aiStatus";
+import { ApiClientError } from "../../services/api/client";
+import type {
+  AiConversationDetail,
+  AiConversationSummary,
+  AiRuntimeStatus,
+} from "../../types/ai";
 import AIComposer from "../conversations/AIComposer";
+import AIUnconfiguredNotice from "../conversations/AIUnconfiguredNotice";
 import ConversationList from "../conversations/ConversationList";
 import ConversationTranscript from "../conversations/ConversationTranscript";
 import SignInPanel from "../conversations/SignInPanel";
@@ -36,6 +43,9 @@ export default function AIHistoryView() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiRuntimeStatus | null>(null);
+  const [notConfiguredOverride, setNotConfiguredOverride] = useState(false);
+  const [pendingInstruction, setPendingInstruction] = useState<string | null>(null);
 
   const loadList = useCallback(async () => {
     if (!isAuthenticated) return;
@@ -68,6 +78,19 @@ export default function AIHistoryView() {
     }
   }, []);
 
+  /**
+   * Fetch the safe runtime status. A failure (backend down, session vanished)
+   * leaves `aiStatus` null so the "not configured" notice is only ever driven
+   * by a SUCCESSFUL, safe status response — never by an outage.
+   */
+  const loadStatus = useCallback(async () => {
+    try {
+      setAiStatus(await getAiRuntimeStatus());
+    } catch {
+      setAiStatus(null);
+    }
+  }, []);
+
   /** Reconcile after an approval decision: reload the list + selected transcript. */
   const reconcileConversation = useCallback(
     async (conversationId: string) => {
@@ -94,7 +117,15 @@ export default function AIHistoryView() {
         if (resumedSame) await loadDetail(targetId);
         return true;
       } catch (err) {
-        setSubmitError(err instanceof Error ? err.message : "Could not submit your instruction.");
+        if (err instanceof ApiClientError && err.code === "common/not-configured") {
+          // The backend's stable "not configured" signal maps to the clear
+          // configuration state, not a raw error string.
+          setSubmitError(null);
+          setNotConfiguredOverride(true);
+          setPendingInstruction(instruction);
+        } else {
+          setSubmitError(err instanceof Error ? err.message : "Could not submit your instruction.");
+        }
         // A failed turn may still have persisted partial state — reconcile the
         // currently selected transcript from the server.
         if (selectedId !== null) void loadDetail(selectedId);
@@ -106,6 +137,22 @@ export default function AIHistoryView() {
     [isAuthenticated, selectedId, loadList, loadDetail],
   );
 
+  /**
+   * Retry after the "AI isn't configured" state: re-check the status and, when
+   * an instruction previously failed with `common/not-configured`, re-run it.
+   * If the provider still is not configured, the next submit failure keeps the
+   * notice visible.
+   */
+  const retryUnconfigured = useCallback(() => {
+    setNotConfiguredOverride(false);
+    void loadStatus();
+    const pending = pendingInstruction;
+    if (pending !== null) {
+      setPendingInstruction(null);
+      void handleSubmit(pending);
+    }
+  }, [loadStatus, pendingInstruction, handleSubmit]);
+
   useEffect(() => {
     if (!isAuthenticated) {
       setConversations(null);
@@ -113,9 +160,13 @@ export default function AIHistoryView() {
       setDetail(null);
       setListError(null);
       setDetailError(null);
+      setAiStatus(null);
+      setNotConfiguredOverride(false);
+      setPendingInstruction(null);
       return;
     }
     void loadList();
+    void loadStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated]);
 
@@ -130,6 +181,8 @@ export default function AIHistoryView() {
   if (!isAuthenticated) return <SignInPanel />;
 
   const displayName = user?.displayName ?? user?.email ?? "";
+  const showUnconfigured =
+    (aiStatus !== null && !aiStatus.configured) || notConfiguredOverride;
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -223,12 +276,16 @@ export default function AIHistoryView() {
           </main>
         </div>
         )}
-        <AIComposer
-          disabled={submitting}
-          submitting={submitting}
-          error={submitError}
-          onSubmit={handleSubmit}
-        />
+        {showUnconfigured ? (
+          <AIUnconfiguredNotice onRetry={retryUnconfigured} />
+        ) : (
+          <AIComposer
+            disabled={submitting}
+            submitting={submitting}
+            error={submitError}
+            onSubmit={handleSubmit}
+          />
+        )}
       </div>
     </div>
   );

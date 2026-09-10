@@ -448,3 +448,69 @@ characters via the same shared guard helper.
   remains the single canonical-scope authority at execution. No existing
   normalization assumptions were disturbed.
 - oxfmt (workspace defect) was NOT run; edits match committed style.
+
+---
+
+# Phase M1 — Graceful AI provider status and failure UX
+
+> Root: 64d6c93 `AI: complete path-scope validation for read tools`
+> This phase: (uncommitted) — makes an unconfigured AI runtime a first-class,
+> explainable state instead of a raw error string. No streaming, no new tools,
+> no agent-loop / permission / approval changes, and no provider API keys are
+> introduced.
+
+## Goal
+
+Give the desktop Conversations AI UI a graceful, safe experience when no AI
+provider is configured on the backend: (1) the backend status endpoint states
+at an aggregate level whether ANY provider is constructible, secret-free; (2)
+the existing stable `503 common/not-configured` envelope is locked by tests;
+and (3) the client renders a clear "AI isn't configured yet" state with a
+retry control instead of echoing a raw error.
+
+## What changed
+
+1. `backend/src/services/aiStatus.ts` (EDIT) — `AiRuntimeStatus` gains a safe
+   `configured: boolean` aggregate: `true` iff at least one diagnostic provider
+   entry is `enabled`. Still secret-free by construction (no keys, handles,
+   base URLs, env names, or filesystem paths) and never network-probing.
+2. `backend/src/services/aiStatus.test.ts` (EXTENDED) — the exact stable
+   response shape now includes `configured`; new `configured`-aggregate tests
+   (true with an enabled provider; false when the only provider is disabled;
+   true for a credential-free ollama).
+3. `backend/src/routes/ai.test.ts` (EDIT) — `CANNED_STATUS` fixture + stable
+   shape assertion updated for the new field.
+4. `backend/src/services/aiInstructions.test.ts` (EXTENDED) — locks the
+   production-entry `runAiInstruction` failure when the runtime cannot be
+   constructed to the stable `503 common/not-configured` envelope (unchanged
+   service behavior, now regression-covered).
+5. `web/src/types/ai.ts` (EDIT) — mirrors of `AiRuntimeStatus` /
+   `AiProviderStatus` / `AiProviderIssue` for `GET /api/ai/status`.
+6. `web/src/services/api/aiStatus.ts` (NEW) — typed `getAiRuntimeStatus()`
+   client following the `aiConversations.ts` pattern (token via
+   `requireSessionToken`).
+7. `web/src/components/conversations/AIUnconfiguredNotice.tsx` (NEW) — the
+   "AI isn't configured yet" state with a `Try again` control, rendered in
+   place of the composer.
+8. `web/src/components/views/AIHistoryView.tsx` (EDIT) —
+   - Fetches the safe status on auth; when it reports an unconfigured runtime,
+     the notice replaces the composer (driven by a SUCCESSFUL status response
+     only — a status fetch failure never claims "not configured").
+   - A submit failure with the stable `common/not-configured` code maps to the
+     notice (keeping the typed instruction) instead of a raw error string.
+   - `Try again` re-checks status AND re-submits the pending instruction when
+     one failed with `common/not-configured`.
+9. `web/src/components/views/AIHistoryView.test.tsx` (EXTENDED) + new
+   `web/src/components/conversations/AIUnconfiguredNotice.test.tsx` — status-
+   driven state + recovery, and the not-configured failure → notice → retry
+   re-submit flow.
+
+## Verification
+
+- Backend: 985/985 tests pass (`pnpm test`), 37 files; `pnpm typecheck` clean.
+- Web: 59/59 tests pass (`pnpm test` in `web/`), 8 files; `pnpm typecheck`
+  clean.
+- Security: the status payload reveals only configuration capability
+  (credential counts, never values/handles); the notice shows only friendly
+  copy; no provider keys added or touched anywhere.
+- oxfmt (workspace defect) was NOT run; edits match committed style.

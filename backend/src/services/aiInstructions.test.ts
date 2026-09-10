@@ -415,6 +415,13 @@ describe("runAiInstruction — runtime seam", () => {
     bindAiInstructionFilesystem(undefined);
   });
 
+  it("rejects with the stable 503 common/not-configured envelope when the runtime cannot be constructed", async () => {
+    await expect(runAiInstruction(sessionContext(), { instruction: VALID_INSTRUCTION })).rejects.toMatchObject({
+      status: 503,
+      code: "common/not-configured",
+    });
+  });
+
   it("uses a bound long-lived runtime when provided", async () => {
     const run = vi.fn().mockResolvedValue(makeResult());
     bindAiInstructionRuntime(fakeRuntime({ run }));

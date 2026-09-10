@@ -105,6 +105,36 @@ describe("buildAiRuntimeStatus — ordering and validity", () => {
   });
 });
 
+describe("buildAiRuntimeStatus — `configured` aggregate", () => {
+  it("reports configured: true when at least one provider is enabled", () => {
+    const payload = buildAiRuntimeStatus(validateProviderConfiguration(makeInput()));
+
+    expect(payload.configured).toBe(true);
+    expect(payload.providers.filter((p) => p.enabled)).toHaveLength(3);
+  });
+
+  it("reports configured: false when NO provider is enabled (unconfigured runtime)", () => {
+    // A credential-serving provider with zero credentials is disabled, so the
+    // runtime has nothing constructible to fall back on.
+    const payload = buildAiRuntimeStatus(
+      validateProviderConfiguration(makeInput({ chain: ["grok"], credentials: { grok: [] } })),
+    );
+
+    expect(payload.configured).toBe(false);
+    expect(payload.providers).toHaveLength(1);
+    expect(payload.providers[0]).toMatchObject({ provider: "grok", enabled: false });
+  });
+
+  it("stays boolean and safe even when every provider is disabled", () => {
+    const payload = buildAiRuntimeStatus(
+      validateProviderConfiguration(makeInput({ chain: ["ollama"] })),
+    );
+
+    expect(typeof payload.configured).toBe("boolean");
+    expect(payload.configured).toBe(true); // credential-free ollama is enabled
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 3. Credential count, never values or handles
 // ---------------------------------------------------------------------------
@@ -301,7 +331,7 @@ describe("aiRuntimeStatus — stable shape and config resolver", () => {
   it("has the exact stable response shape", () => {
     const payload = buildAiRuntimeStatus(validateProviderConfiguration(makeInput()));
 
-    expect(Object.keys(payload).sort()).toEqual(["providers", "status"]);
+    expect(Object.keys(payload).sort()).toEqual(["configured", "providers", "status"]);
     expect(payload.status).toBe("ok");
 
     for (const provider of payload.providers) {

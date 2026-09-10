@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import AIHistoryView from "./AIHistoryView";
+import { ApiClientError } from "../../services/api/client";
 import type {
   AiConversationDetail,
   AiConversationSummary,
   AiInstructionResponse,
+  AiRuntimeStatus,
   AiToolApproval,
   AiTurnState,
 } from "../../types/ai";
@@ -52,6 +54,14 @@ vi.mock("@/services/api/aiInstructions", () => ({
   submitAiInstruction: instr.submitAiInstruction,
 }));
 
+const status = vi.hoisted(() => ({
+  getAiRuntimeStatus: vi.fn(),
+}));
+
+vi.mock("@/services/api/aiStatus", () => ({
+  getAiRuntimeStatus: status.getAiRuntimeStatus,
+}));
+
 const decide = vi.hoisted(() => ({
   approveAiApproval: vi.fn(),
   rejectAiApproval: vi.fn(),
@@ -96,6 +106,14 @@ function summary(overrides: Partial<AiConversationSummary> = {}): AiConversation
     pendingApprovals: [],
     ...overrides,
   };
+}
+
+function configuredStatus(overrides: Partial<AiRuntimeStatus> = {}): AiRuntimeStatus {
+  return { status: "ok", configured: true, providers: [], ...overrides };
+}
+
+function unconfiguredStatus(overrides: Partial<AiRuntimeStatus> = {}): AiRuntimeStatus {
+  return { status: "ok", configured: false, providers: [], ...overrides };
 }
 
 function detail(overrides: Partial<AiConversationDetail> = {}): AiConversationDetail {
@@ -159,6 +177,7 @@ describe("AIHistoryView", () => {
     api.listAiConversations.mockResolvedValue([]);
     api.getAiConversation.mockResolvedValue(detail());
     instr.submitAiInstruction.mockResolvedValue(instructionResult("conv-1", DONE_REPLY));
+    status.getAiRuntimeStatus.mockResolvedValue(configuredStatus());
     decide.approveAiApproval.mockResolvedValue(pendingApproval({ status: "approved", decidedAt: ISO }));
     decide.rejectAiApproval.mockResolvedValue(pendingApproval({ status: "rejected", decidedAt: ISO }));
   });
@@ -617,5 +636,78 @@ describe("AIHistoryView", () => {
     expect(instr.submitAiInstruction).not.toHaveBeenCalled();
     expect(await screen.findByText("The approval window elapsed before a decision was made.")).toBeInTheDocument();
     expect(screen.queryByText(DONE_REPLY)).toBeNull();
+  });
+
+  it("shows the clear AI-not-configured state from status and recovers when configured", async () => {
+    authenticatedUser();
+    api.listAiConversations.mockResolvedValue([]);
+    status.getAiRuntimeStatus
+      .mockResolvedValueOnce(unconfiguredStatus())
+      .mockResolvedValue(configuredStatus());
+
+    render(<AIHistoryView />);
+
+    // Proactive status-driven state replaces the composer BEFORE any submit.
+    expect(await screen.findByTestId("ai-unconfigured-notice")).toBeInTheDocument();
+    expect(screen.getByText("AI isn't configured yet")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Give the assistant an instruction")).toBeNull();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+
+    // Retry re-checks the status; once configured, the composer returns.
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Give the assistant an instruction")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-unconfigured-notice")).toBeNull();
+    expect(status.getAiRuntimeStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps a common/not-configured submit failure to the clear state (not a raw error) and retry re-submits", async () => {
+    authenticatedUser();
+    api.listAiConversations.mockResolvedValue([summary()]);
+    api.getAiConversation.mockResolvedValue(twoPane.detail);
+    instr.submitAiInstruction
+      .mockRejectedValueOnce(
+        new ApiClientError(503, "common/not-configured", "The AI provider is not configured yet."),
+      )
+      .mockResolvedValue(instructionResult("conv-1", DONE_REPLY));
+
+    render(<AIHistoryView />);
+    await screen.findByText(RECEIPTS_INPUT);
+
+    const input = screen.getByLabelText("Give the assistant an instruction");
+    fireEvent.change(input, { target: { value: MOVE_THEM } });
+    fireEvent.click(screen.getByRole("button", { name: "Send instruction" }));
+
+    // The stable not-configured code renders the clear state, NOT the raw text.
+    await waitFor(() =>
+      expect(instr.submitAiInstruction).toHaveBeenCalledWith({
+        conversationId: "conv-1",
+        instruction: MOVE_THEM,
+      }),
+    );
+    expect(await screen.findByTestId("ai-unconfigured-notice")).toBeInTheDocument();
+    expect(screen.queryByText("The AI provider is not configured yet.")).toBeNull();
+    expect(screen.queryByLabelText("Give the assistant an instruction")).toBeNull();
+
+    // Retry re-checks status AND re-submits the pending instruction. The
+    // success path reconciles the transcript from the server.
+    api.getAiConversation.mockResolvedValue(
+      detail({
+        turnState: "completed",
+        messages: [
+          { id: "m1", role: "user", content: RECEIPTS_INPUT, createdAt: ISO, isFinal: false },
+          { id: "m2", role: "assistant", content: RECEIPTS_REPLY, createdAt: ISO, isFinal: false },
+          { id: "m3", role: "user", content: MOVE_THEM, createdAt: ISO, isFinal: false },
+          { id: "m4", role: "assistant", content: DONE_REPLY, createdAt: ISO, isFinal: true },
+        ],
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(instr.submitAiInstruction).toHaveBeenCalledTimes(2));
+    expect(instr.submitAiInstruction).toHaveBeenLastCalledWith({
+      conversationId: "conv-1",
+      instruction: MOVE_THEM,
+    });
+    expect(await screen.findByText(DONE_REPLY)).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-unconfigured-notice")).toBeNull();
   });
 });

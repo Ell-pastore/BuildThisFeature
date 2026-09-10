@@ -67,6 +67,14 @@ export interface AiProviderStatus {
 export interface AiRuntimeStatus {
   /** The status service itself computed successfully ("ok"). */
   status: "ok";
+  /**
+   * Whether at least one provider is fully configured and constructible
+   * (`enabled`). Safe to drive client UX on: an unconfigured runtime reports
+   * `configured: false` so a client can show a clear "AI isn't configured"
+   * state instead of a raw error. Deliberately coarse — the per-provider
+   * detail lives in `providers`.
+   */
+  configured: boolean;
   /** Provider capability status, in configured fallback order. */
   providers: AiProviderStatus[];
 }
@@ -90,6 +98,7 @@ export function buildAiRuntimeStatus(
 ): AiRuntimeStatus {
   return {
     status: "ok",
+    configured: report.providers.some((entry) => entry.enabled),
     providers: report.providers.map((entry, order) => ({
       provider: entry.provider,
       order,

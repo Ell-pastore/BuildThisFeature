@@ -135,6 +135,7 @@ function sessionFor(user: { id: string; email: string; displayName: string; stat
 
 const CANNED_STATUS: AiRuntimeStatus = {
   status: "ok",
+  configured: true,
   providers: [
     {
       provider: "grok",
@@ -355,7 +356,8 @@ describe("GET /api/ai/status — authenticated", () => {
 
     const body = (await (await makeApp().request("/api/ai/status", { headers: authorizedHeaders() })).json()) as AiRuntimeStatus;
 
-    expect(Object.keys(body).sort()).toEqual(["providers", "status"]);
+    expect(Object.keys(body).sort()).toEqual(["configured", "providers", "status"]);
+    expect(typeof body.configured).toBe("boolean");
     expect(body.providers).toHaveLength(2);
     for (const provider of body.providers) {
       expect(typeof provider.provider).toBe("string");

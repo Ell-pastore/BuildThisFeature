@@ -87,6 +87,49 @@ export interface AiConversationDetail extends AiConversationSummaryBase {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime status (GET /api/ai/status)
+// ---------------------------------------------------------------------------
+
+/** One safe, non-secret configuration/validation reason category. */
+export interface AiProviderIssue {
+  code: string;
+  message: string;
+}
+
+/** Safe per-provider capability status exposed to an authenticated client. */
+export interface AiProviderStatus {
+  /** Provider id, e.g. "grok", "gemini", "openrouter", "ollama". */
+  provider: string;
+  /** Zero-based position in the configured fallback chain. */
+  order: number;
+  /** Fully valid + constructible (NOT a proof of reachability). */
+  enabled: boolean;
+  /** Per-provider validation outcome. */
+  validationStatus: "valid" | "disabled";
+  /** Configured model, when present and safe to report. */
+  model?: string;
+  /** Number of configured credentials — never the values or handles. */
+  credentialCount: number;
+  /** True for credential-free providers (e.g. local Ollama). */
+  credentialFree: boolean;
+  /** Safe reason categories when the provider is disabled/invalid. */
+  issues: readonly AiProviderIssue[];
+}
+
+/** Stable, explicitly typed response of `GET /api/ai/status`. */
+export interface AiRuntimeStatus {
+  /** The status service itself computed successfully ("ok"). */
+  status: "ok";
+  /**
+   * Whether at least one provider is fully configured and constructible.
+   * Safe to drive "AI isn't configured yet" UX on.
+   */
+  configured: boolean;
+  /** Provider capability status, in configured fallback order. */
+  providers: readonly AiProviderStatus[];
+}
+
+// ---------------------------------------------------------------------------
 // Instruction submission (POST /api/ai/instructions)
 // ---------------------------------------------------------------------------
 
