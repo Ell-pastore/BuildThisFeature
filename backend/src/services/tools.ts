@@ -31,7 +31,10 @@
  * Tauri and so any future executor wiring can be substituted here.
  */
 import { createSessionExecutionContext } from "../tools/sessionContext.js";
-import { dispatchTool } from "../tools/handlers/index.js";
+import {
+  dispatchTool,
+  runToolPreflight,
+} from "../tools/handlers/index.js";
 import { isToolRegistryError, type ToolRegistry } from "../tools/registry.js";
 import { requiresToolApproval, type ToolDefinition } from "../tools/types.js";
 import { ToolError, ToolErrorCode } from "../tools/errors.js";
@@ -301,6 +304,20 @@ async function runApprovalGate(
         `Tool "${toolName}" requires approval, which needs a persisted conversation and message context.`,
       ),
     };
+  }
+  // Phase 10.36: run the tool's read-only PREFLIGHT BEFORE any approval record
+  // exists. A preflight performs DEEP validation that the generic schema check
+  // cannot express (source exists + is a file, destination parent is a folder,
+  // destination is free, both paths stay within permitted scope). Failing here
+  // means NO approval is created and NOTHING executes — an approval can never
+  // encode arguments that are provably invalid or unsafe at creation time.
+  const preflightError = await runToolPreflight(
+    toolName,
+    input,
+    options.filesystem,
+  );
+  if (preflightError !== null) {
+    return { ok: false, error: preflightError };
   }
   const now = new Date();
   try {

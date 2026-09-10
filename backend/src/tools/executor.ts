@@ -10,10 +10,12 @@
  * `DesktopFilesystemProvider`). In tests, a `FakeFilesystemExecutor`
  * stands in — no Tauri, no LLM, no Node `fs`.
  *
- * The interface is intentionally minimal: it lists ONLY the four read-only
- * operations the Phase 9.2 tool definitions describe. Write and destructive
- * operations are deliberately absent; they belong to later phases and
- * will be added here (and only here) when they arrive.
+ * The interface is intentionally minimal: it lists the four read-only
+ * operations the Phase 9.2 tool definitions describe, plus the single
+ * approval-gated write operation `moveFile` added in Phase 10.36. Write
+ * and destructive operations are deliberately absent beyond that; they
+ * belong to later phases and will be added here (and only here) when
+ * they arrive.
  *
  * Every method throws on failure. The error shape is the caller's
  * concern; handlers project these into public `AppError`s.
@@ -43,6 +45,13 @@ export interface FilesystemExecutor {
    * payload is JSON-safe for any wire format (HTTP, IPC, queue, log).
    */
   readFile(path: string): Promise<{ encoding: "base64"; data: string }>;
+  /**
+   * Move a file to an exact destination path (optionally renaming it).
+   * The Rust `move_file` command rejects folders, missing sources,
+   * missing destination folders, existing destinations, and any path
+   * outside the configured `AllowList`. Resolves to nothing on success.
+   */
+  moveFile(source: string, destinationPath: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +97,12 @@ export function tauriFilesystemExecutor(
         encoding: "base64" as const,
         data: Buffer.from(bytes).toString("base64"),
       }));
+    },
+    moveFile(source, destinationPath) {
+      return invoke<void>("move_file", {
+        source,
+        destination: destinationPath,
+      });
     },
   };
 }

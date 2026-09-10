@@ -54,6 +54,10 @@ export const ToolErrorCode = {
   UnknownTool: "tools/unknown-tool",
   // not_found
   FilesystemNotFound: "filesystem/not-found",
+  // validation — filesystem write operations (Phase 10.36)
+  FilesystemNotAFile: "filesystem/not-a-file",
+  FilesystemNotADirectory: "filesystem/not-a-directory",
+  FilesystemAlreadyExists: "filesystem/already-exists",
   // security
   PermissionDenied: "tools/permission-denied",
   PolicyContextMissing: "tools/policy-context-missing",

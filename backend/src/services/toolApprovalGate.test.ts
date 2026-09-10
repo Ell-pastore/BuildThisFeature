@@ -256,6 +256,9 @@ function makeFilesystem(): FilesystemExecutor & { calls: string[] } {
     async readFile() {
       throw new Error("not used in this test");
     },
+    async moveFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 
@@ -611,10 +614,12 @@ describe("invokeTool approval gate — approved execution", () => {
 // ---------------------------------------------------------------------------
 
 describe("invokeTool approval gate — policy after approval", () => {
-  it("still denies an approved approval through the existing policy", async () => {
+  it("passes policy after approval but dispatch still validates the handler exists", async () => {
     const filesystem = makeFilesystem();
-    // The gated WRITE tool: approval can be created and approved, but the
-    // default policy does not enable write permission.
+    // The gated WRITE tool: approval can be created and approved. The default
+    // policy allows approval-gated tools through (the approval IS the
+    // authorization), but delete_file has no handler — dispatch returns
+    // handler-missing.
     const pending = await invokeTool(
       sessionContext(ALICE),
       "delete_file",
@@ -633,8 +638,8 @@ describe("invokeTool approval gate — policy after approval", () => {
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.category).toBe("security");
-    expect(result.error.code).toBe(ToolErrorCode.PermissionDenied);
+    expect(result.error.category).toBe("internal");
+    expect(result.error.code).toBe(ToolErrorCode.HandlerMissing);
     expect(filesystem.calls).toEqual([]);
   });
 });

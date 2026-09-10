@@ -104,6 +104,9 @@ function makeFilesystem(): FilesystemExecutor & {
       calls.push("readFile");
       return { encoding: "base64", data: "" };
     },
+    async moveFile() {
+      calls.push("moveFile");
+    },
   };
   return fake;
 }

@@ -514,6 +514,55 @@ pub fn move_item(allow_list: &AllowList, source: &str, dest_dir: &str) -> Result
     fs::rename(&source, &destination).map_err(|e| format!("Unable to move: {}", map_io_error(&e)))
 }
 
+/// Move a FILE to an exact destination path. The destination may carry a new
+/// name (move + rename) or the same name, but it is always a full path: the
+/// destination folder must already exist and the leaf name is validated and
+/// applied by this function. Folders are rejected — only files are moved.
+///
+/// The source must be an existing file, so the destination can never silently
+/// become an empty placeholder, and the destination folder's canonical path is
+/// checked against the allow list so a move can never escape permitted roots.
+pub fn move_file(allow_list: &AllowList, source: &str, destination: &str) -> Result<(), String> {
+    let source: PathBuf = PathBuf::from(source);
+    if !source.exists() {
+        return Err("The file or folder no longer exists.".to_string());
+    }
+    let metadata =
+        fs::metadata(&source).map_err(|e| format!("Unable to move: {}", map_io_error(&e)))?;
+    if metadata.is_dir() {
+        return Err("The source is not a file".to_string());
+    }
+    let source = resolve_in_canonical_parent(&source, "Unable to move: ")?;
+    ensure_allowed(allow_list, &source)?;
+
+    let destination_path = Path::new(destination);
+    let name = destination_path
+        .file_name()
+        .ok_or_else(|| "Invalid destination path".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let name = validate_item_name(&name)?;
+    let parent = destination_path
+        .parent()
+        .ok_or_else(|| "Invalid destination path".to_string())?;
+    if !parent.exists() {
+        return Err("The destination folder does not exist.".to_string());
+    }
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Unable to move: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &parent)?;
+
+    let destination = parent.join(&name);
+    if destination == source {
+        return Ok(());
+    }
+    if destination.exists() {
+        return Err("A file or folder with that name already exists.".to_string());
+    }
+    fs::rename(&source, &destination).map_err(|e| format!("Unable to move: {}", map_io_error(&e)))
+}
+
 /// Delete a file or folder. The UI must confirm before calling this.
 pub fn delete_item(allow_list: &AllowList, path: &str) -> Result<(), String> {
     let target = PathBuf::from(path);
@@ -1808,6 +1857,132 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
         assert!(outside.child("o3.txt").is_file());
+    }
+
+    #[test]
+    fn move_file_moves_a_file_to_an_exact_destination() {
+        let root = TempDir::new("mvf_root");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        write_file(&root.child("a.txt"), "a");
+        move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&root.child("dest/a.txt")),
+        )
+        .unwrap();
+        assert!(root.child("dest").join("a.txt").is_file());
+        assert!(!root.child("a.txt").exists());
+    }
+
+    #[test]
+    fn move_file_can_rename_while_moving() {
+        let root = TempDir::new("mvf_rename");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        write_file(&root.child("a.txt"), "a");
+        move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&root.child("dest/renamed.txt")),
+        )
+        .unwrap();
+        assert!(root.child("dest").join("renamed.txt").is_file());
+        assert!(!root.child("a.txt").exists());
+    }
+
+    #[test]
+    fn move_file_rejects_folders_and_keeps_source_when_destination_is_missing() {
+        let root = TempDir::new("mvf_folder");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("folder")).unwrap();
+
+        let err = move_file(
+            &allow,
+            &str_of(&root.child("folder")),
+            &str_of(&root.child("dest2")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "The source is not a file");
+        assert!(root.child("folder").is_dir());
+
+        write_file(&root.child("a.txt"), "a");
+        let err = move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&root.child("missing/b.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "The destination folder does not exist.");
+        assert!(root.child("a.txt").is_file());
+    }
+
+    #[test]
+    fn move_file_refuses_to_overwrite_and_denies_outside_root() {
+        let root = TempDir::new("mvf_overwrite");
+        let outside = TempDir::new("mvf_outside");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        write_file(&root.child("a.txt"), "a");
+        write_file(&root.child("dest/a.txt"), "occupied");
+        let err = move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&root.child("dest/a.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "A file or folder with that name already exists.");
+        assert!(!root.child("dest").join("a.txt").is_empty());
+        assert_eq!(std::fs::read_to_string(root.child("dest").join("a.txt")).unwrap(), "occupied");
+
+        // in → out: denied and source untouched
+        write_file(&outside.child("x.txt"), "x");
+        let err = move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&outside.child("x.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(root.child("a.txt").is_file());
+        assert!(!outside.child("x.txt").is_empty());
+
+        // out → in: denied
+        let err = move_file(
+            &allow,
+            &str_of(&outside.child("x.txt")),
+            &str_of(&root.child("dest/x.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        assert!(outside.child("x.txt").is_file());
+    }
+
+    #[test]
+    fn move_file_missing_source_and_noop_destination() {
+        let root = TempDir::new("mvf_noop");
+        let allow = allow_for(&root);
+        fs::create_dir_all(root.child("dest")).unwrap();
+
+        let err = move_file(
+            &allow,
+            &str_of(&root.child("ghost.txt")),
+            &str_of(&root.child("dest/ghost.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "The file or folder no longer exists.");
+
+        write_file(&root.child("a.txt"), "a");
+        move_file(
+            &allow,
+            &str_of(&root.child("a.txt")),
+            &str_of(&root.child("a.txt")),
+        )
+        .unwrap();
+        assert!(root.child("a.txt").is_file());
     }
 
     #[test]

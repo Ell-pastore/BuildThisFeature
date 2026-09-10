@@ -260,6 +260,9 @@ describe("createSessionExecutionContext — dispatch integration", () => {
       async readFile() {
         throw new Error("not used in this test");
       },
+      async moveFile() {
+        throw new Error("not used in this test");
+      },
     };
   }
 

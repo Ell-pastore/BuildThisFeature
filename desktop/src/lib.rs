@@ -61,6 +61,16 @@ fn move_item(
     fs_service::move_item(allow_list.inner(), &source, &dest_dir)
 }
 
+/// Move a file to an exact destination path (optionally renaming it).
+#[tauri::command]
+fn move_file(
+    source: String,
+    destination: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<(), String> {
+    fs_service::move_file(allow_list.inner(), &source, &destination)
+}
+
 /// Delete a file or folder. The UI must confirm before calling this.
 #[tauri::command]
 fn delete_item(
@@ -208,6 +218,7 @@ pub fn run() {
             create_folder,
             rename_item,
             move_item,
+            move_file,
             delete_item,
             open_item,
             disk_usage,

@@ -71,6 +71,46 @@ export type PathValidation =
   | { ok: false; error: ToolError };
 
 /**
+ * Return the parent directory of an absolute path (both POSIX `/` and Windows
+ * `\` separators), or `null` when the path has no parent (it is already a
+ * filesystem root). Trailing separators are ignored, so `"/a/b/"` and
+ * `"/a/b"` both yield `"/a"`. The root itself (`"/"`, `"C:\"`, `"C:/"`,
+ * `"\\server\share"`) has no parent.
+ *
+ * Shape-only, never I/O. Used by validation that must reason about a
+ * destination path's containing folder before any executor call.
+ */
+export function parentDirectory(path: string): string | null {
+  const parts = path.split(/[\\/]+/);
+  while (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+
+  if (!isWindowsAbsolute(path)) {
+    // POSIX root has no parent; everything else names its parent by the
+    // segment list minus the final component.
+    if (parts.length <= 1) return null;
+    parts.pop();
+    // After the pop, the first element is always "" (the leading-slash
+    // artefact of split("/")).  Joining already produces the leading "/"
+    // (e.g. ["", "a", "b"].join("/") === "/a/b"), so we must NOT prepend
+    // another "/" — that would yield a double-slash like "//a/b".
+    const joined = parts.join("/");
+    return joined === "" ? "/" : joined;
+  }
+  if (parts.length <= 1) {
+    // A bare `C:` was already rejected by isAbsoluteToolPath; treat a
+    // root-only drive or UNC share as having no parent.
+    return null;
+  }
+  parts.pop();
+  const lastRemaining = parts[0];
+  if (parts.length === 1 && lastRemaining !== undefined && /^[A-Za-z]:$/.test(lastRemaining)) {
+    return lastRemaining + "\\";
+  }
+  if (path.startsWith("\\\\") && parts.length <= 3) return null;
+  return parts.join("\\");
+}
+
+/**
  * Deterministic first gate for a tool-provided directory/file path. Rejects
  * relative, control-character, and root-escaping paths as typed `ToolError`s
  * — `validation` / `tools/invalid-path` for unusable input, `security` /

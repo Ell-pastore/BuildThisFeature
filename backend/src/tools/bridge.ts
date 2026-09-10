@@ -27,6 +27,7 @@ export type {
 } from "./types.js";
 
 export { readToolDefinitions, registerReadTools } from "./definitions/readTools.js";
+export { writeToolDefinitions, registerWriteTools } from "./definitions/writeTools.js";
 
 export type { FilesystemExecutor, TauriInvoke } from "./executor.js";
 export { tauriFilesystemExecutor } from "./executor.js";
@@ -35,6 +36,7 @@ export {
   handlers,
   handledToolNames,
   dispatchTool,
+  runToolPreflight,
 } from "./handlers/index.js";
 export type {
   RawToolInput,

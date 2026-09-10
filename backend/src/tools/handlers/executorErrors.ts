@@ -40,6 +40,13 @@ const SHAPES: readonly Shape[] = [
     match: (l) => l.includes("access") && l.includes("not permitted"),
   },
   {
+    // Rust `SECURITY_POLICY_ERROR` fires when an operation would touch a
+    // path the `AllowList` does not contain.
+    category: "security",
+    code: ToolErrorCode.FilesystemNotAllowed,
+    match: (l) => l.includes("outside your allowed"),
+  },
+  {
     category: "not_found",
     code: ToolErrorCode.FilesystemNotFound,
     match: (l) =>
@@ -47,13 +54,19 @@ const SHAPES: readonly Shape[] = [
   },
   {
     category: "validation",
-    code: "filesystem/not-a-directory",
+    code: ToolErrorCode.FilesystemNotADirectory,
     match: (l) => l.includes("not a folder") || l.includes("not a directory"),
   },
   {
     category: "validation",
-    code: "filesystem/not-a-file",
+    code: ToolErrorCode.FilesystemNotAFile,
     match: (l) => l.includes("is a folder") || l.includes("not a file"),
+  },
+  {
+    // Significant for move/copy/rename: the destination already exists.
+    category: "validation",
+    code: ToolErrorCode.FilesystemAlreadyExists,
+    match: (l) => l.includes("already exists"),
   },
 ];
 

@@ -24,7 +24,7 @@ import type {
   FileEntry,
   FileMetadata,
 } from "../tauriShapes.js";
-import { ToolError, ToolErrorCode } from "../errors.js";
+import { ToolError, ToolErrorCode, toToolError } from "../errors.js";
 import {
   defaultToolPolicy,
   enforcePolicy,
@@ -38,11 +38,17 @@ import {
   type ToolHandler,
   type ToolHandlerContext,
 } from "./handler.js";
+import type { FilesystemExecutor } from "../executor.js";
 
 import { getFileMetadataHandler } from "./getFileMetadata.js";
 import { listDirectoryHandler } from "./listDirectory.js";
 import { readFileHandler } from "./readFile.js";
 import { searchFilesHandler } from "./searchFiles.js";
+import {
+  moveFileHandler,
+  validateMoveFileInput,
+  type MoveFileResult,
+} from "./moveFile.js";
 
 /**
  * Map of tool name → handler. Typed as an object literal (not a Record)
@@ -62,12 +68,62 @@ export const handlers = Object.freeze({
     encoding: "base64";
     data: string;
   }>,
+  move_file: ((input, ctx) =>
+    runHandler(moveFileHandler, input, ctx)) as ToolHandler<MoveFileResult>,
 });
 
 /** Names of tools that have a registered handler. */
 export const handledToolNames: readonly string[] = Object.freeze(
   Object.keys(handlers),
 );
+
+/**
+ * Per-tool preflight functions (Phase 10.36).
+ *
+ * A preflight performs DEEP, read-only semantic validation of a tool's
+ * arguments BEFORE an approval record is created. The generic schema
+ * check that the approval gate already runs is shape-only; the preflight
+ * adds filesystem-relative checks (target exists, is a file, is in scope,
+ * destination is free, ...) so an approval can never encode arguments
+ * that are demonstrably invalid or unsafe at creation time.
+ *
+ * Preflights MUST be read-only — approval creation must never mutate the
+ * filesystem. They are also re-run at execution time (the handlers share
+ * the same validation), which is what reconciles approvals against a
+ * filesystem that changed after approval.
+ *
+ * A tool with an absent preflight is fine — most tools are plain reads.
+ */
+type ToolPreflight = (
+  input: RawToolInput,
+  filesystem: FilesystemExecutor,
+) => Promise<unknown> | unknown;
+
+export const toolPreflights: Readonly<Record<string, ToolPreflight>> =
+  Object.freeze({
+    move_file: (input, filesystem) => validateMoveFileInput(input, filesystem),
+  });
+
+/**
+ * Run a tool's preflight if one is registered. Returns `null` when the
+ * preflight passes (or does not exist); returns the categorized
+ * `ToolError` when it fails. Unexpected throws collapse to a public-safe
+ * `internal` error — raw executor text is never surfaced by the gate.
+ */
+export async function runToolPreflight(
+  toolName: string,
+  input: RawToolInput,
+  filesystem: FilesystemExecutor,
+): Promise<ToolError | null> {
+  const preflight = toolPreflights[toolName];
+  if (!preflight) return null;
+  try {
+    await preflight(input, filesystem);
+    return null;
+  } catch (error) {
+    return toToolError(error, "internal");
+  }
+}
 
 /**
  * Dispatch a tool call. Looks the tool up in the registry (proving it is

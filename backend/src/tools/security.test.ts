@@ -30,6 +30,7 @@ interface ExecutorCalls {
   searchFiles: string[];
   getFileMetadata: string[];
   readFile: string[];
+  moveFile: Array<{ source: string; destination: string }>;
 }
 
 function makeRecordingExecutor(): FilesystemExecutor & { calls: ExecutorCalls } {
@@ -38,6 +39,7 @@ function makeRecordingExecutor(): FilesystemExecutor & { calls: ExecutorCalls } 
     searchFiles: [],
     getFileMetadata: [],
     readFile: [],
+    moveFile: [],
   };
   return {
     calls,
@@ -71,6 +73,9 @@ function makeRecordingExecutor(): FilesystemExecutor & { calls: ExecutorCalls } 
       calls.readFile.push(path);
       return { encoding: "base64", data: "" };
     },
+    async moveFile(source, destination) {
+      calls.moveFile.push({ source, destination });
+    },
   };
 }
 
@@ -90,6 +95,7 @@ function assertNoFilesystemTouch(calls: ExecutorCalls): void {
   expect(calls.searchFiles).toEqual([]);
   expect(calls.getFileMetadata).toEqual([]);
   expect(calls.readFile).toEqual([]);
+  expect(calls.moveFile).toEqual([]);
 }
 
 describe("no arbitrary command/code execution path", () => {
@@ -98,6 +104,7 @@ describe("no arbitrary command/code execution path", () => {
     expect([...handledToolNames].sort()).toEqual([
       "get_file_metadata",
       "list_directory",
+      "move_file",
       "read_file",
       "search_files",
     ]);

@@ -319,6 +319,9 @@ function makeFilesystem(): FilesystemExecutor & { calls: string[] } {
     async readFile() {
       throw new Error("not used in this test");
     },
+    async moveFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 

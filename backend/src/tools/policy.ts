@@ -32,7 +32,11 @@
  * implementation.
  */
 import { ToolError, ToolErrorCode, type ToolErrorCategory } from "./errors.js";
-import { ToolPermission, type ToolDefinition } from "./types.js";
+import {
+  requiresToolApproval,
+  ToolPermission,
+  type ToolDefinition,
+} from "./types.js";
 
 /**
  * The authenticated identity carried by an `ai-agent` actor.
@@ -278,7 +282,13 @@ export type ToolPolicy = (
  *   user status is not `"active"`. A `user` actor is rejected as
  *   `tools/permission-denied` (the actor kind is not authorized in
  *   Phase 9.6).
- * - Reject any tool whose `permission` is not `Read`.
+ * - Reject any tool whose `permission` is not `Read`, UNLESS the tool
+ *   definition declares `requiresApproval` (Phase 10.28B+). Approval-
+ *   gated write tools (`move_file` in Phase 10.36) never reach dispatch
+ *   without a valid, executable approval — the approval gate is the
+ *   authorization, not this policy. Ungated write / destructive tools
+ *   remain denied, so a registrant who forgets the approval flag gets a
+ *   clear "permission denied" instead of a silent success.
  */
 export function defaultToolPolicy(): ToolPolicy {
   return function policy(definition, context) {
@@ -308,16 +318,18 @@ export function defaultToolPolicy(): ToolPolicy {
       );
     }
 
-    // 3. Only read tools exist in Phase 9.6. Write and destructive
-    //    tools are not yet wired; deny them explicitly so a future
-    //    tool author who registers a write tool gets a clear
-    //    "permission denied" instead of a silent success.
+    // 3. Read tools are always allowed. Non-read tools are allowed ONLY
+    //    when they carry `requiresApproval` — fixed tool-definition
+    //    metadata the AI cannot control. Ungated write/destructive tools
+    //    are denied explicitly.
     if (definition.permission !== ToolPermission.Read) {
-      return deny(
-        "security",
-        ToolErrorCode.PermissionDenied,
-        `Tool "${definition.name}" has permission "${definition.permission}" which is not enabled.`,
-      );
+      if (!requiresToolApproval(definition)) {
+        return deny(
+          "security",
+          ToolErrorCode.PermissionDenied,
+          `Tool "${definition.name}" has permission "${definition.permission}" which is not enabled.`,
+        );
+      }
     }
 
     return { allowed: true };

@@ -107,6 +107,9 @@ function makeFilesystem(events?: string[]): FilesystemExecutor {
     async readFile() {
       throw new Error("not used in this test");
     },
+    async moveFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 

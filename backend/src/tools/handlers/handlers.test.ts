@@ -22,6 +22,10 @@ import {
   readToolDefinitions,
   registerReadTools,
 } from "../definitions/readTools.js";
+import {
+  writeToolDefinitions,
+  registerWriteTools,
+} from "../definitions/writeTools.js";
 import { dispatchTool, handlers, handledToolNames } from "./index.js";
 import { requireString } from "./handler.js";
 import {
@@ -43,6 +47,7 @@ interface FakeOptions {
   listDirectory?: DirectoryListing;
   searchFiles?: FileEntry[];
   getFileMetadata?: FileMetadata;
+  getFileMetadataByPath?: Record<string, FileMetadata>;
   readFile?: { encoding: "base64"; data: string };
 }
 
@@ -50,7 +55,9 @@ interface FakeErrorOptions {
   listDirectory?: Error;
   searchFiles?: Error;
   getFileMetadata?: Error;
+  getFileMetadataByPath?: Record<string, Error>;
   readFile?: Error;
+  moveFile?: Error;
 }
 
 interface Fake extends FilesystemExecutor {
@@ -59,6 +66,7 @@ interface Fake extends FilesystemExecutor {
     searchFiles: string[];
     getFileMetadata: string[];
     readFile: string[];
+    moveFile: Array<[string, string]>;
   };
   respondWith: FakeOptions;
   throwFor: FakeErrorOptions;
@@ -70,6 +78,7 @@ function makeFake(): Fake {
     searchFiles: [] as string[],
     getFileMetadata: [] as string[],
     readFile: [] as string[],
+    moveFile: [] as Array<[string, string]>,
   };
   const respondWith: FakeOptions = {};
   const throwFor: FakeErrorOptions = {};
@@ -92,6 +101,12 @@ function makeFake(): Fake {
     async getFileMetadata(path: string) {
       calls.getFileMetadata.push(path);
       if (throwFor.getFileMetadata) throw throwFor.getFileMetadata;
+      if (throwFor.getFileMetadataByPath?.[path]) {
+        throw throwFor.getFileMetadataByPath[path];
+      }
+      if (respondWith.getFileMetadataByPath?.[path]) {
+        return respondWith.getFileMetadataByPath[path];
+      }
       if (respondWith.getFileMetadata) return respondWith.getFileMetadata;
       return {
         name: path,
@@ -115,12 +130,40 @@ function makeFake(): Fake {
       if (respondWith.readFile) return respondWith.readFile;
       return { encoding: "base64", data: "" };
     },
+    async moveFile(source: string, destination: string) {
+      calls.moveFile.push([source, destination]);
+      if (throwFor.moveFile) throw throwFor.moveFile;
+      return undefined;
+    },
   };
   return fake;
 }
 
 let registry: ToolRegistry;
 let fake: Fake;
+
+/** Canned `FileMetadata` for scripting the fake's per-path map. */
+function metaOf(
+  path: string,
+  kind: "file" | "folder",
+): FileMetadata {
+  const isFile = kind === "file";
+  return {
+    name: path.split("/").pop() ?? path,
+    path,
+    isFile,
+    isFolder: !isFile,
+    sizeBytes: 0,
+    extension: null,
+    isHidden: false,
+    modified: "\u2014",
+    modifiedTs: 0,
+    created: "\u2014",
+    createdTs: 0,
+    accessed: null,
+    accessedTs: null,
+  };
+}
 
 function makeContext() {
   return { filesystem: fake };
@@ -743,6 +786,7 @@ describe("dispatchTool", () => {
       searchFiles: [],
       getFileMetadata: [],
       readFile: [],
+      moveFile: [],
     });
   });
 
@@ -796,7 +840,7 @@ describe("read tools — registry", () => {
     "read_file",
   ];
 
-  it("all four tools are registered", () => {
+  it("all four read tools are registered", () => {
     expect(registry.size).toBe(4);
   });
 
@@ -815,41 +859,256 @@ describe("read tools — registry", () => {
   it.each(toolNames)("tool '%s' has the read permission", (name) => {
     expect(registry.get(name).permission).toBe("read");
   });
+});
 
-  it("handledToolNames lists all four tools", () => {
-    expect(handledToolNames).toEqual(toolNames);
+// ---------------------------------------------------------------------------
+// Registry: write tools
+// ---------------------------------------------------------------------------
+
+describe("write tools — registry", () => {
+  it("registerWriteTools adds move_file alongside the read tools", () => {
+    const r = new ToolRegistry();
+    registerReadTools(r);
+    registerWriteTools(r);
+    expect(r.size).toBe(5);
+    expect(r.get("move_file")).toBeDefined();
   });
 
-  it("handlers map has entries for all four tools", () => {
-    for (const name of toolNames) {
-      expect(
-        (handlers as unknown as Record<string, unknown>)[name],
-      ).toBeDefined();
-    }
+  it("move_file is a write-permission tool that requires approval", () => {
+    const definition = writeToolDefinitions.find(
+      (d) => d.name === "move_file",
+    );
+    expect(definition).toBeDefined();
+    if (definition === undefined) return;
+    expect(definition.permission).toBe("write");
+    expect(definition.requiresApproval).toBe(true);
+    expect(definition.inputSchema.required).toContain("sourcePath");
+    expect(definition.inputSchema.required).toContain("destinationPath");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Definitions export the same four tools the bridge handles
+// move_file handler behaviour (via dispatchTool — approval-agnostic)
+// ---------------------------------------------------------------------------
+
+describe("move_file handler", () => {
+  beforeEach(() => {
+    registerWriteTools(registry);
+  });
+
+  function scriptMoveState(): void {
+    fake.respondWith.getFileMetadataByPath = {
+      "/home/a.txt": metaOf("/home/a.txt", "file"),
+      "/home/dest": metaOf("/home/dest", "folder"),
+    };
+    fake.throwFor.getFileMetadataByPath = {
+      "/home/dest/b.txt": new Error("The file or folder does not exist."),
+    };
+  }
+
+  it("moves a file to an exact destination and reports the canonical pair", async () => {
+    scriptMoveState();
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/home/dest/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw result.error;
+    expect(result.data).toEqual({
+      movedFrom: "/home/a.txt",
+      movedTo: "/home/dest/b.txt",
+    });
+    expect(fake.calls.moveFile).toEqual([["/home/a.txt", "/home/dest/b.txt"]]);
+  });
+
+  it("rejects a missing source as not_found", async () => {
+    fake.throwFor.getFileMetadataByPath = {
+      "/home/ghost.txt": new Error("The file or folder no longer exists."),
+    };
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/ghost.txt", destinationPath: "/home/dest/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("not_found");
+    expect(result.error.code).toBe(ToolErrorCode.FilesystemNotFound);
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects a folder source as not-a-file", async () => {
+    fake.respondWith.getFileMetadataByPath = {
+      "/home/folder": metaOf("/home/folder", "folder"),
+    };
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/folder", destinationPath: "/home/dest/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.FilesystemNotAFile);
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects a missing destination folder as not_found", async () => {
+    fake.respondWith.getFileMetadataByPath = {
+      "/home/a.txt": metaOf("/home/a.txt", "file"),
+    };
+    fake.throwFor.getFileMetadataByPath = {
+      "/home/missing": new Error("The file or folder does not exist."),
+      "/home/missing/b.txt": new Error("The file or folder does not exist."),
+    };
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/home/missing/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("not_found");
+    expect(result.error.message).toBe("The destination folder does not exist.");
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects an existing destination as already-exists and never overwrites", async () => {
+    fake.respondWith.getFileMetadataByPath = {
+      "/home/a.txt": metaOf("/home/a.txt", "file"),
+      "/home/dest": metaOf("/home/dest", "folder"),
+      "/home/dest/b.txt": metaOf("/home/dest/b.txt", "file"),
+    };
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/home/dest/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(result.error.code).toBe(ToolErrorCode.FilesystemAlreadyExists);
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects a destination outside the permitted scope as security", async () => {
+    fake.respondWith.getFileMetadataByPath = {
+      "/home/a.txt": metaOf("/home/a.txt", "file"),
+    };
+    fake.throwFor.getFileMetadataByPath = {
+      "/etc": new Error("Access to this location is not permitted."),
+      "/etc/passwd": new Error("Access to this location is not permitted."),
+    };
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/etc/passwd" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("security");
+    expect(result.error.code).toBe(ToolErrorCode.FilesystemNotAllowed);
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects identical source and destination as validation", async () => {
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/home/a.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("validation");
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("rejects malformed and traversal-escaping paths before any executor call", async () => {
+    for (const args of [
+      { sourcePath: "relative.txt", destinationPath: "/home/dest/b.txt" },
+      { sourcePath: "/home/a.txt", destinationPath: "relative.txt" },
+      { sourcePath: "/a\u0000b", destinationPath: "/home/dest/b.txt" },
+      { sourcePath: "/home/a.txt", destinationPath: "/../etc" },
+    ]) {
+      const result = await dispatchTool(
+        registry,
+        "move_file",
+        args,
+        makeContext(),
+        makeExecutionContext(),
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.category).toBe(result.error.category);
+    }
+    expect(fake.calls.getFileMetadata).toEqual([]);
+    expect(fake.calls.moveFile).toEqual([]);
+  });
+
+  it("propagates executor move failures as categorized errors", async () => {
+    scriptMoveState();
+    fake.throwFor.moveFile = new Error("Permission denied.");
+    const result = await dispatchTool(
+      registry,
+      "move_file",
+      { sourcePath: "/home/a.txt", destinationPath: "/home/dest/b.txt" },
+      makeContext(),
+      makeExecutionContext(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.category).toBe("security");
+    expect(result.error.code).toBe(ToolErrorCode.FilesystemPermissionDenied);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Definitions export the same tools the bridge handles (read + write)
 // ---------------------------------------------------------------------------
 
 describe("definitions ↔ handlers wiring", () => {
-  it("readToolDefinitions has the same names as handledToolNames", () => {
-    const definedNames = readToolDefinitions.map((d) => d.name).sort();
+  it("all defined tools (read + write) have the same names as handledToolNames", () => {
+    const definedNames = [
+      ...readToolDefinitions.map((d) => d.name),
+      ...writeToolDefinitions.map((d) => d.name),
+    ].sort();
     const handled = [...handledToolNames].sort();
     expect(handled).toEqual(definedNames);
   });
 
   it("every defined tool has a matching handler", () => {
     const handlerMap = handlers as unknown as Record<string, unknown>;
-    for (const def of readToolDefinitions) {
+    for (const def of [...readToolDefinitions, ...writeToolDefinitions]) {
       expect(handlerMap[def.name]).toBeDefined();
     }
   });
 
-  it("every defined tool declares the read permission", () => {
+  it("every read tool declares the read permission", () => {
     for (const def of readToolDefinitions) {
       expect(def.permission).toBe("read");
+    }
+  });
+
+  it("every write tool declares approval-gated permission", () => {
+    for (const def of writeToolDefinitions) {
+      expect(def.permission).not.toBe("read");
+      expect(def.requiresApproval).toBe(true);
     }
   });
 });

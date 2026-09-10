@@ -36,6 +36,7 @@ import { isConversationId } from "./conversationId.js";
 import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { readToolDefinitions, registerReadTools } from "../tools/definitions/readTools.js";
+import { writeToolDefinitions, registerWriteTools } from "../tools/definitions/writeTools.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
 import type { AgentMessage } from "./conversation.js";
 import { isAgentLoopError } from "./agentLoop.js";
@@ -350,9 +351,10 @@ function createDefaultAiInstructionRuntime(): PersistentAgentTurnRuntime {
   const stack = composeDefaultProviderStack();
   const registry = new ToolRegistry();
   registerReadTools(registry);
+  registerWriteTools(registry);
   return createPersistentTurnRuntime({
     stack,
-    tools: readToolDefinitions,
+    tools: [...readToolDefinitions, ...writeToolDefinitions],
     registry,
     filesystem: boundFilesystem,
     maxToolRounds: MAX_TOOL_ROUNDS,
