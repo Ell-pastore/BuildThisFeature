@@ -514,3 +514,75 @@ retry control instead of echoing a raw error.
   (credential counts, never values/handles); the notice shows only friendly
   copy; no provider keys added or touched anywhere.
 - oxfmt (workspace defect) was NOT run; edits match committed style.
+
+---
+
+# Phase 10.38 — Production AI instruction runtime binding at startup
+
+> Root: 61b2c0e `AI: graceful provider status and failure UX`
+> This phase: `AI: bind production runtime at startup`
+
+## Goal
+
+Remove the remaining gap between a fully configured provider system and an
+operational `POST /api/ai/instructions` route: the production app now binds the
+LONG-LIVED persistent agent-turn runtime **once at startup** so provider
+fallback/rotation/cooldown state and the registered tool surface survive across
+requests. The previous lazy runtime construction — which surfaced as a 503
+`common/not-configured` "filesystem executor not configured" on every instruction
+when no runtime was pre-bound — is eliminated when the runtime is correctly
+configured. Provider misconfiguration now FAILS STARTUP LOUDLY (the server
+refuses to start) instead of silently serving a broken AI stack.
+
+## What changed
+
+1. `backend/src/services/productionAiRuntime.ts` (NEW) — the single composition
+   + binding point:
+   - `composeProductionAiRuntime(options)` assembles the runtime from the
+     configured provider stack (`composeDefaultProviderStack()`), the registered
+     read + write tool surface, a fresh `ToolRegistry`, and the desktop
+     `FilesystemExecutor` bridge (Tauri IPC, via `tauriFilesystemExecutor`).
+   - `bindProductionAiInstructionRuntime(runtime | options)` composes (when
+     options are given) and binds via the existing `bindAiInstructionRuntime`
+     seam.
+   - `ProviderCompositionError` propagates SYNC (nothing swallows it) — provider
+     misconfiguration is loud at startup.
+   - The ambient Tauri `invoke` is resolved from `globalThis.__TAURI__` when the
+     host is present; a host/test can inject `invoke` / `filesystem` / `stack`.
+     When no host is available, the filesystem executor is fail-closed (tools
+     reject with a clear, non-secret error instead of crashing the server).
+2. `backend/src/app.ts` (EDIT) — `createApp(options?)` now calls
+   `bindProductionAiInstructionRuntime(options.aiRuntime)` before any route is
+   served. An optional `{ aiRuntime }` injection point lets tests and hosts
+   supply a pre-assembled runtime; absent it, the composed production runtime is
+   built (and provider misconfiguration throws synchronously).
+3. `backend/src/services/productionAiRuntime.test.ts` (NEW) — regression tests:
+   - the composed runtime is assembled from the explicit stack + tool surface;
+   - `bindProductionAiInstructionRuntime` returns the same instance;
+   - binding removes the 503 filesystem-executor condition (via
+     `runAiInstruction`);
+   - the existing 503 `common/not-configured` guard remains intact when NO
+     runtime is bound;
+   - provider misconfiguration fails LOUDLY out of both
+     `composeProductionAiRuntime` and `createApp` (deterministic, env-independent
+     via vi.mock).
+4. `backend/src/app.test.ts` (NEW) — app-level HTTP regression tests driving
+   the REAL `createApp()`:
+   - an authenticated instruction through an injected runtime returns 200 with
+     the expected turn result (proves the startup binding reaches the route);
+   - a composed production runtime (Ollama stack, credential-free) reaches the
+     same 200 path via HTTP (proves the full composition → binding → route
+     pipeline works offline, no DB beyond the mocked persistence layer);
+   - the old 503 filesystem-executor envelope no longer appears when the
+     runtime is configured.
+5. `backend/src/services/h.txt` (EDIT) — this phase note appended.
+
+## Verification
+
+- Backend: 995/995 tests pass (`pnpm test`), 39 files; `pnpm typecheck` clean.
+- No new providers, adapters, tools, streaming, filesystem tools, or
+  approval/policy changes. Existing behavior unchanged.
+- Security: the production runtime only binds at startup; no new secrets are
+  introduced, and `ProviderCompositionError` carries only provider ids (never
+  credential values).
+- oxfmt (workspace defect) was NOT run; edits match committed style.
