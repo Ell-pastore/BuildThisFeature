@@ -7,14 +7,20 @@
  * never pass or hold a token, and no unauthenticated request is ever issued.
  *
  * The body is STRICT and mirrors the backend validation: only
- * `conversationId` (optional — omitted to start a NEW conversation) and
- * `instruction` (required) are ever sent. Identity always comes from the
- * session, never the body. Ownership, execution, tool policy, turn state, and
- * errors all stay authoritative on the backend.
+ * `conversationId` (optional — omitted to start a NEW conversation),
+ * `instruction` (required), `approvalId` (optional — resume after an approved
+ * approval), and `resumeExecutions` (optional — resume after the desktop host
+ * executed the pending operations) are ever sent. Identity always comes from
+ * the session, never the body. Ownership, execution, tool policy, turn state,
+ * and errors all stay authoritative on the backend.
  */
 import { apiRequest } from "./client";
 import { requireSessionToken } from "../session";
-import type { AiInstructionResponse } from "../../types/ai";
+import { isTauriEnv } from "../desktopEnv";
+import type {
+  AiHostExecutionSubmission,
+  AiInstructionResponse,
+} from "../../types/ai";
 
 /** The ONLY fields ever sent to `POST /api/ai/instructions`. */
 export interface SubmitAiInstructionInput {
@@ -28,12 +34,26 @@ export interface SubmitAiInstructionInput {
   approvalId?: string;
   /** The user's instruction (required; server-truncated at 4096 characters). */
   instruction: string;
+  /**
+   * Resume the interrupted turn after the desktop host executed the pending
+   * operations (Phase 10.39): one submission per pending execution. The
+   * backend validates each id, ownership, pending status, and expiry, then
+   * seals the executions and replays their results into the SAME bounded turn.
+   */
+  resumeExecutions?: readonly AiHostExecutionSubmission[];
 }
 
 /**
  * Submit one instruction to the agent runtime. A foreign or missing
  * conversation surfaces as the backend's 404 envelope; provider failures as
  * 503; the tool-loop bound as 502 (all typed `ApiClientError`).
+ *
+ * When this app is running inside the Tauri desktop webview, the
+ * `x-desktop-host: 1` header is sent so the backend swaps the host-delegated
+ * filesystem executor in for THIS request and records AI filesystem tool
+ * calls as host executions instead of failing against a Tauri bridge this
+ * Node process cannot reach. Plain browsers never send it — the backend stays
+ * fail-closed there.
  */
 export async function submitAiInstruction(
   input: SubmitAiInstructionInput,
@@ -43,5 +63,6 @@ export async function submitAiInstruction(
     method: "POST",
     body: input,
     token,
+    ...(isTauriEnv() ? { headers: { "x-desktop-host": "1" } } : {}),
   });
 }

@@ -1,81 +1,43 @@
-import { Sparkles, Filter } from "../../components/Icons";
+import { Filter } from "../../components/Icons";
 import FileIcon from "../FileIcon";
 import type { FileItem } from "../../types";
 
 interface SearchProps {
   query: string;
   onOpenFile: (file: FileItem) => void;
-  /** Real results passed from App (currently loaded directory). */
+  /** Real results from the recursive desktop filesystem search. */
   results?: FileItem[];
+  /** True while the recursive search is in flight. */
+  searching?: boolean;
+  /** Honest error string when the underlying search failed. */
+  error?: string | null;
 }
 
-const aiUnderstanding: Record<string, string[]> = {
-  default: ["Relevant files", "Current folder", "Filenames and types"],
-  video: ["Video files", "Large media", "All folders"],
-  duplicate: ["PDF files", "Duplicate content", "Same file size"],
-  week: ["All file types", "Modified in last 7 days", "Any location"],
-};
-
-function getUnderstanding(q: string) {
-  const l = q.toLowerCase();
-  if (l.includes("video") || l.includes("large")) return aiUnderstanding.video;
-  if (l.includes("duplicate")) return aiUnderstanding.duplicate;
-  if (l.includes("week") || l.includes("yesterday") || l.includes("recent")) return aiUnderstanding.week;
-  return aiUnderstanding.default;
-}
-
-function matchScore(file: FileItem, query: string): number {
-  const q = query.toLowerCase();
-  const name = file.name.toLowerCase();
-  if (name.includes(q)) return 94;
-  const words = q.split(" ");
-  const matches = words.filter(
-    (w) => name.includes(w) || file.location.toLowerCase().includes(w) || file.type.includes(w),
-  );
-  return Math.max(40, Math.round((matches.length / words.length) * 80 + Math.random() * 15));
-}
-
-function getReason(file: FileItem, query: string): string {
-  const q = query.toLowerCase();
-  if (file.name.toLowerCase().includes(q)) return `Filename directly matches "${query}".`;
-  return `File name and type are relevant to "${query}".`;
-}
-
-export default function Search({ query, onOpenFile, results = [] }: SearchProps) {
-  const understanding = getUnderstanding(query);
-  // Search runs against the real data provided by the app; never fake files.
-  const displayed = results
-    .map((f) => ({ ...f, score: matchScore(f, query), reason: getReason(f, query) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 7);
+export default function Search({
+  query,
+  onOpenFile,
+  results = [],
+  searching = false,
+  error = null,
+}: SearchProps) {
+  const hasQuery = query.trim().length > 0;
 
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-3xl mx-auto px-8 py-8 space-y-6">
-        {/* Query header */}
-        <div className="bg-card border border-border rounded-xl p-5">
-          <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-1">Search Query</div>
-          <div className="text-lg font-medium text-foreground" style={{ fontFamily: "Instrument Sans, sans-serif" }}>
-            "{query}"
+        {hasQuery && (
+          <div className="bg-card border border-border rounded-xl p-5">
+            <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-1">
+              Search Query
+            </div>
+            <div
+              className="text-lg font-medium text-foreground"
+              style={{ fontFamily: "Instrument Sans, sans-serif" }}
+            >
+              "{query}"
+            </div>
           </div>
-        </div>
-
-        {/* AI Understanding */}
-        <div className="bg-ai-bg border border-indigo-200 rounded-xl p-5">
-          <div className="flex items-center gap-2 mb-3">
-            <Sparkles size={14} className="text-ai-text" />
-            <span className="text-sm font-semibold text-ai-text" style={{ fontFamily: "Instrument Sans, sans-serif" }}>AI Understanding</span>
-          </div>
-          <div className="text-xs text-ai-text mb-3">Looking for:</div>
-          <ul className="space-y-1.5">
-            {understanding.map((item) => (
-              <li key={item} className="flex items-center gap-2 text-sm text-ai-text">
-                <span className="w-1.5 h-1.5 rounded-full bg-accent flex-shrink-0" />
-                {item}
-              </li>
-            ))}
-          </ul>
-        </div>
+        )}
 
         {/* Filters */}
         <div className="flex items-center gap-2">
@@ -95,42 +57,61 @@ export default function Search({ query, onOpenFile, results = [] }: SearchProps)
           </button>
         </div>
 
-        {/* Results */}
+        {/* Results — rendered only from real provider data; honest states. */}
         <div>
-          <div className="text-xs text-muted-foreground mb-3">{displayed.length} results</div>
-          {displayed.length === 0 ? (
+          {searching ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
+              <div className="w-8 h-8 rounded-full border-2 border-border border-t-accent animate-spin mx-auto mb-4" />
+              <p className="text-sm font-medium text-foreground">Searching your folders…</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Looking through all your allowed folders.
+              </p>
+            </div>
+          ) : error ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
+              <p className="text-sm font-medium text-foreground">Couldn't search your folders</p>
+              <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto">{error}</p>
+            </div>
+          ) : !hasQuery ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
+              <p className="text-sm font-medium text-foreground">Search across all your folders</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Type a query to find files and folders anywhere on your allowed filesystem.
+              </p>
+            </div>
+          ) : results.length === 0 ? (
             <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
               <p className="text-sm font-medium text-foreground">No files found</p>
               <p className="text-xs text-muted-foreground mt-1">
-                No files in the current folder match "{query}".
+                Nothing in your folders matches "{query}".
               </p>
             </div>
           ) : (
-          <div className="space-y-2">
-            {displayed.map((file) => (
-              <button
-                key={file.id}
-                onClick={() => onOpenFile(file)}
-                className="w-full flex items-center gap-4 bg-card border border-border rounded-xl px-5 py-4 hover:border-accent/40 hover:shadow-sm transition-all text-left"
-              >
-                <FileIcon type={file.type} size="sm" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-mono font-medium text-foreground truncate">{file.name}</div>
-                  <div className="text-xs text-muted-foreground mt-1 truncate">{file.reason}</div>
-                  <div className="text-xs text-muted-foreground mt-0.5">{file.location} · {file.modified}</div>
-                </div>
-                <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                  <div className={`text-xs font-semibold px-2 py-0.5 rounded-full
-                    ${file.score >= 90 ? "bg-emerald-50 text-emerald-600"
-                    : file.score >= 75 ? "bg-blue-50 text-blue-600"
-                    : "bg-secondary text-muted-foreground"}`}>
-                    {file.score}% match
-                  </div>
-                  <div className="text-xs font-mono text-muted-foreground">{file.size}</div>
-                </div>
-              </button>
-            ))}
-          </div>
+            <>
+              <div className="text-xs text-muted-foreground mb-3">{results.length} results</div>
+              <div className="space-y-2">
+                {results.map((file) => (
+                  <button
+                    key={file.id}
+                    onClick={() => onOpenFile(file)}
+                    className="w-full flex items-center gap-4 bg-card border border-border rounded-xl px-5 py-4 hover:border-accent/40 hover:shadow-sm transition-all text-left"
+                  >
+                    <FileIcon type={file.type} size="sm" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-mono font-medium text-foreground truncate">
+                        {file.name}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-0.5">
+                        {file.location} · {file.modified}
+                      </div>
+                    </div>
+                    <div className="text-xs font-mono text-muted-foreground flex-shrink-0">
+                      {file.size}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </>
           )}
         </div>
       </div>

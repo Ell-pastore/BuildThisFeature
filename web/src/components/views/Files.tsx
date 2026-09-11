@@ -3,12 +3,14 @@ import {
   LayoutGrid,
   List,
   Plus,
+  RefreshCw,
   Upload,
   ArrowUpDown,
   Filter,
   MoreHorizontal,
   ExternalLink,
   Share2,
+  Copy,
   Edit2,
   Move,
   Star,
@@ -17,6 +19,7 @@ import {
   ChevronLeft,
 } from "../../components/Icons";
 import FileIcon from "../FileIcon";
+import MoveFolderDialog from "../MoveFolderDialog";
 import type { FileItem } from "../../types";
 
 interface FilesProps {
@@ -30,10 +33,14 @@ interface FilesProps {
   onOpenPreview: (item: FileItem) => void;
   onOpenDisk: (item: FileItem) => void;
   onNewFolder: (name: string) => void;
+  onNewFile: (name: string) => void;
   onRename: (item: FileItem, newName: string) => void;
   onDelete: (item: FileItem) => void;
   onMove: (item: FileItem, destDir: string) => void;
+  onCopy: (item: FileItem, destDir: string) => void;
+  onDuplicate: (item: FileItem) => void;
   onToggleStar: (item: FileItem) => void;
+  onRefresh: () => void;
 }
 
 type SortKey = "name" | "modified" | "size";
@@ -49,10 +56,14 @@ export default function Files({
   onOpenPreview,
   onOpenDisk,
   onNewFolder,
+  onNewFile,
   onRename,
   onDelete,
   onMove,
+  onCopy,
+  onDuplicate,
   onToggleStar,
+  onRefresh,
 }: FilesProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -60,11 +71,12 @@ export default function Files({
 
   // Local modal/flow state.
   const [newOpen, setNewOpen] = useState(false);
+  const [newKind, setNewKind] = useState<"folder" | "file">("folder");
   const [newName, setNewName] = useState("");
   const [renameItem, setRenameItem] = useState<FileItem | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [moveItem, setMoveItem] = useState<FileItem | null>(null);
-  const [moveDest, setMoveDest] = useState("");
+  const [copyItems, setCopyItems] = useState<FileItem[]>([]);
   const [deleteItem, setDeleteItem] = useState<FileItem | null>(null);
 
   function toggleSelect(id: string, e: React.MouseEvent) {
@@ -127,7 +139,17 @@ export default function Files({
 <div className="flex items-center gap-2">
 
             <button
-              onClick={() => { setNewOpen(true); setNewName(""); }}
+              onClick={onRefresh}
+              title="Refresh folder"
+              aria-label="Refresh folder"
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-lg text-xs font-medium text-muted-foreground hover:bg-secondary transition-colors"
+            >
+              <RefreshCw size={13} />
+              <span>Refresh</span>
+            </button>
+
+            <button
+              onClick={() => { setNewOpen(true); setNewKind("folder"); setNewName(""); }}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-foreground text-primary-foreground rounded-lg text-xs font-medium hover:opacity-90 transition-opacity"
             >
               <Plus size={13} />
@@ -220,12 +242,30 @@ export default function Files({
             <button
               onClick={() => {
                 const item = selectedItems[0];
-                if (item) { setMoveItem(item); setMoveDest(""); }
+                if (item) { setMoveItem(item); }
               }}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs hover:bg-white/10 transition-colors"
             >
               <Move size={12} />
               <span>Move</span>
+            </button>
+
+            <button
+              onClick={() => selectedItems.forEach((i) => onDuplicate(i))}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs hover:bg-white/10 transition-colors"
+            >
+              <Copy size={12} />
+              <span>Duplicate</span>
+            </button>
+
+            <button
+              onClick={() => {
+                if (selectedItems.length > 0) setCopyItems(selectedItems);
+              }}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs hover:bg-white/10 transition-colors"
+            >
+              <Copy size={12} />
+              <span>Copy to…</span>
             </button>
 
             <button
@@ -288,7 +328,7 @@ export default function Files({
             </h2>
 
             <p className="text-sm text-muted-foreground mt-1 max-w-sm">
-              Create a new folder or navigate to another directory.
+              Create a new folder or file, or navigate to another directory.
             </p>
 
           </div>
@@ -423,19 +463,37 @@ export default function Files({
 
       </div>
 
-      {/* New folder modal */}
+      {/* New folder / file modal */}
       {newOpen && (
         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
           <div className="bg-card border border-border rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <div className="text-base font-semibold text-foreground">New folder</div>
+            <div className="text-base font-semibold text-foreground">New {newKind}</div>
+            <div className="mt-4 grid grid-cols-2 gap-2 p-1 bg-secondary rounded-lg">
+              {(["folder", "file"] as const).map((kind) => (
+                <button
+                  key={kind}
+                  onClick={() => setNewKind(kind)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors capitalize ${
+                    newKind === kind
+                      ? "bg-card text-foreground shadow-sm border border-border"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {kind}
+                </button>
+              ))}
+            </div>
             <input
               autoFocus
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && newName.trim()) { onNewFolder(newName.trim()); setNewOpen(false); }
+                if (e.key === "Enter" && newName.trim()) {
+                  if (newKind === "folder") { onNewFolder(newName.trim()); setNewOpen(false); }
+                  else { onNewFile(newName.trim()); setNewOpen(false); }
+                }
               }}
-              placeholder="Folder name"
+              placeholder={newKind === "folder" ? "Folder name" : "File name"}
               className="mt-4 w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:border-accent bg-card text-foreground placeholder:text-muted-foreground"
             />
             <div className="flex gap-3 mt-6">
@@ -446,7 +504,12 @@ export default function Files({
                 Cancel
               </button>
               <button
-                onClick={() => { if (newName.trim()) { onNewFolder(newName.trim()); setNewOpen(false); } }}
+                onClick={() => {
+                  if (newName.trim()) {
+                    if (newKind === "folder") { onNewFolder(newName.trim()); setNewOpen(false); }
+                    else { onNewFile(newName.trim()); setNewOpen(false); }
+                  }
+                }}
                 className="flex-1 px-4 py-2 text-sm bg-foreground text-primary-foreground rounded-lg hover:opacity-90 transition-opacity"
               >
                 Create
@@ -488,38 +551,32 @@ export default function Files({
         </div>
       )}
 
-      {/* Move modal */}
+      {/* Move dialog — real folder picker */}
       {moveItem && (
-        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
-          <div className="bg-card border border-border rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <div className="text-base font-semibold text-foreground">Move to folder</div>
-            <p className="text-xs text-muted-foreground mt-1">Enter the destination directory path.</p>
-            <input
-              autoFocus
-              value={moveDest}
-              onChange={(e) => setMoveDest(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && moveDest.trim()) { onMove(moveItem, moveDest.trim()); setMoveItem(null); }
-              }}
-              placeholder="/Users/you/Documents"
-              className="mt-4 w-full px-4 py-2 text-sm border border-border rounded-lg outline-none focus:border-accent bg-transparent text-foreground placeholder:text-muted-foreground"
-            />
-            <div className="flex gap-3 mt-6">
-              <button
-                onClick={() => setMoveItem(null)}
-                className="flex-1 px-4 py-2 text-sm border border-border rounded-lg hover:bg-secondary transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => { if (moveDest.trim()) { onMove(moveItem, moveDest.trim()); setMoveItem(null); } }}
-                className="flex-1 px-4 py-2 text-sm bg-accent text-white rounded-lg hover:bg-indigo-600 transition-colors"
-              >
-                Move
-              </button>
-            </div>
-          </div>
-        </div>
+        <MoveFolderDialog
+          itemName={moveItem.name}
+          initialPath={moveItem.location}
+          onConfirm={(dest) => {
+            onMove(moveItem, dest);
+            setMoveItem(null);
+          }}
+          onClose={() => setMoveItem(null)}
+        />
+      )}
+
+      {/* Copy dialog — reuses the picker with a clearly-labelled Copy action */}
+      {copyItems.length > 0 && (
+        <MoveFolderDialog
+          itemName={copyItems.length === 1 ? copyItems[0].name : `${copyItems.length} items`}
+          initialPath={copyItems[0].location}
+          titleVerb="Copy"
+          actionLabel="Copy here"
+          onConfirm={(dest) => {
+            copyItems.forEach((item) => onCopy(item, dest));
+            setCopyItems([]);
+          }}
+          onClose={() => setCopyItems([])}
+        />
       )}
 
       {/* Delete confirmation */}
@@ -529,9 +586,9 @@ export default function Files({
             <div className="w-10 h-10 rounded-xl bg-red-50 flex items-center justify-center mb-4">
               <Trash2 size={18} className="text-red-500" />
             </div>
-            <h2 className="text-base font-semibold text-foreground">Delete {deleteItem.name}?</h2>
+            <h2 className="text-base font-semibold text-foreground">Move {deleteItem.name} to Trash?</h2>
             <p className="text-sm text-muted-foreground mt-2">
-              This action cannot be undone. The file will be permanently removed from your storage.
+              The item will be moved to the app-managed trash. You can restore it from the Trash view.
             </p>
             <div className="flex gap-3 mt-6">
               <button
@@ -544,7 +601,7 @@ export default function Files({
                 onClick={() => { onDelete(deleteItem); setDeleteItem(null); setSelected(new Set()); }}
                 className="flex-1 px-4 py-2 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
               >
-                Delete
+                Move to Trash
               </button>
             </div>
           </div>

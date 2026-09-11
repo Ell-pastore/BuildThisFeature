@@ -60,6 +60,10 @@ function makeOptions(
     chain: [ProviderId.Grok],
     settings: {
       [ProviderId.Grok]: settings(),
+      [ProviderId.Groq]: settings({
+        model: "openai/gpt-oss-20b",
+        baseUrl: "https://api.groq.com/openai/v1",
+      }),
       [ProviderId.Gemini]: settings({
         model: "gemini-3.5-flash",
         baseUrl: "https://generativelanguage.googleapis.com/v1beta",
@@ -75,6 +79,7 @@ function makeOptions(
     },
     credentials: {
       [ProviderId.Grok]: ["grok-key-1", "grok-key-2"],
+      [ProviderId.Groq]: ["groq-key-1"],
       [ProviderId.Gemini]: ["gemini-key-1"],
       [ProviderId.OpenRouter]: ["openrouter-key-1"],
     },
@@ -184,6 +189,11 @@ describe("default provider configuration", () => {
       model: config.gemini.model,
       baseUrl: config.gemini.baseUrl,
       timeoutMs: config.gemini.timeoutMs,
+    });
+    expect(options.settings[ProviderId.Groq]).toEqual({
+      model: config.groq.model,
+      baseUrl: config.groq.baseUrl,
+      timeoutMs: config.groq.timeoutMs,
     });
     expect(options.settings[ProviderId.OpenRouter]).toEqual({
       model: config.openrouter.model ?? "",
@@ -498,6 +508,17 @@ describe("required credential missing", () => {
       () =>
         composeProviderStack(
           makeOptions({
+            chain: [ProviderId.Groq],
+            credentials: { [ProviderId.Groq]: [] },
+          }),
+        ),
+      "provider-composition/missing-credentials",
+      ProviderId.Groq,
+    );
+    expectCompositionFailure(
+      () =>
+        composeProviderStack(
+          makeOptions({
             chain: [ProviderId.OpenRouter],
             credentials: { [ProviderId.OpenRouter]: [] },
           }),
@@ -667,14 +688,14 @@ describe("invalid / unknown provider configuration", () => {
 // ---------------------------------------------------------------------------
 
 describe("provider construction", () => {
-  it("constructs the real adapter through the build hook and answers", async () => {
+  it("constructs the Groq adapter through the build hook and answers", async () => {
     const { captured } = stubFetchQueue([
-      () => makeResponse({ choices: [{ message: { content: "hi from grok" } }] }),
+      () => makeResponse({ choices: [{ message: { content: "hi from groq" } }] }),
     ]);
     const stack = composeProviderStack(
       makeOptions({
-        chain: [ProviderId.Grok],
-        credentials: { [ProviderId.Grok]: ["grok-key-1"] },
+        chain: [ProviderId.Groq],
+        credentials: { [ProviderId.Groq]: ["groq-key-1"] },
       }),
     );
 
@@ -683,12 +704,12 @@ describe("provider construction", () => {
       tools: [],
     });
 
-    expect(response).toEqual({ text: "hi from grok" });
+    expect(response).toEqual({ text: "hi from groq" });
     expect(captured).toHaveLength(1);
     const call = captured[0];
-    expect(call?.url).toBe("https://api.x.ai/v1/chat/completions");
-    expect(call?.init.headers.Authorization).toBe("Bearer grok-key-1");
-    expect(JSON.parse(call?.init.body ?? "{}").model).toBe("grok-3");
+    expect(call?.url).toBe("https://api.groq.com/openai/v1/chat/completions");
+    expect(call?.init.headers.Authorization).toBe("Bearer groq-key-1");
+    expect(JSON.parse(call?.init.body ?? "{}").model).toBe("openai/gpt-oss-20b");
   });
 
   it("uses the injectable adapter factory when provided", async () => {

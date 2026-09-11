@@ -27,6 +27,7 @@ import type { FilesystemExecutor } from "../tools/executor.js";
 import type { DirectoryListing } from "../tools/tauriShapes.js";
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { AgentProvider, AgentProviderRequest, AgentResponse } from "./provider.js";
+import type { HostExecutionRequestInfo } from "./tools.js";
 import { isProviderError, ProviderError, ProviderErrorCode } from "./provider.js";
 import {
   AgentLoopError,
@@ -34,6 +35,21 @@ import {
   runAgentLoop,
   type AgentLoopOptions,
 } from "./agentLoop.js";
+
+// ---------------------------------------------------------------------------
+// Provider-module seam (Phase 10.39): `routeAgentResponse` is the ONE function
+// the pause tests need to script; everything else stays REAL. The mock
+// delegates to the real routing by default, so the pre-existing tests are
+// behavior-identical, and a pause test can override just the routing result.
+// ---------------------------------------------------------------------------
+const providerSeam = vi.hoisted(() => ({ routeAgentResponse: vi.fn() }));
+
+vi.mock("./provider.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./provider.js")>();
+  providerSeam.routeAgentResponse.mockImplementation(actual.routeAgentResponse);
+  return { ...actual, routeAgentResponse: providerSeam.routeAgentResponse };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -154,10 +170,62 @@ describe("runAgentLoop — final text termination", () => {
       results: [],
       toolRounds: 0,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
     expect(generate).toHaveBeenCalledTimes(1);
     expect(requests[0]).toEqual({ message: "hi", tools: readToolDefinitions });
     expect(filesystem.calls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.39 — host-execution pause (early-stop)
+// ---------------------------------------------------------------------------
+
+describe("runAgentLoop — host-execution pause (Phase 10.39)", () => {
+  it("stops early with pendingExecutions when the routed round defers to the host", async () => {
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("h1", "list_directory", { path: "/home" })] },
+    ]);
+    const pending: HostExecutionRequestInfo[] = [
+      {
+        executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        toolName: "list_directory",
+        arguments: { path: "/home" },
+        expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      },
+    ];
+    // Override exactly the ONE routing result this pause needs; the default
+    // delegation (real routing) stays in effect for every other test.
+    providerSeam.routeAgentResponse.mockResolvedValueOnce({
+      finalText: undefined,
+      results: [],
+      pendingApprovals: [],
+      pendingExecutions: pending,
+    });
+
+    const output = await runAgentLoop(
+      sessionContext(ACTIVE_USER),
+      "list my home",
+      makeOptions(generate, { filesystem, maxToolRounds: 3 }),
+    );
+
+    // The loop paused WITHOUT executing the round's intents: no results are
+    // fed back, no filesystem call happened, no bound error fired, and the
+    // deferred round counts as one consumed provider round.
+    expect(output.pendingExecutions).toEqual(pending);
+    expect(output.results).toEqual([]);
+    expect(output.pendingApprovals).toEqual([]);
+    expect(output.toolRounds).toBe(1);
+    expect(output.text).toBeUndefined();
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(filesystem.calls).toEqual([]);
+    // The deferral round reached routing with the incremented round tag.
+    const routedOptions = providerSeam.routeAgentResponse.mock.calls[0]?.[2] as {
+      toolRounds?: number;
+    };
+    expect(routedOptions?.toolRounds).toBe(1);
   });
 });
 
@@ -190,6 +258,7 @@ describe("runAgentLoop — tool rounds", () => {
       results: [{ ok: true, callId: "a", data: homeListing() }],
       toolRounds: 1,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
     expect(filesystem.calls).toEqual(["listDirectory:/home"]);
   });
@@ -230,6 +299,7 @@ describe("runAgentLoop — tool rounds", () => {
       ],
       toolRounds: 2,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
     expect(filesystem.calls).toEqual(["searchFiles", "listDirectory:/tmp"]);
   });
@@ -496,6 +566,7 @@ describe("runAgentLoop — seeded initial context (Phase 10.30)", () => {
       results: [seeded],
       toolRounds: 1,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
     // Seeded results are context, not new executions.
     expect(filesystem.calls).toEqual([]);

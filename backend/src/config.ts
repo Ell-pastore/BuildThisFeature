@@ -96,6 +96,28 @@ export const config = {
     ),
   },
   /**
+   * Groq provider settings.
+   *
+   * The API key is a production secret: read from the environment only,
+   * never committed. Model, base URL, and timeout mirror the Grok block —
+   * all operators can change them via `GROQ_*` without a code change.
+   */
+  groq: {
+    /** Groq API key. `undefined` until `GROQ_API_KEY` is set in env/.env. */
+    apiKey: envStringOrUndefined(process.env.GROQ_API_KEY),
+    /** All Groq credential values in rotation order (primary first). */
+    credentials: credentialsFromEnv("GROQ"),
+    /** Model sent to the Groq API. Default via configuration. */
+    model: process.env.GROQ_MODEL ?? "openai/gpt-oss-20b",
+    /** Groq API base URL. */
+    baseUrl: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
+    /** Request timeout in milliseconds. */
+    timeoutMs: Math.max(
+      1000,
+      intFromEnv(process.env.GROQ_TIMEOUT_MS) ?? 60_000,
+    ),
+  },
+  /**
    * Gemini (Google AI) provider settings (Phase 10.14).
    *
    * The API key is a production secret: read from the environment only,

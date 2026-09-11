@@ -38,7 +38,11 @@ import type { ToolDefinition } from "../tools/types.js";
 import { AppError } from "../core/errors.js";
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import { parseAgentRequest, runAgentRequest } from "./agent.js";
-import type { InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
+import type {
+  HostExecutionRequestInfo,
+  InvokeToolOptions,
+  ToolApprovalRequestInfo,
+} from "./tools.js";
 
 /**
  * The provider-agnostic context a provider receives to produce a reply.
@@ -181,6 +185,12 @@ export interface RouteAgentResponseResult {
    * in this round. Empty when no tools required approval.
    */
   readonly pendingApprovals: readonly ToolApprovalRequestInfo[];
+  /**
+   * Host-execution metadata collected from any `host_execution_required`
+   * results in this round (Phase 10.39). The bounded loop PAUSES when this
+   * is non-empty.
+   */
+  readonly pendingExecutions: readonly HostExecutionRequestInfo[];
 }
 
 /**
@@ -206,13 +216,14 @@ export async function routeAgentResponse(
   options: InvokeToolOptions,
 ): Promise<RouteAgentResponseResult> {
   if (!response.toolCalls || response.toolCalls.length === 0) {
-    return { results: [], pendingApprovals: [] };
+    return { results: [], pendingApprovals: [], pendingExecutions: [] };
   }
   const request = parseAgentRequest({ calls: response.toolCalls });
   const agentResult = await runAgentRequest(c, request, options);
   return {
     results: agentResult.results,
     pendingApprovals: agentResult.pendingApprovals,
+    pendingExecutions: agentResult.pendingExecutions,
   };
 }
 

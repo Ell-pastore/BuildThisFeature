@@ -170,6 +170,7 @@ const CANNED_SUMMARY: AiConversationSummary = {
   updatedAt: "2026-01-03T00:00:00.000Z",
   turnState: "completed",
   pendingApprovals: [],
+  pendingHostExecutions: [],
 };
 
 const CANNED_DETAIL: AiConversationDetail = {
@@ -219,6 +220,7 @@ beforeEach(() => {
           maxToolRounds: 3,
           toolResults: [],
           pendingApprovals: [],
+          pendingExecutions: [],
         },
       };
     },
@@ -484,7 +486,7 @@ describe("POST /api/ai/instructions — authenticated", () => {
     const body = (await res.json()) as AiInstructionResponse;
     expect(Object.keys(body).sort()).toEqual(["conversationId", "turn"]);
     expect(Object.keys(body.turn).sort()).toEqual(
-      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "toolResults", "toolRounds"].sort(),
+      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "pendingExecutions", "toolResults", "toolRounds"].sort(),
     );
     expect(body.turn.instruction).toBe("List my home directory.");
     expect(body.conversationId).toBe("22222222-2222-2222-2222-222222222222");

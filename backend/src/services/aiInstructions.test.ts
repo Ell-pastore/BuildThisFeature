@@ -102,6 +102,7 @@ function makeResult(
     created: overrides?.created ?? true,
     state,
     pendingApprovals: overrides?.pendingApprovals ?? [],
+    pendingExecutions: overrides?.pendingExecutions ?? [],
   };
 }
 
@@ -337,7 +338,7 @@ describe("toAiInstructionResponse — safe response shape", () => {
 
     expect(Object.keys(response).sort()).toEqual(["conversationId", "turn"]);
     expect(Object.keys(response.turn).sort()).toEqual(
-      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "toolResults", "toolRounds"].sort(),
+      ["created", "finalText", "instruction", "maxToolRounds", "messages", "pendingApprovals", "pendingExecutions", "toolResults", "toolRounds"].sort(),
     );
     expect(response.conversationId).toBe(CONVERSATION_ID);
     expect(response.turn.instruction).toBe("List my home directory.");
@@ -381,6 +382,7 @@ describe("toAiInstructionResponse — safe response shape", () => {
       created: true,
       state,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
 
     expect(response.turn.toolResults).toEqual([{ callId: "f1", ok: false }]);
@@ -395,6 +397,7 @@ describe("toAiInstructionResponse — safe response shape", () => {
       created: true,
       state,
       pendingApprovals: [],
+      pendingExecutions: [],
     });
     expect("finalText" in response.turn).toBe(false);
   });

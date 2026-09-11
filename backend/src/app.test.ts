@@ -60,6 +60,7 @@ function makeResult(): PersistentTurnResult {
     created: true,
     state,
     pendingApprovals: [],
+    pendingExecutions: [],
   };
 }
 

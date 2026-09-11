@@ -40,6 +40,7 @@ import {
 } from "../tools/definitions/writeTools.js";
 import {
   tauriFilesystemExecutor,
+  hostDelegatedFilesystemExecutor,
   type FilesystemExecutor,
   type TauriInvoke,
 } from "../tools/executor.js";
@@ -89,6 +90,15 @@ export interface ProductionAiRuntimeOptions {
   registry?: ToolRegistry;
   /** Loop bound for NEW conversations. Defaults to `PRODUCTION_AI_MAX_TOOL_ROUNDS`. */
   maxToolRounds?: number;
+  /**
+   * Per-request filesystem executor resolution (Phase 10.39). Defaults to the
+   * production resolver: the host-delegated executor strictly when the
+   * request carries the desktop-host flag, `undefined` otherwise (the
+   * fail-closed Tauri bridge stays in effect). Injectable for tests.
+   */
+  resolveFilesystem?: (
+    c: { get: (key: string) => unknown },
+  ) => FilesystemExecutor | undefined;
 }
 
 /**
@@ -142,6 +152,20 @@ function buildProductionToolRegistry(): ToolRegistry {
 }
 
 /**
+ * The production per-request filesystem resolver (Phase 10.39): the
+ * host-delegated executor EXACTLY when this turn's request came from the
+ * desktop host (`x-desktop-host: 1`, surfaced on the Hono context), and
+ * `undefined` otherwise so the default — a Tauri bridge that is fail-closed
+ * when this Node process has no host — stays in effect. Never trusts request
+ * data beyond the header flag the route set.
+ */
+function productionResolveFilesystem(c: {
+  get: (key: string) => unknown;
+}): FilesystemExecutor | undefined {
+  return c.get("desktopHost") === true ? hostDelegatedFilesystemExecutor() : undefined;
+}
+
+/**
  * Assemble the production persistent agent-turn runtime (Phase 10.20) from the
  * configured provider stack, the registered tool surface, and the filesystem
  * executor.
@@ -165,6 +189,7 @@ export function composeProductionAiRuntime(
     tools,
     registry,
     filesystem,
+    resolveFilesystem: options.resolveFilesystem ?? productionResolveFilesystem,
     maxToolRounds: options.maxToolRounds ?? PRODUCTION_AI_MAX_TOOL_ROUNDS,
   });
 }

@@ -586,3 +586,80 @@ refuses to start) instead of silently serving a broken AI stack.
   introduced, and `ProviderCompositionError` carries only provider ids (never
   credential values).
 - oxfmt (workspace defect) was NOT run; edits match committed style.
+# Phase 10.39 — Groq provider (first-class)
+
+> This phase: `AI: add Groq as a first-class provider`
+
+## Goal
+
+Add Groq (the OpenAI-compatible inference cloud) as a first-class AI provider
+alongside Grok, Gemini, OpenRouter, and Ollama: a new adapter behind the
+provider-agnostic `AgentProvider` boundary, environment-driven configuration,
+registration in the selection/composition/diagnostics layers, and test
+coverage matching the existing adapters — verified live with a harmless native
+tool-calling request through the Groq API.
+
+## What changed
+
+1. `backend/src/services/groqProvider.ts` (NEW) — `createGroqProvider(options)`
+   adapter mirroring the Grok/OpenRouter adapters (same OpenAI-compatible chat
+   completions contract):
+   - POSTs to `${GROQ_BASE_URL default https://api.groq.com/openai/v1}/chat/completions`
+     with `Authorization: Bearer <key>`;
+   - maps tools → `tools` array, tool results → `tool` messages, and parses
+     `choices[0].message` into `AgentResponse` (`text` and/or `AgentToolCall`
+     intents) with full runtime validation;
+   - maps failures to the typed `ProviderError` contract (401/403 →
+     Authentication, 429 → RateLimited, 4xx → InvalidResponse, network →
+     Unavailable, timeout → Timeout, 5xx → Internal);
+   - fails fast at construction when no API key is configured; `fetch` is
+     injectable so tests need no key and no network.
+2. `backend/src/config.ts` (EDIT) — `config.groq` block (GROQ_API_KEY +
+   `_1.._N` rotation via `credentialsFromEnv("GROQ")`, GROQ_MODEL default
+   `openai/gpt-oss-20b`, GROQ_BASE_URL, GROQ_TIMEOUT_MS).
+3. `backend/src/services/providerSelection.ts` (EDIT) — `ProviderId.Groq =
+   "groq"` added to the typed provider map (registers into
+   `KNOWN_PROVIDER_IDS` / `isProviderId` automatically).
+4. `backend/src/services/providerComposition.ts` (EDIT) — requires a
+   credential (`REQUIRES_CREDENTIAL`), adapter case in `buildBuiltinAdapter`,
+   and per-provider settings/credentials in
+   `defaultProviderCompositionOptions()`.
+5. `backend/src/services/providerDiagnostics.ts` (EDIT) — `groq` added to the
+   mirrored `REQUIRES_CREDENTIAL` set so validation/status reporting covers it.
+6. `backend/.env.example` (EDIT) — GROQ_* template section; local
+   `backend/.env` (ignored) has the real key.
+7. Tests (EDIT/NEW):
+   - `backend/src/services/groqProvider.test.ts` (NEW) — request construction,
+     tool mapping, response/tool_calls parsing, malformed-output rejection,
+     HTTP/transport error mapping, and no-key construction failure.
+   - `backend/src/services/providerComposition.test.ts` (EDIT) — Groq fixture,
+     default-config settings assertion, missing-credentials failure, and a
+     real-adapter-through-build-hook test (URL, Bearer auth, model).
+   - `backend/src/services/providerSelection.test.ts` (EDIT) — `groq` in the
+     known-ids test.
+   - `backend/src/services/providerDiagnostics.test.ts` (EDIT) — Groq in the
+     valid-configuration fixture and expected provider list.
+8. `backend/src/services/h.txt` (EDIT) — this phase note appended.
+
+## Verification
+
+- Backend: 1021/1021 tests pass (`pnpm test`), 40 files; `pnpm typecheck`
+  clean. (995 before; +26 new/updated.)
+- Live verification with the configured key (model `openai/gpt-oss-20b`):
+  - raw POST to `https://api.groq.com/openai/v1/chat/completions` returned
+    HTTP 200 with `finish_reason:"tool_calls"` and a structured
+    `tool_calls[].function.arguments` JSON string — the exact shape the
+    adapter parses;
+  - end-to-end through `createGroqProvider` produced the provider-independent
+    `AgentToolCall` intent `{ id, toolName: "list_directory", input: { path:
+    "~" } }`.
+- Model note: `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` were
+  decommissioned on Groq (Aug 2026); `openai/gpt-oss-20b` is a free-tier,
+  tool-capable default.
+- Security: the Groq key lives only in the git-ignored local `backend/.env`;
+  no secrets were logged, printed, or added to source; diagnostics/composition
+  errors carry provider ids, never credential values.
+- No changes to the running provider config (`AI_PROVIDER=gemini`,
+  `AI_PROVIDER_FALLBACK=gemini,ollama,openrouter`), to other adapters, the
+  agent loop, policy, or approval behavior. Adding `groq` to the fallback
+  chain is a one-line `.env` change.

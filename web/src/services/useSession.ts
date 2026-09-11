@@ -3,6 +3,7 @@ import {
   getSessionSnapshot,
   login as sessionLogin,
   logout as sessionLogout,
+  register as sessionRegister,
   subscribeSession,
   type SessionState,
 } from "./session";
@@ -17,6 +18,7 @@ export interface SessionBinding {
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<NonNullable<SessionState["user"]>>;
   logout: () => Promise<void>;
+  register: (email: string, displayName: string, password: string) => Promise<NonNullable<SessionState["user"]>>;
 }
 
 export function useSession(): SessionBinding {
@@ -26,5 +28,6 @@ export function useSession(): SessionBinding {
     isAuthenticated: state.user !== null && state.token !== null,
     login: sessionLogin,
     logout: sessionLogout,
+    register: sessionRegister,
   };
 }

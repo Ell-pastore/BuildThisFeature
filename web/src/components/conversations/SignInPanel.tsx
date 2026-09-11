@@ -1,18 +1,25 @@
 import { useState, type FormEvent } from "react";
 import { Sparkles } from "../Icons";
 import { useSession } from "../../services/useSession";
+import SignUpPanel from "./SignUpPanel";
 
 /**
  * Sign-in panel used when the desktop UI has no active in-memory session. It
  * reuses the existing backend login abstraction via the centralized session
- * store — the bearer token never enters component state or the URL.
+ * store — the bearer token never enters component state or the URL. A small
+ * "Create account" toggle reveals the sign-up panel for new users.
  */
 export default function SignInPanel() {
   const { login } = useSession();
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  if (mode === "signup") {
+    return <SignUpPanel onSwitchToSignIn={() => setMode("signin")} />;
+  }
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -69,6 +76,13 @@ export default function SignInPanel() {
             {submitting ? "Signing in…" : "Sign in"}
           </button>
         </form>
+
+        <p className="mt-4 text-xs text-center">
+          <span className="text-muted-foreground">Don&apos;t have an account?</span>{" "}
+          <button type="button" onClick={() => setMode("signup")} className="text-accent hover:underline">
+            Create one
+          </button>
+        </p>
       </div>
     </div>
   );

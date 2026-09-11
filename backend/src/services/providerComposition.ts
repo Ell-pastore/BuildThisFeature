@@ -72,6 +72,7 @@ import {
   type ProviderId as ProviderIdType,
 } from "./providerSelection.js";
 import { createGrokProvider } from "./grokProvider.js";
+import { createGroqProvider } from "./groqProvider.js";
 import { createGeminiProvider } from "./geminiProvider.js";
 import { createOpenRouterProvider } from "./openrouterProvider.js";
 import { createOllamaProvider } from "./ollamaProvider.js";
@@ -197,6 +198,7 @@ export function isProviderCompositionError(
 /** Providers that cannot operate without a credential. */
 const REQUIRES_CREDENTIAL: ReadonlySet<ProviderIdType> = new Set([
   ProviderId.Grok,
+  ProviderId.Groq,
   ProviderId.Gemini,
   ProviderId.OpenRouter,
 ]);
@@ -321,6 +323,13 @@ function buildBuiltinAdapter(
   switch (provider) {
     case ProviderId.Grok:
       return createGrokProvider({
+        apiKey: credentialValue ?? "",
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        timeoutMs: settings.timeoutMs,
+      });
+    case ProviderId.Groq:
+      return createGroqProvider({
         apiKey: credentialValue ?? "",
         model: settings.model,
         baseUrl: settings.baseUrl,
@@ -476,6 +485,11 @@ export function defaultProviderCompositionOptions(): ProviderCompositionOptions 
         baseUrl: config.grok.baseUrl,
         timeoutMs: config.grok.timeoutMs,
       },
+      [ProviderId.Groq]: {
+        model: config.groq.model,
+        baseUrl: config.groq.baseUrl,
+        timeoutMs: config.groq.timeoutMs,
+      },
       [ProviderId.Gemini]: {
         model: config.gemini.model,
         baseUrl: config.gemini.baseUrl,
@@ -494,6 +508,7 @@ export function defaultProviderCompositionOptions(): ProviderCompositionOptions 
     },
     credentials: {
       [ProviderId.Grok]: config.grok.credentials,
+      [ProviderId.Groq]: config.groq.credentials,
       [ProviderId.Gemini]: config.gemini.credentials,
       [ProviderId.OpenRouter]: config.openrouter.credentials,
     },

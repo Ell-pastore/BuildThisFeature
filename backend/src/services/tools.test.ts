@@ -24,7 +24,7 @@
  *      binds the persisted conversation/message ids to the execution context,
  *      while direct invocations carry none (behavior unchanged).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 
 import { AppError } from "../core/errors.js";
 import { ToolRegistry } from "../tools/registry.js";
@@ -35,10 +35,42 @@ import {
 import { registerReadTools } from "../tools/definitions/readTools.js";
 import { ToolErrorCode } from "../tools/errors.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
+import { hostDelegatedFilesystemExecutor } from "../tools/executor.js";
 import type { DirectoryListing } from "../tools/tauriShapes.js";
 import type { ToolExecutionContext, ToolPolicy } from "../tools/policy.js";
 import { defaultToolPolicy } from "../tools/policy.js";
-import { invokeTool, type InvokeToolOptions } from "./tools.js";
+import {
+  invokeTool,
+  isHostExecutionRequiredResult,
+  type InvokeToolOptions,
+} from "./tools.js";
+import {
+  HostExecutionDuplicateError,
+  HostExecutionStatus,
+  type HostExecutionRecord,
+} from "./aiHostExecutions.js";
+
+// ---------------------------------------------------------------------------
+// Host-execution service seam (Phase 10.39): repo-touching functions stubbed,
+// error classes + executable assertions stay REAL.
+// ---------------------------------------------------------------------------
+const hostMocks = vi.hoisted(() => ({
+  createAiHostExecution: vi.fn(),
+  getPendingHostExecution: vi.fn(),
+  getAiHostExecution: vi.fn(),
+  submitHostExecution: vi.fn(),
+}));
+
+vi.mock("./aiHostExecutions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./aiHostExecutions.js")>();
+  return {
+    ...actual,
+    createAiHostExecution: hostMocks.createAiHostExecution,
+    getPendingHostExecution: hostMocks.getPendingHostExecution,
+    getAiHostExecution: hostMocks.getAiHostExecution,
+    submitHostExecution: hostMocks.submitHostExecution,
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -391,3 +423,165 @@ function writeTool(name: string): ToolDefinition {
     permission: ToolPermission.Write,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 10.39 — host-execution gate (invokeTool, hereby the proof)
+// ---------------------------------------------------------------------------
+
+describe("invokeTool — host-execution gate (Phase 10.39)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hostMocks.createAiHostExecution.mockReset();
+    hostMocks.getPendingHostExecution.mockReset().mockResolvedValue(null);
+  });
+
+  function pendingRecord(): HostExecutionRecord {
+    return {
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      userId: ACTIVE_USER.id,
+      conversationId: "conv-1",
+      messageId: "msg-1",
+      toolName: "list_directory",
+      callId: "c1",
+      arguments: { path: "/home" },
+      round: 1,
+      status: HostExecutionStatus.Pending,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      executedAt: null,
+    };
+  }
+
+  function delegatedOptions(): InvokeToolOptions {
+    return {
+      registry: makeRegistry(),
+      filesystem: hostDelegatedFilesystemExecutor(),
+      turnContext: { conversationId: "conv-1", messageId: "msg-1" },
+      callId: "c1",
+      toolRounds: 1,
+    };
+  }
+
+  it("records a scoped pending execution for a delegated read tool and NEVER executes it here", async () => {
+    const record = pendingRecord();
+    hostMocks.createAiHostExecution.mockResolvedValue(record);
+    const filesystem = hostDelegatedFilesystemExecutor();
+    await expect(filesystem.listDirectory("/")).rejects.toThrow();
+
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      delegatedOptions(),
+    );
+
+    // The gate wrote the execution and returned the typed pending result —
+    // the doomed executor's call never happened.
+    expect(hostMocks.createAiHostExecution).toHaveBeenCalledWith(
+      {
+        userId: ACTIVE_USER.id,
+        conversationId: "conv-1",
+        messageId: "msg-1",
+        toolName: "list_directory",
+        callId: "c1",
+        arguments: { path: "/home" },
+        round: 1,
+        expiresAt: expect.any(Date),
+      },
+      { registry: expect.any(Object) },
+    );
+    expect(isHostExecutionRequiredResult(result)).toBe(true);
+    if (!isHostExecutionRequiredResult(result)) return;
+    expect(result.executionRequired).toBe(true);
+    expect(result.error).toMatchObject({
+      category: "security",
+      code: ToolErrorCode.HostExecutionRequired,
+    });
+    expect(result.execution).toEqual({
+      executionId: record.id,
+      toolName: "list_directory",
+      arguments: { path: "/home" },
+      expiresAt: record.expiresAt,
+    });
+  });
+
+  it("fails closed with security when the delegated executor lacks turn context", async () => {
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      { registry: makeRegistry(), filesystem: hostDelegatedFilesystemExecutor() },
+    );
+
+    expect(hostMocks.createAiHostExecution).not.toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toMatchObject({
+      category: "security",
+      code: ToolErrorCode.HostExecutionContextMissing,
+    });
+  });
+
+  it("fails closed with security when the delegated executor lacks a callId/toolRounds", async () => {
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      {
+        registry: makeRegistry(),
+        filesystem: hostDelegatedFilesystemExecutor(),
+        turnContext: { conversationId: "conv-1", messageId: "msg-1" },
+      },
+    );
+
+    expect(hostMocks.createAiHostExecution).not.toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toMatchObject({
+      category: "security",
+      code: ToolErrorCode.HostExecutionContextMissing,
+    });
+  });
+
+  it("dispatches a non-delegated executor exactly as before (gate declines)", async () => {
+    hostMocks.createAiHostExecution.mockResolvedValue(pendingRecord());
+    const filesystem = makeFilesystem();
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      {
+        registry: makeRegistry(),
+        filesystem,
+        turnContext: { conversationId: "conv-1", messageId: "msg-1" },
+        callId: "c1",
+        toolRounds: 1,
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.data).toBeDefined();
+    expect(hostMocks.createAiHostExecution).not.toHaveBeenCalled();
+    expect(filesystem.calls).toEqual(["listDirectory:/home"]);
+  });
+
+  it("handles an idempotent duplicate by returning the existing pending execution", async () => {
+    const record = pendingRecord();
+    hostMocks.createAiHostExecution.mockRejectedValue(
+      new HostExecutionDuplicateError("msg-1", "list_directory", "c1"),
+    );
+    hostMocks.getPendingHostExecution.mockResolvedValue(record);
+
+    const result = await invokeTool(
+      sessionContext(ACTIVE_USER),
+      "list_directory",
+      { path: "/home" },
+      delegatedOptions(),
+    );
+
+    expect(isHostExecutionRequiredResult(result)).toBe(true);
+    if (!isHostExecutionRequiredResult(result)) return;
+    expect(result.execution.executionId).toBe(record.id);
+  });
+});

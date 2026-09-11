@@ -13,6 +13,12 @@ vi.mock("./client", async (importOriginal) => {
   return { ...real, apiRequest: apiRequestMock };
 });
 
+const desktopEnvMock = vi.hoisted(() => ({ isTauriEnv: vi.fn() }));
+
+vi.mock("../desktopEnv", () => ({
+  isTauriEnv: desktopEnvMock.isTauriEnv,
+}));
+
 import { SessionNotAuthenticatedError } from "../session";
 import { ApiClientError } from "./client";
 import { submitAiInstruction } from "./aiInstructions";
@@ -20,6 +26,7 @@ import { submitAiInstruction } from "./aiInstructions";
 describe("aiInstructions api client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    desktopEnvMock.isTauriEnv.mockReturnValue(false);
   });
 
   it("fails fast without an active session — no unauthenticated request is issued", async () => {
@@ -99,5 +106,94 @@ describe("aiInstructions api client", () => {
     await expect(
       submitAiInstruction({ instruction: "Move receipts." }),
     ).rejects.toMatchObject({ status: 503, code: "ai/provider-unavailable" });
+  });
+
+  it("sends the x-desktop-host header ONLY inside the Tauri desktop webview", async () => {
+    requireTokenMock.mockReturnValue("session-token");
+    apiRequestMock.mockResolvedValue({
+      conversationId: "conv-1",
+      turn: {
+        created: false,
+        instruction: "List my files.",
+        messages: [{ kind: "final", text: "Done." }],
+        toolRounds: 0,
+        maxToolRounds: 3,
+        toolResults: [],
+        pendingApprovals: [],
+        pendingExecutions: [],
+      },
+    });
+
+    // Plain browser: no header.
+    desktopEnvMock.isTauriEnv.mockReturnValue(false);
+    await submitAiInstruction({ instruction: "List my files." });
+    expect(apiRequestMock).toHaveBeenLastCalledWith("/api/ai/instructions", {
+      method: "POST",
+      body: { instruction: "List my files." },
+      token: "session-token",
+    });
+
+    // Tauri desktop webview: header present so the backend swaps the
+    // host-delegated executor in for THIS request.
+    desktopEnvMock.isTauriEnv.mockReturnValue(true);
+    await submitAiInstruction({ instruction: "List my files." });
+    expect(apiRequestMock).toHaveBeenLastCalledWith("/api/ai/instructions", {
+      method: "POST",
+      body: { instruction: "List my files." },
+      token: "session-token",
+      headers: { "x-desktop-host": "1" },
+    });
+  });
+
+  it("forwards resumeExecutions verbatim when the desktop host resubmits results", async () => {
+    requireTokenMock.mockReturnValue("session-token");
+    apiRequestMock.mockResolvedValue({
+      conversationId: "conv-1",
+      turn: {
+        created: false,
+        instruction: "Continue after the requested operations have been executed.",
+        messages: [],
+        toolRounds: 1,
+        maxToolRounds: 3,
+        toolResults: [],
+        pendingApprovals: [],
+        pendingExecutions: [
+          {
+            executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            toolName: "list_directory",
+            arguments: { path: "/home" },
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+
+    await submitAiInstruction({
+      conversationId: "conv-1",
+      instruction: "Continue after the requested operations have been executed.",
+      resumeExecutions: [
+        {
+          executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          ok: true,
+          result: { path: "/home", parentPath: null, isHome: true, items: [] },
+        },
+      ],
+    });
+
+    expect(apiRequestMock).toHaveBeenCalledWith("/api/ai/instructions", {
+      method: "POST",
+      token: "session-token",
+      body: {
+        conversationId: "conv-1",
+        instruction: "Continue after the requested operations have been executed.",
+        resumeExecutions: [
+          {
+            executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ok: true,
+            result: { path: "/home", parentPath: null, isHome: true, items: [] },
+          },
+        ],
+      },
+    });
   });
 });

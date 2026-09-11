@@ -30,7 +30,9 @@ import type { RawToolInput } from "../tools/handlers/handler.js";
 import type { ToolError } from "../tools/errors.js";
 import {
   invokeTool,
+  isHostExecutionRequiredResult,
   isToolApprovalRequiredResult,
+  type HostExecutionRequestInfo,
   type InvokeToolOptions,
   type ToolApprovalRequestInfo,
 } from "./tools.js";
@@ -82,6 +84,14 @@ export interface AgentResult<T = unknown> {
    * only: approval id, tool name, validated arguments, and expiry.
    */
   pendingApprovals: readonly ToolApprovalRequestInfo[];
+  /**
+   * Host-execution metadata collected from any `host_execution_required`
+   * results (Phase 10.39). Empty when no ungated read tool was delegated to
+   * the desktop host. Safe metadata only: execution id, tool name, validated
+   * arguments, and expiry. The turn PAUSES on non-empty — the host must
+   * execute before the bounded loop continues.
+   */
+  pendingExecutions: readonly HostExecutionRequestInfo[];
 }
 
 /**
@@ -156,12 +166,24 @@ export async function runAgentRequest(
 ): Promise<AgentResult> {
   const results: AgentToolResult[] = [];
   const pendingApprovals: ToolApprovalRequestInfo[] = [];
+  const pendingExecutions: HostExecutionRequestInfo[] = [];
   for (const call of request.calls) {
-    const result = await invokeTool(c, call.toolName, call.input, options);
+    const result = await invokeTool(c, call.toolName, call.input, {
+      // Phase 10.39: the provider-intent call id tags any host-delegated tool
+      // call so the recorded execution is correlated back to this intent.
+      // The round count is already carried by `options.toolRounds`.
+      ...options,
+      callId: call.id,
+    });
     // Phase 10.29: surface the pending approval's safe metadata alongside the
     // structured denial, so the instruction flow can report it to the client.
     if (isToolApprovalRequiredResult(result)) {
       pendingApprovals.push(result.approval);
+    }
+    // Phase 10.39: surface the pending host execution's safe metadata so the
+    // bounded loop can PAUSE until the desktop host executes locally.
+    if (isHostExecutionRequiredResult(result)) {
+      pendingExecutions.push(result.execution);
     }
     results.push(
       result.ok
@@ -169,5 +191,5 @@ export async function runAgentRequest(
         : { ok: false, callId: call.id, error: result.error },
     );
   }
-  return { requestId: request.id, results, pendingApprovals };
+  return { requestId: request.id, results, pendingApprovals, pendingExecutions };
 }

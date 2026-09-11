@@ -11,12 +11,13 @@
 
 /**
  * Turn-state of a conversation's last turn, derived server-side:
- * `awaiting-approval`, `approved`, `rejected`, `expired`, `failed`, or
- * `completed`.
+ * `awaiting-approval`, `awaiting-host-execution`, `approved`, `rejected`,
+ * `expired`, `failed`, or `completed`.
  */
 export type AiTurnState =
   | "completed"
   | "awaiting-approval"
+  | "awaiting-host-execution"
   | "approved"
   | "rejected"
   | "expired"
@@ -38,6 +39,43 @@ export interface AiToolApproval {
   updatedAt: string;
   expiresAt: string;
   decidedAt: string | null;
+}
+
+/** Safe projection of one persisted host execution (Phase 10.39). `arguments`
+ * are the validated identifying references only — never raw file contents or
+ * secrets. `executedAt` is null until the desktop host submits its result.
+ */
+export interface AiHostExecution {
+  id: string;
+  conversationId: string;
+  messageId: string;
+  toolName: string;
+  callId: string;
+  arguments: Readonly<Record<string, unknown>>;
+  round: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  executedAt: string | null;
+}
+
+/**
+ * The turn-echo of ONE pending host execution (`POST /api/ai/instructions`
+ * paused response, Phase 10.39). Mirrors the backend's
+ * `HostExecutionRequestInfo` — deliberately narrower than `AiHostExecution`
+ * (no `id`/`callId`/`status`): the desktop host needs only the execution id
+ * to submit against, the tool to execute, and the validated arguments.
+ */
+export interface AiInstructionHostExecution {
+  /** The persisted pending host-execution id (submission key). */
+  executionId: string;
+  /** The registered tool the host execution was created for. */
+  toolName: string;
+  /** The schema-validated arguments stored for the host. */
+  arguments: unknown;
+  /** When the host-execution window closes. */
+  expiresAt: string;
 }
 
 /** A persisted tool-call intent for one provider round. */
@@ -77,12 +115,18 @@ export interface AiConversationSummary extends AiConversationSummaryBase {
   turnState: AiTurnState;
   /** Approvals still awaiting a decision (`pending`, unexpired), oldest-first. */
   pendingApprovals: readonly AiToolApproval[];
+  /**
+   * Host executions still awaiting the desktop host to submit a result
+   * (`pending`, unexpired), oldest-first. Safe identification metadata only.
+   */
+  pendingHostExecutions: readonly AiHostExecution[];
 }
 
 /** One owned conversation with its persisted transcript and turn state. */
 export interface AiConversationDetail extends AiConversationSummaryBase {
   turnState: AiTurnState;
   pendingApprovals: readonly AiToolApproval[];
+  pendingHostExecutions: readonly AiHostExecution[];
   messages: readonly AiHistoryMessage[];
 }
 
@@ -179,6 +223,30 @@ export interface AiInstructionTurn {
   maxToolRounds: number;
   toolResults: readonly AiToolOutcome[];
   pendingApprovals: readonly AiInstructionApprovalInfo[];
+  /**
+   * Host executions the desktop host is still expected to run locally
+   * (Phase 10.39). Non-empty means the turn is PAUSED at a filesystem
+   * operation: the desktop client must execute each request, then resume the
+   * turn with `resumeExecutions`.
+   */
+  pendingExecutions: readonly AiInstructionHostExecution[];
+}
+
+/**
+ * One strict host-execution submission for `resumeExecutions` (Phase 10.39):
+ * the desktop host's own result for the matched pending execution. `result`
+ * is transient provider context (never persisted); `error` carries a
+ * categorized tool error and is mutually exclusive with `result`.
+ */
+export interface AiHostExecutionSubmission {
+  /** The matched pending execution's id (its echo's `executionId`). */
+  executionId: string;
+  /** Whether the host's execution succeeded. */
+  ok: boolean;
+  /** The host's execution payload when it succeeded. */
+  result?: unknown;
+  /** The categorized tool error when the host's execution failed. */
+  error?: { code: string; category: string };
 }
 
 /** Stable response of `POST /api/ai/instructions`. */

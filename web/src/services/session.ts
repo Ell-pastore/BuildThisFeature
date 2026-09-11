@@ -82,6 +82,16 @@ export async function login(email: string, password: string): Promise<SafeUserRe
 }
 
 /**
+ * Create an account through the existing backend register endpoint, then sign
+ * the new account in immediately so it is usable right away. The token follows
+ * the same rule as login: memory only, never persisted to browser storage.
+ */
+export async function register(email: string, displayName: string, password: string): Promise<SafeUserRemote> {
+  await authApi.register({ email, displayName, password });
+  return login(email, password);
+}
+
+/**
  * End the local session. Best-effort revokes the session server-side via the
  * existing logout endpoint FIRST on the captured token, then clears in-memory
  * state regardless of the network result — the UI must never be stuck "logged

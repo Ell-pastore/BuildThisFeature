@@ -73,6 +73,11 @@ export const ToolErrorCode = {
   ApprovalContextMissing: "tools/approval-context-missing",
   // validation — approval gate (Phase 10.28C)
   ApprovalInvalidArguments: "tools/approval-invalid-arguments",
+  // security — host-execution gate (Phase 10.39)
+  HostExecutionRequired: "tools/host-execution-required",
+  HostExecutionContextMissing: "tools/host-execution-context-missing",
+  // validation — host-execution gate (Phase 10.39)
+  HostExecutionInvalidArguments: "tools/host-execution-invalid-arguments",
   // internal
   Internal: "internal/error",
 } as const;

@@ -41,7 +41,7 @@ import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { AgentProviderRequest, AgentResponse } from "./provider.js";
 import { routeAgentResponse } from "./provider.js";
 import type { OrchestratedTurnOptions } from "./orchestrator.js";
-import type { AgentTurnContext } from "./tools.js";
+import type { AgentTurnContext, HostExecutionRequestInfo } from "./tools.js";
 import type { ToolApprovalRequestInfo } from "./tools.js";
 import { createSessionExecutionContext } from "../tools/sessionContext.js";
 
@@ -148,6 +148,13 @@ export interface AgentLoopOutput {
    * (Phase 10.29). Empty when no tools required approval.
    */
   pendingApprovals: readonly ToolApprovalRequestInfo[];
+  /**
+   * Host-execution metadata collected from a PAUSED round (Phase 10.39).
+   * Non-empty ONLY when the loop stopped without executing the round's
+   * intents: each entry asks the desktop host to execute its tool locally.
+   * The caller resumes the bounded loop AFTER the host submits results.
+   */
+  pendingExecutions: readonly HostExecutionRequestInfo[];
 }
 
 /**
@@ -212,7 +219,13 @@ export async function runAgentLoop(
     const response = await options.provider.generate(request);
 
     if (!response.toolCalls || response.toolCalls.length === 0) {
-      return { text: response.text, results: toolResults, toolRounds, pendingApprovals };
+      return {
+        text: response.text,
+        results: toolResults,
+        toolRounds,
+        pendingApprovals,
+        pendingExecutions: [],
+      };
     }
 
     if (toolRounds >= options.maxToolRounds) {
@@ -234,14 +247,34 @@ export async function runAgentLoop(
     const routed = await routeAgentResponse(c, response, {
       ...options,
       ...(roundContext !== undefined ? { turnContext: roundContext } : {}),
+      // Phase 10.39: the round number tags any host-delegated tool call so
+      // the recorded execution is correlated to this provider round.
+      toolRounds,
     });
-    toolResults = [...toolResults, ...routed.results];
-    pendingApprovals.push(...routed.pendingApprovals);
     options.onRound?.({
       text: response.text,
       toolCalls: response.toolCalls,
       results: routed.results,
       toolRounds,
     });
+
+    // Phase 10.39 early-stop: when this round produced host-execution
+    // deferrals, the loop PAUSES immediately — the round's intents were NOT
+    // executed, so their denied results are NOT fed back to the provider as
+    // context, and the loop does NOT continue (nor hit the bound check) until
+    // the desktop host has executed and the caller resumes. The deferral
+    // round itself is not an executed turn.
+    if (routed.pendingExecutions.length > 0) {
+      return {
+        text: response.text,
+        results: toolResults,
+        toolRounds,
+        pendingApprovals,
+        pendingExecutions: routed.pendingExecutions,
+      };
+    }
+
+    toolResults = [...toolResults, ...routed.results];
+    pendingApprovals.push(...routed.pendingApprovals);
   }
 }

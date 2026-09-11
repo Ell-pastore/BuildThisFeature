@@ -15,7 +15,7 @@ import Duplicates from "./components/views/Duplicates";
 import SmartFolders from "./components/views/SmartFolders";
 import Storage from "./components/views/Storage";
 import Settings from "./components/views/Settings";
-import { getFilesystemProvider, type DiskUsage } from "./services/filesystem";
+import { getFilesystemProvider, type DiskUsage, type StorageBreakdown } from "./services/filesystem";
 import { useStars } from "./services/stars";
 import type { FileItem } from "./types";
 
@@ -64,6 +64,11 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
 
+  // Real recursive desktop search state (search_files via the provider).
+  const [searchResults, setSearchResults] = useState<FileItem[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
   // Real filesystem state driven by Tauri/Rust.
   const [dirPath, setDirPath] = useState<string>("");
   const [parentPath, setParentPath] = useState<string | null>(null);
@@ -72,7 +77,73 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const { isStarred, toggleStar } = useStars();
+  const { stars, isStarred, toggleStar } = useStars();
+
+  // Starred view state: ALL persisted starred paths resolved against the real
+  // filesystem (source of truth = the persisted star store), so stars outside
+  // the currently loaded directory are shown too. `missing` is every persisted
+  // path the filesystem could not resolve (deleted/moved/outside-allowlist).
+  const [starredItems, setStarredItems] = useState<FileItem[]>([]);
+  const [starredMissing, setStarredMissing] = useState<string[]>([]);
+  const [starredLoading, setStarredLoading] = useState(false);
+  const [starredError, setStarredError] = useState<string | null>(null);
+  const [starredReloadKey, setStarredReloadKey] = useState(0);
+
+  // Recent files state: the bounded, most-recently-modified items across ALL
+  // allowed roots, served by the real recent_files scan (not the loaded dir).
+  // Reloaded on demand via recentReloadKey (e.g. retry after an error).
+  const [recentItems, setRecentItems] = useState<FileItem[]>([]);
+  const [recentLoading, setRecentLoading] = useState(false);
+  const [recentError, setRecentError] = useState<string | null>(null);
+  const [recentReloadKey, setRecentReloadKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRecentLoading(true);
+    setRecentError(null);
+    filesystem
+      .recentFiles()
+      .then((items) => {
+        if (cancelled) return;
+        setRecentItems(items);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setRecentError(err instanceof Error ? err.message : String(err));
+        setRecentItems([]);
+      })
+      .finally(() => {
+        if (!cancelled) setRecentLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [recentReloadKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setStarredLoading(true);
+    setStarredError(null);
+    filesystem
+      .resolveStarredPaths(stars)
+      .then((res) => {
+        if (cancelled) return;
+        setStarredItems(res.items.map((f) => ({ ...f, starred: true })));
+        setStarredMissing(res.missing);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setStarredError(err instanceof Error ? err.message : String(err));
+        setStarredItems([]);
+        setStarredMissing([]);
+      })
+      .finally(() => {
+        if (!cancelled) setStarredLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [stars, starredReloadKey]);
 
   // Real volume capacity reported by Rust (disk_usage). Null while loading or
   // when unavailable — never fabricated.
@@ -84,6 +155,39 @@ export default function App() {
       .then(setDiskUsage)
       .catch(() => setDiskUsage(null));
   }, []);
+
+  // Storage "By Category" state: REAL file sizes aggregated by extension by the
+  // bounded `storage_by_category` scan. Scanned lazily when the Storage view
+  // first opens (a full-tree scan shouldn't run at app startup), then reloaded
+  // on demand via storageReloadKey (e.g. retry after a transient error).
+  const [storageBreakdown, setStorageBreakdown] = useState<StorageBreakdown | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [storageReloadKey, setStorageReloadKey] = useState(0);
+
+  useEffect(() => {
+    if (view !== "storage") return;
+    let cancelled = false;
+    setStorageLoading(true);
+    setStorageError(null);
+    filesystem
+      .storageByCategory()
+      .then((breakdown) => {
+        if (cancelled) return;
+        setStorageBreakdown(breakdown);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setStorageError(err instanceof Error ? err.message : String(err));
+        setStorageBreakdown(null);
+      })
+      .finally(() => {
+        if (!cancelled) setStorageLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view, storageReloadKey]);
 
   /** Load the given directory (defaults to the user's home directory). */
   const loadDir = useCallback(async (path?: string) => {
@@ -136,9 +240,38 @@ export default function App() {
       ? buildPathCrumbs(dirPath, navigateToPath)
       : (staticCrumbs[view] ?? ["SmartFile"]).map((label) => ({ label }));
 
-  function handleSearch(q: string) {
+  const handleSearch = (q: string) => {
     setSearchQuery(q);
     setView("search");
+    void runSearch(q);
+  };
+
+  /**
+   * Real desktop search: the recursive `search_files` Rust command via the
+   * filesystem provider, across ALL allowed roots — not the loaded directory.
+   * Empty/whitespace queries never touch the filesystem and clear results.
+   */
+  async function runSearch(query: string) {
+    const q = query.trim();
+    if (!q) {
+      setSearchResults([]);
+      setSearching(false);
+      setSearchError(null);
+      return;
+    }
+    setSearching(true);
+    setSearchError(null);
+    try {
+      const found = await filesystem.searchFiles(q);
+      // Search entries are real provider FileItems; stars are the same
+      // localStorage annotation the rest of the app applies.
+      setSearchResults(found.map((f) => ({ ...f, starred: isStarred(f.path ?? f.id) })));
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : String(err));
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
   }
 
   /** Open the in-app preview overlay (existing Figma behavior). */
@@ -171,6 +304,16 @@ export default function App() {
     }
   }
 
+  async function createNewFile(name: string) {
+    try {
+      const sep = dirPath.endsWith("/") ? "" : "/";
+      await filesystem.createFile(`${dirPath}${sep}${name}`);
+      await loadDir(dirPath);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function doRename(item: FileItem, newName: string) {
     try {
       if (item.path) await filesystem.renameItem(item.path, newName);
@@ -189,9 +332,31 @@ export default function App() {
     }
   }
 
+  async function doCopy(items: FileItem[], destDir: string) {
+    try {
+      for (const item of items) {
+        if (item.path) await filesystem.copyItem(item.path, destDir);
+      }
+      await loadDir(dirPath);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function doDuplicate(item: FileItem) {
+    try {
+      if (item.path) await filesystem.duplicateItem(item.path);
+      await loadDir(dirPath);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function doDelete(item: FileItem) {
     try {
-      if (item.path) await filesystem.deleteItem(item.path);
+      // The normal Delete action moves an item to the app-managed trash —
+      // never a permanent delete.
+      if (item.path) await filesystem.trashItem(item.path);
       if (previewFile?.path === item.path) setPreviewFile(null);
       await loadDir(dirPath);
     } catch (err) {
@@ -202,17 +367,6 @@ export default function App() {
   function doToggleStar(item: FileItem) {
     toggleStar(item.path ?? item.id);
   }
-
-  const searchResults = useMemo(() => {
-    if (!searchQuery.trim()) return [];
-    const q = searchQuery.toLowerCase();
-    return seenFiles.filter(
-      (f) =>
-        f.name.toLowerCase().includes(q) ||
-        f.type.toLowerCase().includes(q) ||
-        (f.location && f.location.toLowerCase().includes(q)),
-    );
-  }, [seenFiles, searchQuery]);
 
   return (
     <div className="h-full flex bg-background overflow-hidden" style={{ fontFamily: "Inter, system-ui, sans-serif" }}>
@@ -245,22 +399,57 @@ export default function App() {
                 onOpenPreview={openPreview}
                 onOpenDisk={openOnDisk}
                 onNewFolder={createNewFolder}
+                onNewFile={createNewFile}
                 onRename={doRename}
                 onDelete={doDelete}
                 onMove={doMove}
+                onCopy={(item, dest) => void doCopy([item], dest)}
+                onDuplicate={doDuplicate}
                 onToggleStar={doToggleStar}
+                onRefresh={() => void loadDir(dirPath)}
               />
             )}
-            {view === "recent" && <Recent onOpenFile={openPreview} recentFiles={seenFiles} />}
+            {view === "recent" && (
+              <Recent
+                onOpenFile={openPreview}
+                items={recentItems}
+                loading={recentLoading}
+                error={recentError}
+                onRetry={() => setRecentReloadKey((k) => k + 1)}
+              />
+            )}
             {view === "starred" && (
-              <Starred onOpenFile={openPreview} starredItems={seenFiles.filter((f) => f.starred)} />
+              <Starred
+                onOpenFile={openPreview}
+                items={starredItems}
+                missingPaths={starredMissing}
+                loading={starredLoading}
+                error={starredError}
+                onRetry={() => setStarredReloadKey((k) => k + 1)}
+              />
             )}
             {view === "trash" && <Trash />}
-            {view === "search" && <Search query={searchQuery} onOpenFile={openPreview} results={searchResults} />}
+            {view === "search" && (
+              <Search
+                query={searchQuery}
+                searching={searching}
+                error={searchError}
+                onOpenFile={openPreview}
+                results={searchResults}
+              />
+            )}
             {view === "ai-organization" && <AIOrganization />}
             {view === "duplicates" && <Duplicates />}
             {view === "smart-folders" && <SmartFolders />}
-            {view === "storage" && <Storage diskUsage={diskUsage} />}
+            {view === "storage" && (
+              <Storage
+                diskUsage={diskUsage}
+                breakdown={storageBreakdown}
+                loading={storageLoading}
+                error={storageError}
+                onRetry={() => setStorageReloadKey((k) => k + 1)}
+              />
+            )}
             {view === "settings" && <Settings />}
             {view === "ai-assistant" && <AIHistoryView />}
           </div>
@@ -285,6 +474,8 @@ export default function App() {
           onDelete={() => void doDelete(previewFile)}
           onRename={(name) => void doRename(previewFile, name)}
           onMove={(dest) => void doMove(previewFile, dest)}
+          onCopy={(dest) => void doCopy([previewFile], dest)}
+          onDuplicate={() => void doDuplicate(previewFile)}
         />
       )}
     </div>

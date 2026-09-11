@@ -38,9 +38,12 @@ import {
 import { isToolRegistryError, type ToolRegistry } from "../tools/registry.js";
 import { requiresToolApproval, type ToolDefinition } from "../tools/types.js";
 import { ToolError, ToolErrorCode } from "../tools/errors.js";
-import type {
-  FilesystemExecutor,
+import {
+  isHostDelegatedFilesystemExecutor,
+  type FilesystemExecutor,
 } from "../tools/executor.js";
+import { requireString } from "../tools/handlers/handler.js";
+import { hasControlCharacters, validateToolPath } from "../tools/paths.js";
 import type {
   RawToolInput,
   ToolExecutionResult,
@@ -56,6 +59,13 @@ import {
   getPendingToolApproval,
   getToolApproval,
 } from "./aiToolApprovals.js";
+import {
+  HostExecutionDuplicateError,
+  HostExecutionInvalidArgumentsError,
+  HostExecutionValidationError,
+  createAiHostExecution,
+  getPendingHostExecution,
+} from "./aiHostExecutions.js";
 
 /** Dependencies the invocation service needs to run pipeline stages. */
 export interface InvokeToolOptions {
@@ -88,6 +98,18 @@ export interface InvokeToolOptions {
    * declare `requiresApproval: true`.
    */
   approvalId?: string;
+  /**
+   * Provider-intent provenance for host-delegated tool calls (Phase 10.39).
+   * When the executor is a `HostDelegatedFilesystemExecutor`, an ungated read
+   * tool is NOT executed in this process: the gate records a scoped
+   * `ai_host_executions` row identified by `callId` and `toolRounds` and
+   * returns a typed `host_execution_required` result for the desktop host.
+   * Both values come from the controlled agent-loop layer, never from
+   * provider output or the untrusted tool input. Ignored unless the executor
+   * is host-delegated.
+   */
+  callId?: string;
+  toolRounds?: number;
 }
 
 /**
@@ -203,7 +225,24 @@ export async function invokeTool(
     return runApprovalGate(executionContext, toolName, input, options);
   }
 
-  // Gates 3+ — policy → handler → executor, exactly as before.
+  // Gate 3 — HOST (Phase 10.39). Only when the executor is host-delegated
+  // and NOT gated above: an ungated read tool must NOT execute in this
+  // process — a scoped host-execution record is created for the desktop host.
+  // The gate declines (`null`) for non-delegated read tools, missing
+  // provenance, or missing turn context, in which case the unchanged pipeline
+  // below runs; a read tool that actually reaches the doomed executor fails
+  // closed with a security error.
+  if (isHostDelegatedFilesystemExecutor(options.filesystem)) {
+    const delegated = await runHostExecutionGate(
+      executionContext,
+      toolName,
+      input,
+      options,
+    );
+    if (delegated !== null) return delegated;
+  }
+
+  // Gates 4+ — policy → handler → executor, exactly as before.
   return dispatchTool(
     options.registry,
     toolName,
@@ -396,4 +435,260 @@ function approvalRequiredResult(record: {
     },
   };
 }
+}
+
+// ---------------------------------------------------------------------------
+// Host-execution gate (Phase 10.39)
+// ---------------------------------------------------------------------------
+
+/** How long a freshly created pending host-execution stays decidable. */
+export const HOST_EXECUTION_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * The un-gated, READ-ONLY tools the desktop host executes locally. Write
+ * tools are not listed: `move_file` requires approval and must never be
+ * host-delegated (it stays behind the Phase 10.28 approval flow). This set is
+ * the ONLY set Phase 10.39 delegates — anything else reaching a
+ * host-delegated executor fails closed.
+ */
+export const HOST_DELEGATED_READ_TOOLS: ReadonlySet<string> = new Set([
+  "list_directory",
+  "search_files",
+  "get_file_metadata",
+  "read_file",
+]);
+
+/**
+ * Safe, typed information about the pending host execution a delegated
+ * invocation produced. Deliberately narrow: the execution id (so the desktop
+ * host / caller can reference it), the tool name, the VALIDATED arguments
+ * stored for the host, and the expiry of the window. No execution has
+ * happened.
+ */
+export interface HostExecutionRequestInfo {
+  /** The persisted pending host-execution id. */
+  readonly executionId: string;
+  /** The registered tool the host execution was created for. */
+  readonly toolName: string;
+  /** The schema-validated arguments stored for the host. */
+  readonly arguments: unknown;
+  /** When the host-execution window closes. */
+  readonly expiresAt: Date;
+}
+
+/**
+ * The typed `host_execution_required` result: a structured failure (category
+ * `security`, code `tools/host-execution-required`) enriched with the pending
+ * host execution's safe information. The tool was NOT executed in this
+ * process — the desktop host is expected to execute it locally and submit.
+ */
+export interface HostExecutionRequiredResult extends ToolFailureResult {
+  /** Discriminator, always `true` on a host-execution-required result. */
+  readonly executionRequired: true;
+  /** The pending host execution's safe information. */
+  readonly execution: HostExecutionRequestInfo;
+}
+
+/** Narrow a tool execution result to a `host_execution_required` result. */
+export function isHostExecutionRequiredResult(
+  result: ToolExecutionResult,
+): result is HostExecutionRequiredResult {
+  return (
+    !result.ok &&
+    "executionRequired" in result &&
+    result.executionRequired === true &&
+    "execution" in result
+  );
+}
+
+/**
+ * The Phase 10.39 host-delegation stage, reached ONLY when the executor is
+ * host-delegated AND the tool passed the approval gate above (so it is an
+ * ungated, read-only tool).
+ *
+ * Returns a `host_execution_required` result after writing one scoped pending
+ * host-execution row for the desktop host; returns `null` when the request is
+ * NOT delegable, so `invokeTool` falls through to the unchanged dispatch —
+ * where a read tool hitting the doomed executor fails closed.
+ *
+ * Every rejection is a structured `security` (or `validation`) result from the
+ * gate; nothing in this process is executed. Shallow-to-deep argument checks
+ * (schema shape via `createAiHostExecution`, path semantics for the
+ * path-valued reads) run BEFORE any row is written.
+ */
+async function runHostExecutionGate(
+  executionContext: ToolExecutionContext,
+  toolName: string,
+  input: RawToolInput,
+  options: InvokeToolOptions,
+): Promise<ToolExecutionResult | null> {
+  const identity =
+    executionContext.actor.kind === "ai-agent"
+      ? executionContext.actor.identity
+      : undefined;
+  const userId = identity?.userId;
+  if (userId === undefined || userId.length === 0) {
+    return {
+      ok: false,
+      error: ToolError.security(
+        ToolErrorCode.HostExecutionContextMissing,
+        "Host execution requires an authenticated identity.",
+      ),
+    };
+  }
+  if (options.turnContext === undefined) {
+    return {
+      ok: false,
+      error: ToolError.security(
+        ToolErrorCode.HostExecutionContextMissing,
+        `Tool "${toolName}" is delegated to the desktop host, which needs a persisted conversation and message context.`,
+      ),
+    };
+  }
+  if (!HOST_DELEGATED_READ_TOOLS.has(toolName)) {
+    // Not a delegated read tool — let the unchanged pipeline run (a write
+    // tool reaching the doomed executor fails closed).
+    return null;
+  }
+  if (options.callId === undefined || options.toolRounds === undefined) {
+    return {
+      ok: false,
+      error: ToolError.security(
+        ToolErrorCode.HostExecutionContextMissing,
+        `Tool "${toolName}" is delegated to the desktop host, which needs an intent call id and a round number.`,
+      ),
+    };
+  }
+
+  const pathError = validateHostExecutionReadArgs(toolName, input);
+  if (pathError !== null) return { ok: false, error: pathError };
+
+  try {
+    const record = await createAiHostExecution(
+      {
+        userId,
+        conversationId: options.turnContext.conversationId,
+        messageId: options.turnContext.messageId,
+        toolName,
+        callId: options.callId,
+        arguments: input,
+        round: options.toolRounds,
+        expiresAt: new Date(Date.now() + HOST_EXECUTION_WINDOW_MS),
+      },
+      { registry: options.registry },
+    );
+    return hostExecutionRequiredResult(record);
+  } catch (error) {
+    if (error instanceof HostExecutionInvalidArgumentsError) {
+      return {
+        ok: false,
+        error: ToolError.validation(
+          ToolErrorCode.HostExecutionInvalidArguments,
+          error.message,
+        ),
+      };
+    }
+    if (error instanceof HostExecutionDuplicateError) {
+      // Idempotent re-request: surface the EXISTING pending execution for the
+      // same message + tool + call instead of writing a second row.
+      const existing = await getPendingHostExecution(
+        userId,
+        options.turnContext.messageId,
+        error.toolName,
+        error.callId,
+      );
+      if (existing !== null) {
+        return hostExecutionRequiredResult(existing);
+      }
+      return {
+        ok: false,
+        error: ToolError.security(
+          ToolErrorCode.HostExecutionRequired,
+          `A pending host execution already exists for tool "${toolName}" in this message.`,
+        ),
+      };
+    }
+    if (error instanceof HostExecutionValidationError) {
+      // Malformed turn-context ids or expiry — fail closed, execute nothing.
+      return {
+        ok: false,
+        error: ToolError.security(
+          ToolErrorCode.HostExecutionContextMissing,
+          error.message,
+        ),
+      };
+    }
+    // UnknownTool / NotDelegable cannot occur (the registry was pre-checked
+    // and approval-gated tools never reach this gate); any other failure
+    // (e.g. a foreign conversation id violating the FK) is fail-closed.
+    return { ok: false, error: ToolError.internal() };
+  }
+}
+
+/**
+ * Deep, shape-only validation of the delegated read tools' arguments. The
+ * `createAiHostExecution` schema check is shape-only; this adds the path
+ * semantics the real handlers enforce (absolute + in-scope, control-free),
+ * acting as the pre-write first gate — a host-execution record can never
+ * encode clearly invalid or unsafe arguments. Messages never include the raw
+ * path. Returns `null` when the arguments are well-formed.
+ */
+function validateHostExecutionReadArgs(
+  toolName: string,
+  input: RawToolInput,
+): ToolError | null {
+  const mandatoryPath =
+    toolName === "list_directory" ||
+    toolName === "get_file_metadata" ||
+    toolName === "read_file";
+  const required = requireString(input, "path");
+  if (mandatoryPath && !required.ok) return required.error;
+  if ("path" in input) {
+    if (typeof input.path !== "string") {
+      return ToolError.validation(
+        ToolErrorCode.InvalidPath,
+        "Field \"path\" must be a string.",
+      );
+    }
+    const validated = validateToolPath(input.path);
+    if (!validated.ok) return validated.error;
+  }
+  if ("query" in input) {
+    if (typeof input.query !== "string") {
+      return ToolError.validation(
+        ToolErrorCode.InvalidPath,
+        "Field \"query\" must be a string.",
+      );
+    }
+    if (hasControlCharacters(input.query)) {
+      return ToolError.validation(
+        ToolErrorCode.InvalidPath,
+        "Field \"query\" contains an invalid character.",
+      );
+    }
+  }
+  return null;
+}
+
+/** Build the typed `host_execution_required` result for a pending record. */
+function hostExecutionRequiredResult(record: {
+  id: string;
+  toolName: string;
+  arguments: unknown;
+  expiresAt: Date;
+}): HostExecutionRequiredResult {
+  return {
+    ok: false,
+    error: ToolError.security(
+      ToolErrorCode.HostExecutionRequired,
+      `Tool "${record.toolName}" is delegated to the desktop host; host execution ${record.id} is pending and the tool was not executed.`,
+    ),
+    executionRequired: true,
+    execution: {
+      executionId: record.id,
+      toolName: record.toolName,
+      arguments: record.arguments,
+      expiresAt: record.expiresAt,
+    },
+  };
 }

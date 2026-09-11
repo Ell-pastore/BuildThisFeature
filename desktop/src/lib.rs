@@ -146,6 +146,30 @@ fn search_files(
     fs_service::search_files(allow_list.inner(), &query)
 }
 
+/// Return the most recently modified files and directories across all allowed
+/// roots, newest first. The result is hard-capped at `limit` (default
+/// [`fs_service::RECENT_FILES_DEFAULT_LIMIT`]) — never the whole tree.
+#[tauri::command]
+fn recent_files(
+    limit: Option<usize>,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<Vec<fs_service::FileEntry>, String> {
+    fs_service::recent_files(
+        allow_list.inner(),
+        limit.unwrap_or(fs_service::RECENT_FILES_DEFAULT_LIMIT),
+    )
+}
+
+/// Scan the allowed roots once and aggregate REAL file sizes by extension-
+/// derived category (Documents, Images, Videos, Audio, Archives, Code, Other).
+/// The scan is hard-capped at [`fs_service::STORAGE_SCAN_MAX_FILES`] files.
+#[tauri::command]
+fn storage_by_category(
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<fs_service::StorageBreakdown, String> {
+    fs_service::storage_by_category(allow_list.inner(), fs_service::STORAGE_SCAN_MAX_FILES)
+}
+
 /// Move an authorized file or folder into the application-managed trash.
 #[tauri::command]
 fn trash_item(
@@ -164,6 +188,40 @@ fn restore_item(
     trash: tauri::State<fs_service::TrashRoot>,
 ) -> Result<String, String> {
     fs_service::restore_item(trash.inner(), allow_list.inner(), &trashed_path)
+}
+
+/// List the current contents of the application-managed trash.
+#[tauri::command]
+fn list_trash(
+    allow_list: tauri::State<fs_service::AllowList>,
+    trash: tauri::State<fs_service::TrashRoot>,
+) -> Result<Vec<fs_service::TrashEntry>, String> {
+    fs_service::list_trash(trash.inner(), allow_list.inner())
+}
+
+/// Load the user's starred absolute paths from the app-local star store.
+#[tauri::command]
+fn load_starred_paths(store: tauri::State<fs_service::StarStore>) -> Result<Vec<String>, String> {
+    fs_service::load_stars(store.inner())
+}
+
+/// Persist the user's starred absolute paths to the app-local star store.
+#[tauri::command]
+fn save_starred_paths(
+    paths: Vec<String>,
+    store: tauri::State<fs_service::StarStore>,
+) -> Result<(), String> {
+    fs_service::save_stars(store.inner(), &paths)
+}
+
+/// Resolve persisted starred paths against the real filesystem, reporting
+/// missing/deleted/moved/invalid/outside-allowlist paths honestly.
+#[tauri::command]
+fn resolve_starred_paths(
+    paths: Vec<String>,
+    allow_list: tauri::State<fs_service::AllowList>,
+) -> Result<fs_service::StarredResolution, String> {
+    fs_service::resolve_starred_paths(allow_list.inner(), &paths)
 }
 
 /// Duplicate a file or folder into the same parent directory with a
@@ -210,6 +268,20 @@ pub fn run() {
                 Some(t) => t,
             };
             app.manage(trash);
+            // The user's starred paths persist to a `stars.json` file in the
+            // Tauri app-local data directory behind an in-memory managed store.
+            // If the data directory cannot be resolved, an empty tombstone is
+            // managed so every star load/save is denied (fail closed).
+            let star_store = app
+                .path()
+                .app_local_data_dir()
+                .ok()
+                .map(|dir| {
+                    let _ = std::fs::create_dir_all(&dir);
+                    fs_service::StarStore::new(dir.join(fs_service::STARS_FILE_NAME))
+                })
+                .unwrap_or_else(fs_service::StarStore::empty);
+            app.manage(star_store);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -227,8 +299,14 @@ pub fn run() {
             read_file,
             write_file,
             search_files,
+            recent_files,
+            storage_by_category,
             trash_item,
             restore_item,
+            list_trash,
+            load_starred_paths,
+            save_starred_paths,
+            resolve_starred_paths,
             duplicate_item,
             create_file,
         ])

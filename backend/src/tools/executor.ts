@@ -107,3 +107,67 @@ export function tauriFilesystemExecutor(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Host-delegated executor (Phase 10.39)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by every method of a `HostDelegatedFilesystemExecutor`. When THIS
+ * process has no real access to the host filesystem (the executor is
+ * host-delegated), the tool layer must defer: it records a scoped
+ * host-execution request and the DESKTOP HOST executes locally. A method on
+ * the delegated executor is never the execution path — reaching one means a
+ * code path forgot to route through the Phase 10.39 host-execution gate.
+ */
+export class HostExecutionDeferredError extends Error {
+  readonly code = "tools/host-execution-required";
+  constructor() {
+    super(
+      "This filesystem operation is delegated to the desktop host; it cannot run inside the backend process.",
+    );
+    this.name = "HostExecutionDeferredError";
+  }
+}
+
+/**
+ * A `FilesystemExecutor` whose every operation is host-delegated. Carrying a
+ * `kind: "host-delegated"` discriminator lets the invocation service detect
+ * that ungated tool calls in THIS process must be recorded for the desktop
+ * host instead of executed. Never construct this directly — use
+ * `hostDelegatedFilesystemExecutor()`.
+ */
+export interface HostDelegatedFilesystemExecutor extends FilesystemExecutor {
+  readonly kind: "host-delegated";
+}
+
+/** Narrow an executor to the host-delegated variant. */
+export function isHostDelegatedFilesystemExecutor(
+  filesystem: FilesystemExecutor,
+): filesystem is HostDelegatedFilesystemExecutor {
+  return (
+    typeof filesystem === "object" &&
+    filesystem !== null &&
+    (filesystem as { kind?: unknown }).kind === "host-delegated"
+  );
+}
+
+/**
+ * The fail-closed host-delegated executor. Every method throws a
+ * `HostExecutionDeferredError` — execution on the host is recorded by the
+ * Phase 10.39 gate in the invocation service, never performed here. Write
+ * operations reaching this executor (via the approval EXECUTE path) fail
+ * closed with a security error, exactly as they do when no Tauri host is
+ * available.
+ */
+export function hostDelegatedFilesystemExecutor(): HostDelegatedFilesystemExecutor {
+  const deferred = (): Promise<never> => Promise.reject(new HostExecutionDeferredError());
+  return {
+    kind: "host-delegated",
+    listDirectory: deferred,
+    searchFiles: deferred,
+    getFileMetadata: deferred,
+    readFile: deferred,
+    moveFile: deferred,
+  };
+}
+

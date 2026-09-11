@@ -17,6 +17,10 @@ const BANNERS: Partial<Record<AiTurnState, { title: string; detail: string }>> =
     title: "Awaiting your approval",
     detail: "The assistant requested a tool action that needs a decision.",
   },
+  "awaiting-host-execution": {
+    title: "Running on your desktop",
+    detail: "Continue after the requested operations have been executed.",
+  },
   approved: {
     title: "Approved",
     detail: "The requested tool action was approved.",

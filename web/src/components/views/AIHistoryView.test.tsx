@@ -5,6 +5,7 @@ import { ApiClientError } from "../../services/api/client";
 import type {
   AiConversationDetail,
   AiConversationSummary,
+  AiHostExecution,
   AiInstructionResponse,
   AiRuntimeStatus,
   AiToolApproval,
@@ -54,6 +55,14 @@ vi.mock("@/services/api/aiInstructions", () => ({
   submitAiInstruction: instr.submitAiInstruction,
 }));
 
+const host = vi.hoisted(() => ({
+  driveHostExecutions: vi.fn(),
+}));
+
+vi.mock("@/services/api/aiHostExecutions", () => ({
+  driveHostExecutions: host.driveHostExecutions,
+}));
+
 const status = vi.hoisted(() => ({
   getAiRuntimeStatus: vi.fn(),
 }));
@@ -91,6 +100,7 @@ function instructionResult(conversationId: string, finalText: string): AiInstruc
       maxToolRounds: 4,
       toolResults: [],
       pendingApprovals: [],
+      pendingExecutions: [],
     },
   };
 }
@@ -104,6 +114,7 @@ function summary(overrides: Partial<AiConversationSummary> = {}): AiConversation
     updatedAt: ISO,
     turnState: "completed",
     pendingApprovals: [],
+    pendingHostExecutions: [],
     ...overrides,
   };
 }
@@ -125,6 +136,7 @@ function detail(overrides: Partial<AiConversationDetail> = {}): AiConversationDe
     updatedAt: ISO,
     turnState: "completed",
     pendingApprovals: [],
+    pendingHostExecutions: [],
     messages: [],
     ...overrides,
   };
@@ -152,6 +164,7 @@ function authenticatedUser() {
 
 const BANNER_DETAIL: Record<AiTurnState, string> = {
   "awaiting-approval": "The assistant requested a tool action that needs a decision.",
+  "awaiting-host-execution": "Continue after the requested operations have been executed.",
   approved: "The requested tool action was approved.",
   rejected: "The requested tool action was rejected.",
   expired: "The approval window elapsed before a decision was made.",
@@ -177,6 +190,7 @@ describe("AIHistoryView", () => {
     api.listAiConversations.mockResolvedValue([]);
     api.getAiConversation.mockResolvedValue(detail());
     instr.submitAiInstruction.mockResolvedValue(instructionResult("conv-1", DONE_REPLY));
+    host.driveHostExecutions.mockResolvedValue(null);
     status.getAiRuntimeStatus.mockResolvedValue(configuredStatus());
     decide.approveAiApproval.mockResolvedValue(pendingApproval({ status: "approved", decidedAt: ISO }));
     decide.rejectAiApproval.mockResolvedValue(pendingApproval({ status: "rejected", decidedAt: ISO }));
@@ -395,6 +409,118 @@ describe("AIHistoryView", () => {
     expect(await screen.findByText(DONE_REPLY)).toBeInTheDocument();
     expect(screen.getByText(MOVE_THEM)).toBeInTheDocument();
     expect(screen.getByLabelText("Give the assistant an instruction")).toHaveValue("");
+  });
+
+  it("drives host executions when a submit pauses at a filesystem operation, then reconciles", async () => {
+    authenticatedUser();
+    const pause = instructionResult("conv-1", DONE_REPLY);
+    pause.turn.pendingExecutions = [
+      {
+        executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        toolName: "list_directory",
+        arguments: { path: "/home" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      },
+    ];
+    instr.submitAiInstruction.mockResolvedValue(pause);
+    const reconciled = detail({
+      turnState: "completed",
+      messages: [
+        { id: "m1", role: "user", content: RECEIPTS_INPUT, createdAt: ISO, isFinal: false },
+        { id: "m3", role: "user", content: MOVE_THEM, createdAt: ISO, isFinal: false },
+        { id: "m4", role: "assistant", content: DONE_REPLY, createdAt: ISO, isFinal: true },
+      ],
+    });
+    api.listAiConversations.mockResolvedValue([summary()]);
+    api.getAiConversation.mockResolvedValueOnce(twoPane.detail).mockResolvedValue(reconciled);
+
+    render(<AIHistoryView />);
+    expect(await screen.findByText(RECEIPTS_INPUT)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Give the assistant an instruction"), {
+      target: { value: MOVE_THEM },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send instruction" }));
+
+    // The view hands the paused turn's executions + conversation to the driver
+    // so the DESKTOP HOST runs them locally and resumes the same bounded turn;
+    // it never runs tools itself or fabricates results.
+    await waitFor(() =>
+      expect(host.driveHostExecutions).toHaveBeenCalledWith(
+        [
+          {
+            executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            toolName: "list_directory",
+            arguments: { path: "/home" },
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          },
+        ],
+        "conv-1",
+      ),
+    );
+    await waitFor(() => expect(api.listAiConversations).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(DONE_REPLY)).toBeInTheDocument();
+  });
+
+  it("reload/recovery: drives a conversation loaded into an awaiting-host-execution pause", async () => {
+    authenticatedUser();
+    const pending: AiHostExecution = {
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      conversationId: "conv-1",
+      messageId: "m2",
+      toolName: "list_directory",
+      callId: "c1",
+      arguments: { path: "/home" },
+      round: 1,
+      status: "pending",
+      createdAt: ISO,
+      updatedAt: ISO,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      executedAt: null,
+    };
+    api.listAiConversations.mockResolvedValue([summary({ turnState: "awaiting-host-execution" })]);
+    api.getAiConversation
+      .mockResolvedValueOnce(
+        detail({
+          turnState: "awaiting-host-execution",
+          pendingHostExecutions: [pending],
+          messages: [
+            { id: "m1", role: "user", content: RECEIPTS_INPUT, createdAt: ISO, isFinal: false },
+          ],
+        }),
+      )
+      .mockResolvedValue(
+        detail({
+          turnState: "completed",
+          pendingHostExecutions: [],
+          messages: [
+            { id: "m1", role: "user", content: RECEIPTS_INPUT, createdAt: ISO, isFinal: false },
+            { id: "m2", role: "assistant", content: DONE_REPLY, createdAt: ISO, isFinal: true },
+          ],
+        }),
+      );
+    host.driveHostExecutions.mockResolvedValue(
+      instructionResult("conv-1", "Here is your Desktop 12 items."),
+    );
+
+    render(<AIHistoryView />);
+    expect(await screen.findByText(RECEIPTS_INPUT)).toBeInTheDocument();
+
+    // History executions (id-keyed) are mapped to executionId-keyed requests
+    // before driving, then the transcript is re-fetched from the server.
+    await waitFor(() =>
+      expect(host.driveHostExecutions).toHaveBeenCalledWith(
+        [
+          {
+            executionId: pending.id,
+            toolName: "list_directory",
+            arguments: { path: "/home" },
+          },
+        ],
+        "conv-1",
+      ),
+    );
+    await waitFor(() => expect(api.getAiConversation).toHaveBeenCalledTimes(2));
   });
 
   it("starts a NEW conversation from the empty state (no conversationId) and selects it", async () => {

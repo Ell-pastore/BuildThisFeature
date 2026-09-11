@@ -1,4 +1,4 @@
-import type { FileItem } from "../../types";
+import type { FileItem, TrashItem } from "../../types";
 
 /**
  * Filesystem provider abstraction — the storage-agnostic contract between the
@@ -60,6 +60,47 @@ export interface FileMetadata {
   accessedTs: number | null;
 }
 
+/** Outcome of resolving a batch of persisted starred paths against the real filesystem. */
+export interface StarredResolution {
+  /** Starred paths that exist on disk, as normal real file items. */
+  items: FileItem[];
+  /** The original starred paths that could NOT be resolved (missing, deleted,
+   * moved, invalid, or outside the allowed roots). Never fabricated. */
+  missing: string[];
+}
+
+/** The seven extension-derived storage categories, in canonical display order. */
+export const STORAGE_CATEGORY_NAMES = [
+  "Documents",
+  "Images",
+  "Videos",
+  "Audio",
+  "Archives",
+  "Code",
+  "Other",
+] as const;
+
+export type StorageCategoryName = (typeof STORAGE_CATEGORY_NAMES)[number];
+
+/** Real aggregated byte total for a single storage category. */
+export interface StorageCategory {
+  category: StorageCategoryName;
+  bytes: number;
+}
+
+/** Real file sizes aggregated by extension-derived category from a single scan. */
+export interface StorageBreakdown {
+  /** Every category in canonical order, each with its real aggregated bytes. */
+  categories: StorageCategory[];
+  /** Sum of all category bytes (files classified during the scan). */
+  totalBytes: number;
+  /** Number of regular files scanned and classified. */
+  scannedFileCount: number;
+  /** True when the scan hit the provider's safety cap before finishing the
+   * tree — totals then describe the scanned prefix, honestly. */
+  scanCapped: boolean;
+}
+
 export interface FilesystemProvider {
   /** The provider's default directory (user's home locally, account root in the cloud). */
   homeDirectory(): Promise<string>;
@@ -104,11 +145,31 @@ export interface FilesystemProvider {
    * whose names contain the (case-insensitive) query. Empty query returns an empty array. */
   searchFiles(query: string): Promise<FileItem[]>;
 
+  /** Return up to `limit` (default 20) most recently modified files and folders across all
+   * allowed roots, newest first. The result is hard-capped at `limit` by the provider. */
+  recentFiles(limit?: number): Promise<FileItem[]>;
+
+  /** Scan the allowed roots once and aggregate REAL file sizes by extension-derived category.
+   * The provider bounds the scan (hard cap on files scanned) and reports `scanCapped` honestly. */
+  storageByCategory(): Promise<StorageBreakdown>;
+
   /** Move an authorized file or folder into the application-managed trash. */
   trashItem(path: string): Promise<void>;
 
   /** Restore a genuine trash entry to its recorded original location. Resolves to the restored path. */
   restoreItem(trashedPath: string): Promise<string>;
+
+  /** List the current contents of the application-managed trash. */
+  listTrash(): Promise<TrashItem[]>;
+
+  /** Load the user's starred absolute paths (application metadata, provider-persisted). */
+  loadStarredPaths(): Promise<string[]>;
+
+  /** Persist the user's starred absolute paths (application metadata). */
+  saveStarredPaths(paths: string[]): Promise<void>;
+
+  /** Resolve persisted starred absolute paths into real file items; unresolvable paths are reported in `missing`. */
+  resolveStarredPaths(paths: string[]): Promise<StarredResolution>;
 
   /** Duplicate an item into the same parent with a collision-safe name: `name (copy).ext`, then `name (copy 2).ext`, etc. */
   duplicateItem(path: string): Promise<string>;

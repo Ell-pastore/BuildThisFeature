@@ -81,7 +81,9 @@
 import { AppError } from "../core/errors.js";
 import type { AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
-import type { InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
+import { ToolError, type ToolErrorCategory } from "../tools/errors.js";
+import type { FilesystemExecutor } from "../tools/executor.js";
+import type { HostExecutionRequestInfo, InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
 import { invokeTool } from "./tools.js";
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { RawToolInput } from "../tools/handlers/handler.js";
@@ -92,6 +94,13 @@ import {
   getToolApproval,
   type ToolApprovalRecord,
 } from "./aiToolApprovals.js";
+import {
+  HostExecutionNotFoundError,
+  assertHostExecutionExecutable,
+  getAiHostExecution,
+  submitHostExecution,
+  type HostExecutionRecord,
+} from "./aiHostExecutions.js";
 import { buildAgentContext } from "./agentContext.js";
 import { runAgentLoop, type AgentLoopRound } from "./agentLoop.js";
 import type { ComposedProviderStack } from "./providerComposition.js";
@@ -117,6 +126,24 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * One host submission on a paused turn's resume (Phase 10.39). The desktop
+ * host executed a pending host-execution LOCALLY and reports the outcome so
+ * the backend can seal the record and seed the resumed turn's provider
+ * context. The `result` is transient — it is passed straight to the provider
+ * as seeded tool context and is NEVER persisted.
+ */
+export interface HostExecutionSubmission {
+  /** The user-owned, pending host-execution that was executed. */
+  executionId: string;
+  /** Whether the desktop host's execution succeeded. */
+  ok: boolean;
+  /** The host's execution payload when it succeeded. Never persisted. */
+  result?: unknown;
+  /** The categorized tool error when the host execution failed. */
+  error?: { code: string; category: string };
+}
+
 export interface PersistentTurnInput {
   /** Resume this conversation (ownership enforced). Omit to create a new one. */
   conversationId?: string;
@@ -134,6 +161,18 @@ export interface PersistentTurnInput {
    * supplied `conversationId` must match the approval's conversation.
    */
   resumeApprovalId?: string;
+  /**
+   * Resume mode (Phase 10.39): submissions for the pending host executions a
+   * PAUSED turn produced. Each owned record is asserted executable and SEALED
+   * (`executed`, single-use) so it can never be submitted again, then this
+   * turn resumes the bounded loop against the executions' OWN conversation
+   * with each submission seeded as an already-executed tool round
+   * (`initialToolRounds` = the highest recorded round, bound from the
+   * conversation's persisted `maxToolRounds`). All submissions must share one
+   * conversation, matching an optional supplied `conversationId`. The result
+   * payloads are transient provider context only — they are never persisted.
+   */
+  resumeHostExecutions?: readonly HostExecutionSubmission[];
 }
 
 export interface PersistentTurnOptions extends InvokeToolOptions {
@@ -153,6 +192,19 @@ export interface PersistentTurnOptions extends InvokeToolOptions {
   tools: readonly ToolDefinition[];
   /** Loop bound used when creating a new conversation. Default 1. */
   maxToolRounds?: number;
+  /**
+   * Per-request filesystem executor resolution (Phase 10.39). When set, it is
+   * consulted for EACH turn with the authenticated request context (which
+   * carries the `desktopHost` header flag) and its return value — when not
+   * `undefined` — REPLACES the base `filesystem` for that turn. The
+   * production resolver returns `hostDelegatedFilesystemExecutor()` exactly
+   * when the request came from the desktop host, and `undefined` otherwise so
+   * the fail-closed Tauri bridge stays in effect. Absent for non-production
+   * callers — behavior is unchanged.
+   */
+  resolveFilesystem?: (
+    c: { get: (key: string) => unknown },
+  ) => FilesystemExecutor | undefined;
 }
 
 export interface PersistentTurnResult {
@@ -169,6 +221,14 @@ export interface PersistentTurnResult {
    * provider output.
    */
   pendingApprovals: readonly ToolApprovalRequestInfo[];
+  /**
+   * Pending host-execution metadata collected from a PAUSED round
+   * (Phase 10.39). Empty unless the loop stopped WITHOUT executing its
+   * intents: the turn's eager rows persist by design, the state below is the
+   * partial (unfinalized) conversation, and the caller must resume after the
+   * desktop host submits each execution. Never populated on a completed turn.
+   */
+  pendingExecutions: readonly HostExecutionRequestInfo[];
 }
 
 /**
@@ -201,6 +261,72 @@ function toTurnRecord(round: AgentLoopRound): AgentTurnRecord {
     toolCalls: round.toolCalls,
     toolResults: round.results,
   };
+}
+
+/** A validated, sealed host-execution resume, ready to seed a loop. */
+interface ResolvedHostResume {
+  /** The ONE conversation all submitted executions belong to. */
+  conversationId: string;
+  /** Seeded per-submission tool results (transient provider context). */
+  seeds: readonly AgentToolResult[];
+  /** The highest recorded round across the submitted executions. */
+  initialRounds: number;
+}
+
+/**
+ * Phase 10.39 resume: validate + SEAL each submitted host execution exactly
+ * once (a sealed record can never be replayed), then shape the seeds for the
+ * resumed loop. Sealing happens here, BEFORE the loop runs; a failure in this
+ * phase leaves every record unsealed and untouched.
+ *
+ * The submission payloads are used ONLY as transient provider context — they
+ * are never persisted anywhere.
+ */
+async function resolveHostExecutionsResume(
+  userId: string,
+  submissions: readonly HostExecutionSubmission[],
+  now: Date,
+): Promise<ResolvedHostResume> {
+  // Phase 1 — resolve + assert EVERY submission without touching anything:
+  // a failure (foreign/missing, already sealed, expired) leaves every record
+  // untouched. Ownership is enforced by `getAiHostExecution`.
+  const resolved: { record: HostExecutionRecord; submission: HostExecutionSubmission }[] = [];
+  for (const submission of submissions) {
+    const record = await getAiHostExecution(userId, submission.executionId);
+    if (record === null) {
+      throw new HostExecutionNotFoundError();
+    }
+    assertHostExecutionExecutable(record, now);
+    resolved.push({ record, submission });
+  }
+  const conversations = new Set(resolved.map((s) => s.record.conversationId));
+  if (conversations.size > 1) {
+    throw AppError.badRequest("The submitted host executions span multiple conversations.");
+  }
+  const conversationId = resolved[0]?.record.conversationId ?? "";
+  // Phase 2 — seal EVERY record exactly once (single-use; cannot be replayed).
+  for (const { record } of resolved) {
+    await submitHostExecution(userId, record.id, now);
+  }
+  const seeds: AgentToolResult[] = resolved.map(({ record, submission }) => {
+    if (!submission.ok) {
+      return {
+        ok: false,
+        callId: record.callId,
+        error: new ToolError(
+          (submission.error?.category ?? "internal") as ToolErrorCategory,
+          submission.error?.code ?? "tools/host-execution-required",
+          "The desktop host could not execute the requested operation.",
+        ),
+      };
+    }
+    return { ok: true, callId: record.callId, data: submission.result };
+  });
+  const initialRounds = resolved.reduce(
+    (highest, s) => Math.max(highest, s.record.round),
+    0,
+  );
+  return { conversationId, seeds, initialRounds };
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +404,7 @@ export async function runPersistentTurn(
   //    and its conversation's persisted bound becomes this turn's bound.
   let bound: number | undefined;
   let resumeRecord: ToolApprovalRecord | undefined;
+  let hostResume: ResolvedHostResume | undefined;
   if (input.resumeApprovalId !== undefined) {
     const record = await getToolApproval(userId, input.resumeApprovalId);
     if (record === null) {
@@ -299,6 +426,29 @@ export async function runPersistentTurn(
       throw new AgentConversationNotFoundError();
     }
     bound = loaded.maxToolRounds;
+  } else if (input.resumeHostExecutions !== undefined && input.resumeHostExecutions.length > 0) {
+    // Phase 10.39: resume the PAUSED turn. Every submitted execution is
+    // asserted executable + SEALED (once) before anything else runs. A
+    // failure here throws and leaves every record unsealed. The executions
+    // must share one conversation (matching an optional supplied id), whose
+    // persisted round bound becomes this turn's bound.
+    const resolved = await resolveHostExecutionsResume(
+      userId,
+      input.resumeHostExecutions,
+      new Date(),
+    );
+    if (input.conversationId !== undefined && input.conversationId !== resolved.conversationId) {
+      throw AppError.badRequest("The submitted host executions belong to a different conversation.");
+    }
+    const resumedConversation = await loadAgentConversationState(userId, resolved.conversationId);
+    if (resumedConversation === null) {
+      throw new AgentConversationNotFoundError();
+    }
+    bound = resumedConversation.maxToolRounds;
+    hostResume = resolved;
+    // The executions' own conversation is authoritative for the resumed
+    // turn — the caller need not repeat it (but may, and it must match).
+    input.conversationId = resolved.conversationId;
   }
   const maxToolRounds = bound ?? options.maxToolRounds ?? 1;
 
@@ -387,6 +537,9 @@ export async function runPersistentTurn(
       ...(resumeSeeded !== undefined
         ? { initialToolResults: [resumeSeeded.toolResult], initialToolRounds: 1 }
         : {}),
+      ...(hostResume !== undefined
+        ? { initialToolResults: hostResume.seeds, initialToolRounds: hostResume.initialRounds }
+        : {}),
       onRound: (round) => {
         observed.push(round);
         // The loop calls prepareRound → execute → onRound in strict order,
@@ -432,6 +585,38 @@ export async function runPersistentTurn(
     });
     const rounds = observed.map(toTurnRecord);
 
+    // Phase 10.39 PAUSE: the loop stopped WITHOUT executing its round's
+    // intents (host executions are pending on the desktop host). This is a
+    // PAUSE, not a failure: the eager rows — the conversation and this
+    // round's assistant/tool-call message — were committed by
+    // beginAgentTurn/appendAgentTurnRoundMessage BEFORE the intents ran and
+    // persist BY DESIGN; no compensation runs and nothing is finalized (there
+    // is no final reply yet). The partial state replays ONLY the executed
+    // rounds — the deferred round is not an executed turn — so it yields an
+    // awaiting-host-execution, unfinalized conversation.
+    if (output.pendingExecutions.length > 0) {
+      let pausedState = createConversationState({
+        instruction: context.instruction,
+        maxToolRounds,
+      });
+      for (const round of rounds.slice(0, -1)) {
+        pausedState = recordProviderTurn(pausedState, {
+          text: round.text,
+          toolCalls: round.toolCalls,
+        });
+        if (round.toolResults !== undefined) {
+          pausedState = recordToolResults(pausedState, round.toolResults);
+        }
+      }
+      return {
+        conversationId: conversationId as string,
+        created,
+        state: pausedState,
+        pendingApprovals: output.pendingApprovals,
+        pendingExecutions: output.pendingExecutions,
+      };
+    }
+
     // Phase 10.29: collect pending approval metadata from the agent loop.
     // This is safe metadata only — approval id, tool name, validated args,
     // and expiry — no raw file contents or provider output.
@@ -474,6 +659,7 @@ export async function runPersistentTurn(
         created,
         state,
         pendingApprovals: turnPendingApprovals,
+        pendingExecutions: [],
       };
     }
 
@@ -492,6 +678,7 @@ export async function runPersistentTurn(
       created: persisted.created,
       state,
       pendingApprovals: turnPendingApprovals,
+      pendingExecutions: [],
     };
   } catch (error) {
     // 6. Compensation: a failed turn that already committed eager rows must
@@ -574,7 +761,14 @@ export function createPersistentTurnRuntime(
   }
   return {
     async run(c, input) {
-      return runPersistentTurn(c, input, { ...options, stack });
+      // Phase 10.39: consult the per-request filesystem resolver (when
+      // present). A non-undefined return replaces the base executor for THIS
+      // turn only — e.g. the desktop host's `x-desktop-host: 1` header swaps
+      // in the host-delegated executor so AI filesystem tool calls are
+      // recorded for the desktop instead of failing against the Tauri bridge
+      // this Node process cannot reach.
+      const filesystem = options.resolveFilesystem?.(c) ?? options.filesystem;
+      return runPersistentTurn(c, input, { ...options, stack, filesystem });
     },
   };
 }

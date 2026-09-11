@@ -31,10 +31,12 @@ export interface ApiRequestOptions {
   method?: string;
   body?: unknown;
   token?: string;
+  /** Additional request headers (e.g. the desktop-host flag). */
+  headers?: Record<string, string>;
 }
 
 export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
-  const { method = "GET", body, token } = options;
+  const { method = "GET", body, token, headers } = options;
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
@@ -42,6 +44,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
       headers: {
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(headers ?? {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });

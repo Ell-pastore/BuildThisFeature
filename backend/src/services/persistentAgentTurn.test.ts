@@ -31,6 +31,7 @@ import { AppError } from "../core/errors.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { registerReadTools, readToolDefinitions } from "../tools/definitions/readTools.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
+import { hostDelegatedFilesystemExecutor } from "../tools/executor.js";
 import { defaultToolPolicy, type ToolExecutionContext, type ToolPolicy } from "../tools/policy.js";
 import type { DirectoryListing } from "../tools/tauriShapes.js";
 import type { AgentToolCall } from "./agent.js";
@@ -43,7 +44,11 @@ import {
   createConversationState,
   finalizeConversation,
 } from "./conversation.js";
-import { runPersistentTurn, type PersistentTurnOptions } from "./persistentAgentTurn.js";
+import { runPersistentTurn, type PersistentTurnOptions, type HostExecutionSubmission } from "./persistentAgentTurn.js";
+import {
+  HostExecutionStatus,
+  type HostExecutionRecord,
+} from "./aiHostExecutions.js";
 
 const mocks = vi.hoisted(() => ({
   loadAgentConversationState: vi.fn(),
@@ -69,6 +74,28 @@ vi.mock("../database/repositories/agentConversations.js", () => ({
     }
   },
 }));
+
+// ---------------------------------------------------------------------------
+// Host-execution service seam (Phase 10.39): the repo-touching functions are
+// stubbed; the error classes and executable assertions stay REAL.
+// ---------------------------------------------------------------------------
+const hostMocks = vi.hoisted(() => ({
+  createAiHostExecution: vi.fn(),
+  getPendingHostExecution: vi.fn(),
+  getAiHostExecution: vi.fn(),
+  submitHostExecution: vi.fn(),
+}));
+
+vi.mock("./aiHostExecutions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./aiHostExecutions.js")>();
+  return {
+    ...actual,
+    createAiHostExecution: hostMocks.createAiHostExecution,
+    getPendingHostExecution: hostMocks.getPendingHostExecution,
+    getAiHostExecution: hostMocks.getAiHostExecution,
+    submitHostExecution: hostMocks.submitHostExecution,
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -684,5 +711,141 @@ describe("runPersistentTurn — escalated tool context (10.28C-prep)", () => {
         expect(context.actor.identity.userId).toBe(USER_ID);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10.39 — host-execution pause + resume
+// ---------------------------------------------------------------------------
+
+describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", () => {
+  beforeEach(() => {
+    resetPersistenceMocks();
+    hostMocks.createAiHostExecution.mockReset();
+    hostMocks.getPendingHostExecution.mockReset().mockResolvedValue(null);
+    hostMocks.getAiHostExecution.mockReset();
+    hostMocks.submitHostExecution.mockReset().mockResolvedValue(undefined);
+  });
+
+  function pendingRecord(
+    overrides: Partial<HostExecutionRecord> = {},
+  ): HostExecutionRecord {
+    return {
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      userId: USER_ID,
+      conversationId: "conv-1",
+      messageId: "msg-r1",
+      toolName: "list_directory",
+      callId: "c1",
+      arguments: { path: "/home" },
+      round: 1,
+      status: HostExecutionStatus.Pending,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      executedAt: null,
+      ...overrides,
+    };
+  }
+
+  it("PAUSES when the routed round defers to the host: no execution, no finalize, nothing compensated", async () => {
+    const record = pendingRecord();
+    hostMocks.createAiHostExecution.mockResolvedValue(record);
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("c1", "list_directory", { path: "/home" })] },
+    ]);
+
+    const result = await runPersistentTurn(
+      sessionContext(ACTIVE_USER),
+      { instruction: "List my files.", title: "Listing turn" },
+      makeOptions({ generate }, {
+        maxToolRounds: 3,
+        filesystem: hostDelegatedFilesystemExecutor(),
+      }),
+    );
+
+    // The host-execution request was recorded (not executed).
+    expect(hostMocks.createAiHostExecution).toHaveBeenCalledWith(
+      {
+        userId: USER_ID,
+        conversationId: "conv-1",
+        messageId: "msg-r1",
+        toolName: "list_directory",
+        callId: "c1",
+        arguments: { path: "/home" },
+        round: 1,
+        expiresAt: expect.any(Date),
+      },
+      { registry: expect.any(Object) },
+    );
+    // The paused result exposes exactly the pending execution.
+    expect(result.pendingExecutions).toEqual([
+      {
+        executionId: record.id,
+        toolName: "list_directory",
+        arguments: { path: "/home" },
+        expiresAt: record.expiresAt,
+      },
+    ]);
+    expect(result.state.finalText).toBeUndefined();
+    // The deferred round is NOT an executed turn.
+    expect(result.state.toolRounds).toBe(0);
+    // The transcript row was eagerly persisted (by design), but NOT finalized
+    // and NOT compensated: this is a pause, not a failure.
+    expect(mocks.beginAgentTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.completeAgentTurn).not.toHaveBeenCalled();
+    expect(mocks.cancelAgentTurn).not.toHaveBeenCalled();
+    // The provider saw exactly one round.
+    expect(generate).toHaveBeenCalledTimes(1);
+  });
+
+  it("RESUMES a paused turn: seals the executions once and seeds their results into the SAME bounded turn", async () => {
+    let previous = createConversationState({ instruction: "First turn", maxToolRounds: 3 });
+    previous = finalizeConversation(previous, "First reply.");
+    mocks.loadAgentConversationState.mockResolvedValue(previous);
+    // The paused conversation's pending execution lives at round 1.
+    const record = pendingRecord({ conversationId: "conv-9" });
+    hostMocks.getAiHostExecution.mockResolvedValue(record);
+    mocks.persistAgentTurn.mockResolvedValue({ id: "conv-9", created: false });
+    // The resumed loop is text-only: the seeded result is already its context.
+    const { generate, requests } = scriptedProvider([{ text: "Done after resume." }]);
+
+    const submission: HostExecutionSubmission = {
+      executionId: record.id,
+      ok: true,
+      result: homeListing(),
+    };
+    const result = await runPersistentTurn(
+      sessionContext(ACTIVE_USER),
+      { instruction: "List my files.", resumeHostExecutions: [submission] },
+      makeOptions({ generate }),
+    );
+
+    // Every submission was validated + SEALED exactly once (single-use).
+    expect(hostMocks.getAiHostExecution).toHaveBeenCalledWith(USER_ID, record.id);
+    expect(hostMocks.submitHostExecution).toHaveBeenCalledWith(
+      USER_ID,
+      record.id,
+      expect.any(Date),
+    );
+    // The seeded result was shown to the provider as already-executed context.
+    expect(requests[0]?.toolResults).toEqual([
+      { ok: true, callId: "c1", data: homeListing() },
+    ]);
+    // Conversation (and its 3-round bound) resolved FROM the execution; the
+    // text-only completed turn persisted against that conversation.
+    expect(result.conversationId).toBe("conv-9");
+    expect(result.state.finalText).toBe("Done after resume.");
+    expect(result.pendingExecutions).toEqual([]);
+    expect(mocks.persistAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: USER_ID,
+        conversationId: "conv-9",
+        maxToolRounds: 3,
+      }),
+    );
+    expect(mocks.beginAgentTurn).not.toHaveBeenCalled();
+    expect(mocks.completeAgentTurn).not.toHaveBeenCalled();
+    expect(mocks.cancelAgentTurn).not.toHaveBeenCalled();
   });
 });

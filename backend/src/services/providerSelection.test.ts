@@ -240,6 +240,8 @@ describe("ProviderId — typed identifiers", () => {
   it("exposes the known provider ids", () => {
     expect(KNOWN_PROVIDER_IDS).toContain("grok");
     expect(isProviderId("grok")).toBe(true);
+    expect(KNOWN_PROVIDER_IDS).toContain("groq");
+    expect(isProviderId("groq")).toBe(true);
     expect(KNOWN_PROVIDER_IDS).toContain("gemini");
     expect(isProviderId("gemini")).toBe(true);
     expect(KNOWN_PROVIDER_IDS).toContain("openrouter");

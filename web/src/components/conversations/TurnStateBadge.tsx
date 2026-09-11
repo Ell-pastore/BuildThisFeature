@@ -2,6 +2,7 @@ import type { AiTurnState } from "../../types/ai";
 
 const STYLES: Record<AiTurnState, string> = {
   "awaiting-approval": "bg-amber-100 text-amber-800",
+  "awaiting-host-execution": "bg-sky-100 text-sky-800",
   approved: "bg-emerald-100 text-emerald-800",
   rejected: "bg-rose-100 text-rose-800",
   expired: "bg-neutral-200 text-neutral-600",
@@ -11,6 +12,7 @@ const STYLES: Record<AiTurnState, string> = {
 
 const LABELS: Record<AiTurnState, string> = {
   "awaiting-approval": "Awaiting approval",
+  "awaiting-host-execution": "Desktop execution",
   approved: "Approved",
   rejected: "Rejected",
   expired: "Expired",

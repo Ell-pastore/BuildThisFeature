@@ -27,6 +27,14 @@ export interface AuthUser {
 export interface AppVariables {
   Variables: {
     user?: AuthUser;
+    /**
+     * Set by the AI routes from the `x-desktop-host: 1` request header
+     * (Phase 10.39). True ONLY when the request genuinely comes from the
+     * desktop host webview, allowing the per-request filesystem executor
+     * resolver to hand AI filesystem tool calls to the host-delegated
+     * executor. Never set directly from provider or untrusted request data.
+     */
+    desktopHost?: boolean;
   };
 }
 

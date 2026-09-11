@@ -46,7 +46,13 @@ import {
   ToolApprovalNotFoundError,
   ToolApprovalNotExecutableError,
 } from "./aiToolApprovals.js";
-import type { ToolApprovalRequestInfo } from "./tools.js";
+import {
+  HostExecutionExpiredError,
+  HostExecutionNotFoundError,
+  HostExecutionNotExecutableError,
+  HostExecutionValidationError,
+} from "./aiHostExecutions.js";
+import type { HostExecutionRequestInfo, ToolApprovalRequestInfo } from "./tools.js";
 import {
   createPersistentTurnRuntime,
   type PersistentAgentTurnRuntime,
@@ -62,8 +68,14 @@ import { composeDefaultProviderStack } from "./providerComposition.js";
 /** Reasonable server-side cap on a single instruction / prompt. */
 export const MAX_INSTRUCTION_LENGTH = 4096;
 
-/** Strict body shape: nothing outside these three fields is accepted. */
-const BODY_FIELDS = new Set(["conversationId", "instruction", "approvalId"]);
+/** Strict body shape: nothing outside these fields is accepted. */
+const BODY_FIELDS = new Set(["conversationId", "instruction", "approvalId", "resumeExecutions"]);
+
+/**
+ * Server-side cap on the number of host-execution submissions accepted in a
+ * single resume request (a pause can defer several tool requests at once).
+ */
+const MAX_RESUME_EXECUTIONS = 16;
 
 /** Tool-loop bound applied when the host has not pre-bound a runtime. */
 const MAX_TOOL_ROUNDS = 3;
@@ -71,6 +83,18 @@ const MAX_TOOL_ROUNDS = 3;
 // ---------------------------------------------------------------------------
 // Typed request / response
 // ---------------------------------------------------------------------------
+
+/** One strict host-execution submission (Phase 10.39 resume). */
+export interface AiHostExecutionSubmissionInput {
+  /** The user-owned pending host execution that the desktop host executed. */
+  executionId: string;
+  /** Whether the host's execution succeeded. */
+  ok: boolean;
+  /** The host's execution payload when it succeeded (never persisted). */
+  result?: unknown;
+  /** The categorized tool error when the host's execution failed. */
+  error?: { code: string; category: string };
+}
 
 /** The ONLY fields accepted in `POST /api/ai/instructions`. */
 export interface AiInstructionBody {
@@ -84,6 +108,14 @@ export interface AiInstructionBody {
    * execute. Optional.
    */
   approvalId?: string;
+  /**
+   * Resume after a PAUSED host-execution round (Phase 10.39): the desktop
+   * host's submissions for the pending executions it executed locally. Each
+   * owned record is sealed exactly once and this turn continues the bounded
+   * loop. Result payloads are transient provider context — never persisted.
+   * Optional.
+   */
+  resumeExecutions?: readonly AiHostExecutionSubmissionInput[];
 }
 
 /** Safe outcome synopsis for one executed tool intent (payloads excluded). */
@@ -125,6 +157,14 @@ export interface AiInstructionTurn {
    * approval. No raw file contents, provider responses, or secrets.
    */
   pendingApprovals: readonly ToolApprovalRequestInfo[];
+  /**
+   * Pending host-execution metadata collected from a PAUSED round
+   * (Phase 10.39). Non-empty ONLY when the turn paused awaiting the desktop
+   * host: each entry is safe metadata (execution id, tool name, validated
+   * arguments, expiry). The caller executes the tools on the host and
+   * resumes with `resumeExecutions`.
+   */
+  pendingExecutions: readonly HostExecutionRequestInfo[];
 }
 
 /** Stable HTTP response for `POST /api/ai/instructions`. */
@@ -189,11 +229,101 @@ export function parseAiInstructionInput(raw: unknown): AiInstructionBody {
     approvalId = record.approvalId;
   }
 
+  let resumeExecutions: AiHostExecutionSubmissionInput[] | undefined;
+  if (record.resumeExecutions !== undefined) {
+    resumeExecutions = parseResumeExecutions(record.resumeExecutions);
+  }
+
   return {
     ...(conversationId !== undefined ? { conversationId } : {}),
     ...(approvalId !== undefined ? { approvalId } : {}),
+    ...(resumeExecutions !== undefined ? { resumeExecutions } : {}),
     instruction,
   };
+}
+
+/**
+ * Strictly validate `resumeExecutions` (Phase 10.39). Each submission is an
+ * exact-key object: `{ executionId, ok, result }` for a successful host
+ * execution, or `{ executionId, ok, error: { code, category } }` for a failed
+ * one. `executionId` must be uuid-shaped, `ok` a boolean, and the payload
+ * must be omitted from a failed submission exactly as the error must be
+ * omitted from a successful one. Extra keys are rejected.
+ *
+ * @throws `AppError.badRequest` (400) on any violation.
+ */
+export function parseResumeExecutions(
+  raw: unknown,
+): AiHostExecutionSubmissionInput[] {
+  if (!Array.isArray(raw)) {
+    throw AppError.badRequest("resumeExecutions must be an array of host-execution submissions.");
+  }
+  if (raw.length === 0) {
+    throw AppError.badRequest("resumeExecutions must not be empty.");
+  }
+  if (raw.length > MAX_RESUME_EXECUTIONS) {
+    throw AppError.badRequest(
+      `resumeExecutions must contain at most ${MAX_RESUME_EXECUTIONS} submissions.`,
+    );
+  }
+  return raw.map((item, index) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw AppError.badRequest(`resumeExecutions[${index}] must be a JSON object.`);
+    }
+    const entry = item as Record<string, unknown>;
+    const keys = Object.keys(entry).sort();
+    for (const key of keys) {
+      if (key !== "executionId" && key !== "ok" && key !== "result" && key !== "error") {
+        throw AppError.badRequest(`resumeExecutions[${index}] has unexpected field "${key}".`);
+      }
+    }
+    if (typeof entry.executionId !== "string" || !isConversationId(entry.executionId)) {
+      throw AppError.badRequest(
+        `resumeExecutions[${index}].executionId must be a valid execution id.`,
+      );
+    }
+    if (typeof entry.ok !== "boolean") {
+      throw AppError.badRequest(`resumeExecutions[${index}].ok must be a boolean.`);
+    }
+    if (entry.ok) {
+      if (entry.error !== undefined) {
+        throw AppError.badRequest(
+          `resumeExecutions[${index}] must not carry an error when ok is true.`,
+        );
+      }
+      if (!("result" in entry)) {
+        throw AppError.badRequest(
+          `resumeExecutions[${index}] must carry a result when ok is true.`,
+        );
+      }
+      return { executionId: entry.executionId, ok: true, result: entry.result };
+    }
+    if ("result" in entry) {
+      throw AppError.badRequest(
+        `resumeExecutions[${index}] must not carry a result when ok is false.`,
+      );
+    }
+    const error = entry.error;
+    if (
+      typeof error !== "object" ||
+      error === null ||
+      Array.isArray(error) ||
+      typeof (error as Record<string, unknown>).code !== "string" ||
+      typeof (error as Record<string, unknown>).category !== "string"
+    ) {
+      throw AppError.badRequest(
+        `resumeExecutions[${index}].error must be { code: string, category: string }.`,
+      );
+    }
+    return {
+      executionId: entry.executionId,
+      ok: false,
+      error: {
+        code: (error as Record<string, unknown>).code as string,
+        category: (error as Record<string, unknown>).category as string,
+      },
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +378,19 @@ export function mapAgentTurnError(error: unknown): unknown {
   ) {
     return AppError.badRequest(error.message);
   }
+  // Phase 10.39 resume failures: a missing/foreign host execution is 404
+  // (indistinguishable from missing); an expired / already-submitted / malformed
+  // execution is 400 and is never replayed (single-use seal).
+  if (error instanceof HostExecutionNotFoundError) {
+    return AppError.notFound("Host execution");
+  }
+  if (
+    error instanceof HostExecutionExpiredError ||
+    error instanceof HostExecutionNotExecutableError ||
+    error instanceof HostExecutionValidationError
+  ) {
+    return AppError.badRequest(error.message);
+  }
   return error;
 }
 
@@ -271,6 +414,10 @@ function toAiInstructionTurn(result: PersistentTurnResult): AiInstructionTurn {
     // Phase 10.29: safe pending approval metadata — approval id, tool name,
     // validated args, and expiry. No raw file contents or provider output.
     pendingApprovals: result.pendingApprovals,
+    // Phase 10.39: safe pending host-execution metadata. Non-empty only when
+    // the turn PAUSED awaiting the desktop host. Defaults to [] for
+    // pre-existing/absent runtimes so old callers stay author-shaped.
+    pendingExecutions: result.pendingExecutions ?? [],
   };
 }
 
@@ -304,6 +451,9 @@ export async function runAiInstructionWithRuntime(
   const turnInput: PersistentTurnInput = {
     ...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
     ...(input.approvalId !== undefined ? { resumeApprovalId: input.approvalId } : {}),
+    ...(input.resumeExecutions !== undefined
+      ? { resumeHostExecutions: input.resumeExecutions }
+      : {}),
     instruction: input.instruction,
   };
 

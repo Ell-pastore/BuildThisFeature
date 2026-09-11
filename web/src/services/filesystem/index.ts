@@ -10,7 +10,17 @@
 import { DesktopFilesystemProvider } from "./desktop";
 import type { FilesystemProvider } from "./provider";
 
-export type { DirListing, DiskUsage, FileMetadata, FilesystemProvider } from "./provider";
+export type {
+  DirListing,
+  DiskUsage,
+  FileMetadata,
+  FilesystemProvider,
+  StarredResolution,
+  StorageBreakdown,
+  StorageCategory,
+  StorageCategoryName,
+} from "./provider";
+export { STORAGE_CATEGORY_NAMES } from "./provider";
 
 let activeProvider: FilesystemProvider | null = null;
 

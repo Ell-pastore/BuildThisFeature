@@ -37,6 +37,7 @@ import {
 } from "./aiConversations.js";
 import { AgentConversationNotFoundError } from "../database/repositories/agentConversations.js";
 import type { AiToolApproval } from "./aiToolApprovals.js";
+import type { AiHostExecution } from "./aiHostExecutions.js";
 
 const mocks = vi.hoisted(() => ({
   listAgentConversations: vi.fn(),
@@ -47,6 +48,7 @@ const mocks = vi.hoisted(() => ({
   unarchiveAgentConversation: vi.fn(),
   listConversationLastMessages: vi.fn(),
   listConversationToolApprovals: vi.fn(),
+  listConversationHostExecutions: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", async (importOriginal) => {
@@ -71,6 +73,16 @@ vi.mock("./aiToolApprovals.js", async (importOriginal) => {
     // The REAL status constants and safe projection stay in the pipeline; only
     // the ownership-scoped read is stubbed so the tests stay database-free.
     listConversationToolApprovals: mocks.listConversationToolApprovals,
+  };
+});
+
+vi.mock("./aiHostExecutions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./aiHostExecutions.js")>();
+  return {
+    ...actual,
+    // The REAL status enum stays in the pipeline; only the ownership-scoped
+    // read is stubbed so the tests stay database-free.
+    listConversationHostExecutions: mocks.listConversationHostExecutions,
   };
 });
 
@@ -102,6 +114,7 @@ beforeEach(() => {
   // Turn-state enrichment defaults: no approvals, no last messages. Tests that
   // care about a specific state override these, exactly like the repository.
   mocks.listConversationToolApprovals.mockResolvedValue([]);
+  mocks.listConversationHostExecutions.mockResolvedValue([]);
   mocks.listConversationLastMessages.mockResolvedValue([]);
 });
 
@@ -142,6 +155,7 @@ describe("listAiConversations", () => {
       updatedAt: "2026-01-03T00:00:00.000Z",
       turnState: "completed",
       pendingApprovals: [],
+      pendingHostExecutions: [],
     });
     expect(rows[1]?.title).toBeNull();
     // The summary is an explicit projection — arbitrary repo columns never
@@ -232,6 +246,7 @@ describe("listAiConversations", () => {
           updatedAt: "2026-01-03T00:00:00.000Z",
           turnState: "completed",
           pendingApprovals: [],
+          pendingHostExecutions: [],
         },
       ]);
       expect(JSON.stringify(rows)).not.toContain("userId");
@@ -963,6 +978,35 @@ describe("deriveConversationTurnState (Phase 10.31)", () => {
     expect(deriveConversationTurnState(isFinalReply, approvals, NOW)).toBe(expected);
   }
 
+  function hostExecution(
+    overrides: Partial<AiHostExecution> = {},
+  ): AiHostExecution {
+    return {
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      conversationId: CONVERSATION_ID,
+      messageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      toolName: "list_directory",
+      callId: "call-1",
+      arguments: { path: "/home" },
+      round: 1,
+      status: "pending",
+      createdAt: "2026-09-09T10:00:00.000Z",
+      updatedAt: "2026-09-09T10:00:00.000Z",
+      expiresAt: "2026-09-09T14:00:00.000Z",
+      executedAt: null,
+      ...overrides,
+    };
+  }
+
+  function expectStateWithExecutions(
+    isFinalReply: boolean,
+    approvals: readonly AiToolApproval[],
+    executions: readonly AiHostExecution[],
+    expected: AiTurnState,
+  ): void {
+    expect(deriveConversationTurnState(isFinalReply, approvals, NOW, executions)).toBe(expected);
+  }
+
   it("completed — a final reply with no approvals", () => {
     expectState(true, [], "completed");
   });
@@ -1008,9 +1052,78 @@ describe("deriveConversationTurnState (Phase 10.31)", () => {
   it("boundary — an expiry instant now == expiresAt is NOT actionable, so it derives expired", () => {
     expectState(true, [approval("pending", { expiresAt: "2026-09-09T12:00:00.000Z" })], "expired");
   });
+
+  it("awaiting-host-execution — a pending unexpired execution with no actionable approval", () => {
+    expectStateWithExecutions(true, [], [hostExecution()], "awaiting-host-execution");
+  });
+
+  it("awaiting-approval wins over a pending host execution", () => {
+    expectStateWithExecutions(false, [approval("pending")], [hostExecution()], "awaiting-approval");
+  });
+
+  it("an expired execution is not actionable — falls through to the terminal path", () => {
+    expectStateWithExecutions(
+      true,
+      [],
+      [hostExecution({ expiresAt: "2026-09-09T11:30:00.000Z" })],
+      "completed",
+    );
+  });
+
+  it("a resolved (executed) execution never yields awaiting-host-execution", () => {
+    expectStateWithExecutions(
+      false,
+      [],
+      [hostExecution({ status: "executed", executedAt: "2026-09-09T10:05:00.000Z" })],
+      "failed",
+    );
+  });
+
+  it("a pending execution ranks ABOVE an approved approval decision (pending wins)", () => {
+    expectStateWithExecutions(true, [approval("approved")], [hostExecution()], "awaiting-host-execution");
+  });
 });
 
 describe("listAiConversations — turn-state enrichment (Phase 10.31)", () => {
+  it("surfaces awaiting-host-execution with the actionable host executions (Phase 10.39)", async () => {
+    mocks.listAgentConversations.mockResolvedValue([
+      {
+        ...BASE_CONVERSATION,
+        updatedAt: new Date("2026-01-03T00:00:00Z"),
+      },
+    ] as unknown as Awaited<ReturnType<typeof mocks.listAgentConversations>>);
+    mocks.listConversationLastMessages.mockResolvedValue([
+      { conversationId: CONVERSATION_ID, messageId: "final-1", role: "assistant", isFinal: false },
+    ]);
+    mocks.listConversationHostExecutions.mockResolvedValue([
+      {
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        conversationId: CONVERSATION_ID,
+        messageId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        toolName: "list_directory",
+        callId: "call-1",
+        arguments: { path: "/home" },
+        round: 1,
+        status: "pending",
+        createdAt: "2099-01-01T00:00:00.000Z",
+        updatedAt: "2099-01-01T00:00:00.000Z",
+        expiresAt: "2099-01-01T01:00:00.000Z",
+        executedAt: null,
+      },
+    ]);
+
+    const rows = await listAiConversations(ALICE);
+
+    expect(rows[0]?.turnState).toBe("awaiting-host-execution");
+    expect(rows[0]?.pendingApprovals).toEqual([]);
+    expect(rows[0]?.pendingHostExecutions).toEqual([
+      expect.objectContaining({ toolName: "list_directory", status: "pending" }),
+    ]);
+    expect(mocks.listConversationHostExecutions).toHaveBeenCalledWith(ALICE, [
+      CONVERSATION_ID,
+    ]);
+  });
+
   it("surfaces awaiting-approval with the actionable approvals for the listed members", async () => {
     mocks.listAgentConversations.mockResolvedValue([
       {

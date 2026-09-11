@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { FileItem } from "../../types";
-import type { DirListing, DiskUsage, FileMetadata, FilesystemProvider } from "./provider";
+import type { FileItem, TrashItem } from "../../types";
+import type {
+  DirListing,
+  DiskUsage,
+  FileMetadata,
+  FilesystemProvider,
+  StarredResolution,
+  StorageBreakdown,
+  StorageCategory,
+} from "./provider";
 
 /**
  * DesktopFilesystemProvider — local filesystem access in the native desktop app.
@@ -40,6 +48,65 @@ function parentPath(p: string): string {
   const idx = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
   if (idx < 1) return p;
   return p.slice(0, idx);
+}
+
+/** Raw trash entry serialized by the Rust `list_trash` command. */
+interface RawTrashEntry {
+  id: string;
+  name: string;
+  path: string;
+  isFolder: boolean;
+  sizeBytes: number;
+  fileType: string;
+  size: string;
+  created: string;
+  modified: string;
+  modifiedTs: number;
+  createdTs: number;
+  originalPath: string | null;
+}
+
+/** Raw `StarredResolution` serialized by the Rust `resolve_starred_paths` command. */
+interface RawStarredResolution {
+  items: DirEntryResponse[];
+  missing: string[];
+}
+
+/** Raw storage category serialized by the Rust `storage_by_category` command. */
+interface RawStorageCategory {
+  category: string;
+  bytes: number;
+}
+
+/** Raw `StorageBreakdown` serialized by the Rust `storage_by_category` command. */
+interface RawStorageBreakdown {
+  categories: RawStorageCategory[];
+  totalBytes: number;
+  scannedFileCount: number;
+  scanCapped: boolean;
+}
+
+/** Map a raw Rust storage category into the shared StorageCategory model. */
+function mapStorageCategory(category: RawStorageCategory): StorageCategory {
+  return { category: category.category as StorageCategory["category"], bytes: category.bytes };
+}
+
+/** Map a raw Rust trash entry into the shared TrashItem model. */
+function mapTrashEntry(entry: RawTrashEntry): TrashItem {
+  return {
+    id: entry.id,
+    name: entry.name,
+    path: entry.path,
+    isFolder: entry.isFolder,
+    sizeBytes: entry.sizeBytes,
+    fileType: entry.fileType,
+    size: entry.size,
+    created: entry.created,
+    modified: entry.modified,
+    createdTs: entry.createdTs,
+    modifiedTs: entry.modifiedTs,
+    originalPath: entry.originalPath,
+  };
 }
 
 /** Map a raw Rust entry into the shared FileItem model. */
@@ -132,12 +199,47 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     );
   }
 
+  recentFiles(limit?: number): Promise<FileItem[]> {
+    return invoke<DirEntryResponse[]>("recent_files", { limit }).then((entries) =>
+      entries.map(mapEntry),
+    );
+  }
+
+  async storageByCategory(): Promise<StorageBreakdown> {
+    const raw = await invoke<RawStorageBreakdown>("storage_by_category");
+    return {
+      categories: raw.categories.map(mapStorageCategory),
+      totalBytes: raw.totalBytes,
+      scannedFileCount: raw.scannedFileCount,
+      scanCapped: raw.scanCapped,
+    };
+  }
+
   trashItem(path: string): Promise<void> {
     return invoke<void>("trash_item", { path });
   }
 
   restoreItem(trashedPath: string): Promise<string> {
     return invoke<string>("restore_item", { trashedPath });
+  }
+
+  listTrash(): Promise<TrashItem[]> {
+    return invoke<RawTrashEntry[]>("list_trash").then((entries) => entries.map(mapTrashEntry));
+  }
+
+  loadStarredPaths(): Promise<string[]> {
+    return invoke<string[]>("load_starred_paths");
+  }
+
+  saveStarredPaths(paths: string[]): Promise<void> {
+    return invoke<void>("save_starred_paths", { paths });
+  }
+
+  resolveStarredPaths(paths: string[]): Promise<StarredResolution> {
+    return invoke<RawStarredResolution>("resolve_starred_paths", { paths }).then((res) => ({
+      items: res.items.map(mapEntry),
+      missing: res.missing,
+    }));
   }
 
   duplicateItem(path: string): Promise<string> {

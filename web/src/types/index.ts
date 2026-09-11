@@ -43,3 +43,32 @@ export interface FileItem {
   deleted?: boolean;
   deletedOn?: string;
 }
+
+/**
+ * Single item currently sitting in the application-managed trash.
+ *
+ * Comes from Tauri/Rust (`list_trash`) and is mapped into this shape in
+ * `src/services/filesystem/desktop.ts`. The filesystem is the source of truth;
+ * the UI never hardcodes trash contents.
+ */
+export interface TrashItem {
+  /** Stable identifier (its current path inside the trash). */
+  id: string;
+  name: string;
+  /** The item's location inside the trash (the key used for restore). */
+  path: string;
+  isFolder: boolean;
+  /** Human readable size, e.g. "2.4 MB". */
+  size: string;
+  sizeBytes: number;
+  /** Lowercased file extension without the dot, or "folder". */
+  fileType: string;
+  /** Human readable creation date. */
+  created: string;
+  /** Human readable modification date. */
+  modified: string;
+  createdTs?: number;
+  modifiedTs?: number;
+  /** Recorded original location, or null when sidecar metadata is missing/corrupt. */
+  originalPath: string | null;
+}

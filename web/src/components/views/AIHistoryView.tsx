@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, LogOut, RefreshCw, Sparkles } from "../Icons";
 import { useSession } from "../../services/useSession";
 import {
@@ -6,6 +6,10 @@ import {
   listAiConversations,
 } from "../../services/api/aiConversations";
 import { submitAiInstruction } from "../../services/api/aiInstructions";
+import {
+  driveHostExecutions,
+  type HostExecutionRequest,
+} from "../../services/api/aiHostExecutions";
 import { getAiRuntimeStatus } from "../../services/api/aiStatus";
 import { ApiClientError } from "../../services/api/client";
 import type {
@@ -46,6 +50,8 @@ export default function AIHistoryView() {
   const [aiStatus, setAiStatus] = useState<AiRuntimeStatus | null>(null);
   const [notConfiguredOverride, setNotConfiguredOverride] = useState(false);
   const [pendingInstruction, setPendingInstruction] = useState<string | null>(null);
+  /** Guards against concurrent host-execution drives (submit path + reload path). */
+  const drivingRef = useRef(false);
 
   const loadList = useCallback(async () => {
     if (!isAuthenticated) return;
@@ -65,18 +71,59 @@ export default function AIHistoryView() {
     }
   }, [isAuthenticated]);
 
-  const loadDetail = useCallback(async (id: string) => {
-    setDetailLoading(true);
-    setDetailError(null);
-    try {
-      setDetail(await getAiConversation(id));
-    } catch (err) {
-      setDetail(null);
-      setDetailError(err instanceof Error ? err.message : "Could not load this conversation.");
-    } finally {
-      setDetailLoading(false);
-    }
-  }, []);
+  /**
+   * Execute the given host executions locally (Tauri desktop only) and resume
+   * the paused turn. Never re-enters: a concurrent call is skipped.
+   */
+  const drivePendingExecutions = useCallback(
+    async (executions: readonly HostExecutionRequest[], conversationId: string) => {
+      if (executions.length === 0 || drivingRef.current) return;
+      drivingRef.current = true;
+      try {
+        await driveHostExecutions(executions, conversationId);
+      } finally {
+        drivingRef.current = false;
+      }
+    },
+    [],
+  );
+
+  const loadDetail = useCallback(
+    async (id: string) => {
+      setDetailLoading(true);
+      setDetailError(null);
+      try {
+        const loaded = await getAiConversation(id);
+        setDetail(loaded);
+        // Phase 10.39 recovery: a conversation that was loaded into an
+        // "awaiting-host-execution" pause (e.g. after a reload mid-flight) is
+        // driven to completion by the desktop host when one is present. The
+        // ref guard prevents a concurrent drive with the submit path; in a
+        // plain browser `driveHostExecutions` returns null immediately.
+        if (
+          loaded.turnState === "awaiting-host-execution" &&
+          loaded.pendingHostExecutions.length > 0 &&
+          !drivingRef.current
+        ) {
+          await drivePendingExecutions(
+            loaded.pendingHostExecutions.map((execution) => ({
+              executionId: execution.id,
+              toolName: execution.toolName,
+              arguments: execution.arguments,
+            })),
+            id,
+          );
+          setDetail(await getAiConversation(id));
+        }
+      } catch (err) {
+        setDetail(null);
+        setDetailError(err instanceof Error ? err.message : "Could not load this conversation.");
+      } finally {
+        setDetailLoading(false);
+      }
+    },
+    [drivePendingExecutions],
+  );
 
   /**
    * Fetch the safe runtime status. A failure (backend down, session vanished)
@@ -113,6 +160,13 @@ export default function AIHistoryView() {
         const targetId = response.conversationId;
         const resumedSame = selectedId === targetId;
         setSelectedId(targetId);
+        // Phase 10.39: the turn paused at a filesystem operation the backend
+        // asked the DESKTOP HOST to run. Execute each request locally and
+        // resume the SAME bounded turn before reconciling, so the transcript
+        // renders the completed turn (or a clean next pause).
+        if (response.turn.pendingExecutions.length > 0) {
+          await drivePendingExecutions(response.turn.pendingExecutions, targetId);
+        }
         await loadList();
         if (resumedSame) await loadDetail(targetId);
         return true;
@@ -134,7 +188,7 @@ export default function AIHistoryView() {
         setSubmitting(false);
       }
     },
-    [isAuthenticated, selectedId, loadList, loadDetail],
+    [isAuthenticated, selectedId, loadList, loadDetail, drivePendingExecutions],
   );
 
   /**

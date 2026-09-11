@@ -56,6 +56,11 @@ import {
   listConversationToolApprovals,
   type AiToolApproval,
 } from "./aiToolApprovals.js";
+import {
+  HostExecutionStatus,
+  listConversationHostExecutions,
+  type AiHostExecution,
+} from "./aiHostExecutions.js";
 import { validateConversationId } from "./conversationId.js";
 
 // ---------------------------------------------------------------------------
@@ -63,11 +68,15 @@ import { validateConversationId } from "./conversationId.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Turn-state derived from the conversation's approvals and last transcript
- * row (Phase 10.31):
+ * Turn-state derived from the conversation's approvals, host executions, and
+ * last transcript row (Phase 10.31 + 10.39):
  *
  *   - `awaiting-approval` — at least one approval with an UNEXPIRED window is
  *     still `pending`: the turn is blocked at a decision.
+ *   - `awaiting-host-execution` — no actionable approval, but at least one
+ *     host execution is still `pending` inside its window: the desktop host
+ *     has been asked to run a filesystem operation locally and has not yet
+ *     submitted its result.
  *   - `approved` | `rejected` | `expired` — the state of the most recent
  *     approval decision (by `updatedAt`), including a `pending` row whose
  *     window has elapsed (`expired`). After approve+resume (10.30) the turn
@@ -80,6 +89,7 @@ import { validateConversationId } from "./conversationId.js";
 export type AiTurnState =
   | "completed"
   | "awaiting-approval"
+  | "awaiting-host-execution"
   | "approved"
   | "rejected"
   | "expired"
@@ -95,14 +105,21 @@ export interface AiConversationSummaryBase {
 }
 
 /**
- * One owned conversation, newest-first — metadata plus the derived turn state
- * and its actionable approvals (Phase 10.31).
+ * One owned conversation, newest-first — metadata plus the derived turn state,
+ * its actionable approvals, and its pending host executions (Phase 10.31 +
+ * 10.39).
  */
 export interface AiConversationSummary extends AiConversationSummaryBase {
   /** Derived terminal/pending state of the conversation's last turn. */
   turnState: AiTurnState;
   /** Approvals still awaiting a decision (`pending`, unexpired), oldest-first. */
   pendingApprovals: readonly AiToolApproval[];
+  /**
+   * Host executions still awaiting the desktop host to submit a result
+   * (`pending`, unexpired), oldest-first. Safe identification metadata only —
+   * never persisted results.
+   */
+  pendingHostExecutions: readonly AiHostExecution[];
 }
 
 /** A persisted tool-call intent for one provider round. */
@@ -145,6 +162,7 @@ export interface AiHistoryMessage {
 export interface AiConversationDetail extends AiConversationSummaryBase {
   turnState: AiTurnState;
   pendingApprovals: readonly AiToolApproval[];
+  pendingHostExecutions: readonly AiHostExecution[];
   messages: readonly AiHistoryMessage[];
 }
 
@@ -329,29 +347,54 @@ function approvalRank(approval: AiToolApproval): string {
 }
 
 /**
- * Derive a conversation's turn state (Phase 10.31).
+ * Host executions that still require the desktop host to submit a result:
+ * `pending` AND inside their window (`now < expiresAt`). A pending row that
+ * outlived its window is NOT actionable — it derives as `expired`, never as
+ * `awaiting-host-execution`. Pure.
+ */
+export function actionablePendingHostExecutions(
+  executions: readonly AiHostExecution[],
+  now: Date,
+): AiHostExecution[] {
+  return executions.filter(
+    (execution) =>
+      execution.status === HostExecutionStatus.Pending &&
+      now.getTime() < new Date(execution.expiresAt).getTime(),
+  );
+}
+
+/**
+ * Derive a conversation's turn state (Phase 10.31 + 10.39).
  *
- * The inputs are the conversation's LAST transcript row (`isFinalReply`) and
- * ALL of its approvals — deliberately not per-segment approvals, because after
- * approve+resume (10.30) the consumed approval's `messageId` belongs to the
- * EARLIER segment while the resumed round is a NEW message. Filtering by the
- * last user-message segment would misclassify a resumed turn as `completed`.
+ * The inputs are the conversation's LAST transcript row (`isFinalReply`),
+ * ALL of its approvals, and ALL of its host executions — deliberately not
+ * per-segment, because after approve+resume (10.30) the consumed approval's
+ * `messageId` belongs to the EARLIER segment while the resumed round is a NEW
+ * message. Filtering by the last user-message segment would misclassify a
+ * resumed turn as `completed`.
  *
  * Resolution order (pure, deterministic):
  *
  *   1. Any actionable (unexpired) pending approval → `awaiting-approval`;
- *   2. otherwise the approval with the most recent `updatedAt`:
+ *   2. otherwise any actionable pending host execution →
+ *      `awaiting-host-execution` (the past block;
+ *      the `hostExecutions` argument is optional and defaults to `[]`);
+ *   3. otherwise the approval with the most recent `updatedAt`:
  *      `approve` → `approved`, `reject` → `rejected`, else (pending + window
  *      elapsed) → `expired`;
- *   3. otherwise (no approvals at all): `completed` when the turn ended with
- *      an `is_final` reply, else `failed`.
+ *   4. otherwise (no approvals, no executions): `completed` when the turn
+ *      ended with an `is_final` reply, else `failed`.
  */
 export function deriveConversationTurnState(
   isFinalReply: boolean,
   approvals: readonly AiToolApproval[],
   now: Date,
+  hostExecutions: readonly AiHostExecution[] = [],
 ): AiTurnState {
   if (actionablePendingApprovals(approvals, now).length > 0) return "awaiting-approval";
+  if (actionablePendingHostExecutions(hostExecutions, now).length > 0) {
+    return "awaiting-host-execution";
+  }
   if (approvals.length > 0) {
     const mostRecent = [...approvals].sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
@@ -384,24 +427,45 @@ export function groupApprovalsByConversation(
   return grouped;
 }
 
+/** Index host executions by conversationId for batch enrichment. Pure. */
+export function groupHostExecutionsByConversation(
+  executions: readonly AiHostExecution[],
+): ReadonlyMap<string, readonly AiHostExecution[]> {
+  const grouped = new Map<string, AiHostExecution[]>();
+  for (const execution of executions) {
+    const list = grouped.get(execution.conversationId);
+    if (list === undefined) {
+      grouped.set(execution.conversationId, [execution]);
+    } else {
+      list.push(execution);
+    }
+  }
+  return grouped;
+}
+
 /**
- * Attach `turnState` + `pendingApprovals` to a summary/detail base, given its
- * approvals and whether its last transcript row is an assistant `is_final`
- * reply. Pure.
+ * Attach `turnState`, `pendingApprovals`, and `pendingHostExecutions` to a
+ * summary/detail base, given its approvals, its host executions, and whether
+ * its last transcript row is an assistant `is_final` reply. Pure. The
+ * host-executions argument is optional and defaults to `[]`, so callers that
+ * predate Phase 10.39 keep deriving identical state.
  */
 export function enrichTurnState<Base extends AiConversationSummaryBase>(
   base: Base,
   isFinalReply: boolean,
   approvals: readonly AiToolApproval[],
   now: Date,
+  hostExecutions: readonly AiHostExecution[] = [],
 ): Base & {
   turnState: AiTurnState;
   pendingApprovals: readonly AiToolApproval[];
+  pendingHostExecutions: readonly AiHostExecution[];
 } {
   return {
     ...base,
-    turnState: deriveConversationTurnState(isFinalReply, approvals, now),
+    turnState: deriveConversationTurnState(isFinalReply, approvals, now, hostExecutions),
     pendingApprovals: actionablePendingApprovals(approvals, now),
+    pendingHostExecutions: actionablePendingHostExecutions(hostExecutions, now),
   };
 }
 
@@ -447,11 +511,13 @@ export async function listAiConversations(
   const summaries = conversations.map((conversation) => toSummaryBase(conversation));
   if (summaries.length === 0) return [];
   const conversationIds = summaries.map((summary) => summary.id);
-  const [approvals, lastMessages] = await Promise.all([
+  const [approvals, hostExecutions, lastMessages] = await Promise.all([
     listConversationToolApprovals(userId, conversationIds),
+    listConversationHostExecutions(userId, conversationIds),
     listConversationLastMessages(userId, conversationIds),
   ]);
   const approvalsByConversation = groupApprovalsByConversation(approvals);
+  const hostExecutionsByConversation = groupHostExecutionsByConversation(hostExecutions);
   const finalReplyByConversation = new Map<string, boolean>();
   for (const row of lastMessages) {
     finalReplyByConversation.set(row.conversationId, row.role === "assistant" && row.isFinal);
@@ -463,6 +529,7 @@ export async function listAiConversations(
       finalReplyByConversation.get(summary.id) ?? false,
       approvalsByConversation.get(summary.id) ?? [],
       now,
+      hostExecutionsByConversation.get(summary.id) ?? [],
     ),
   );
 }
@@ -485,8 +552,9 @@ export async function getAiConversation(
   if (detail === null) {
     throw AppError.notFound("Agent conversation");
   }
-  const [approvals, lastMessages] = await Promise.all([
+  const [approvals, hostExecutions, lastMessages] = await Promise.all([
     listConversationToolApprovals(userId, [conversationId]),
+    listConversationHostExecutions(userId, [conversationId]),
     listConversationLastMessages(userId, [conversationId]),
   ]);
   const last = lastMessages[0];
@@ -498,6 +566,7 @@ export async function getAiConversation(
     last !== undefined && last.role === "assistant" && last.isFinal,
     approvals,
     new Date(),
+    hostExecutions,
   );
 }
 

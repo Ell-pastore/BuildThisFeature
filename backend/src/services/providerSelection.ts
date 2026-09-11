@@ -45,6 +45,8 @@ import type { AgentProvider } from "./provider.js";
 export const ProviderId = {
   /** Grok — served by the xAI API through the Phase 10.9 adapter. */
   Grok: "grok",
+  /** Groq — served by the Groq OpenAI-compatible API through the Groq adapter. */
+  Groq: "groq",
   /** Gemini — served by the Google AI Studio API through the Phase 10.14 adapter. */
   Gemini: "gemini",
   /** OpenRouter — served by the OpenAI-compatible chat completions API through the Phase 10.15 adapter. */

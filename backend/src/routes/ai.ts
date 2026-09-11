@@ -124,6 +124,14 @@ export const aiRoutes = new Hono<AppVariables>()
     // parser and is never passed to the agent runtime.
     getCurrentUser(c);
 
+    // Phase 10.39: the desktop host webview identifies itself with
+    // `x-desktop-host: 1` so the per-request filesystem executor resolver can
+    // hand AI filesystem tool calls to the host-delegated executor (which
+    // records them for the desktop host) instead of the fail-closed Tauri
+    // bridge this Node process cannot reach. Absence means "not the desktop
+    // host", never something trusted — the resolver still fail-closes.
+    c.set("desktopHost", c.req.header("x-desktop-host") === "1");
+
     let raw: unknown;
     try {
       raw = await c.req.json();

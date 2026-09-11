@@ -1073,16 +1073,26 @@ pub fn create_file(allow_list: &AllowList, path: &str) -> Result<String, String>
 /// [`list_directory`], does not resolve the final link). Cycle detection uses
 /// canonical inode identity on Unix to defend against hardlink-based directory
 /// loops and bind mounts. Per-branch errors (permission denied, I/O error)
-/// are tolerated and do not abort the overall search.
-fn search_recursive(
+/// are tolerated and do not abort the traversal.
+///
+/// The shared safe walker used by [`search_files`], [`recent_files`], and
+/// [`storage_by_category`]: `visit` is invoked for every entry (files AND
+/// directories) inside `dir`, before recursing into subdirectories.
+///
+/// Returns `false` when `visit` requested an early stop (e.g. a scan safety
+/// cap was reached) so callers can abort the whole traversal promptly;
+/// `true` means the walk completed.
+fn walk_recursive<F>(
     dir: &Path,
-    query_lower: &str,
-    results: &mut Vec<FileEntry>,
     visited: &mut std::collections::HashSet<(u64, u64)>,
-) {
+    visit: &mut F,
+) -> bool
+where
+    F: FnMut(&Path, &fs::Metadata) -> bool,
+{
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return, // unreadable directory — skip silently
+        Err(_) => return true, // unreadable directory — skip silently
     };
 
     for entry in read_dir.flatten() {
@@ -1111,18 +1121,17 @@ fn search_recursive(
             }
         }
 
-        // Case-insensitive substring match on the entry's final component.
-        if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-            if name.to_lowercase().contains(query_lower) {
-                results.push(build_file_entry(&entry_path, &meta));
-            }
+        if !visit(&entry_path, &meta) {
+            return false; // visitor asked to stop the traversal early
         }
 
-        // Recurse into subdirectories.
-        if meta.is_dir() {
-            search_recursive(&entry_path, query_lower, results, visited);
+        // Recurse into subdirectories, propagating an early stop upward.
+        if meta.is_dir() && !walk_recursive(&entry_path, visited, visit) {
+            return false;
         }
     }
+
+    true
 }
 
 /// Search recursively through every root in the [`AllowList`] for files and
@@ -1158,13 +1167,237 @@ pub fn search_files(allow_list: &AllowList, query: &str) -> Result<Vec<FileEntry
 
     for root in allow_list.roots() {
         ensure_allowed(allow_list, root)?;
-        search_recursive(root, &query_lower, &mut results, &mut Default::default());
+        let mut visited = std::collections::HashSet::new();
+        walk_recursive(root, &mut visited, &mut |entry_path, meta| {
+            // Case-insensitive substring match on the entry's final component.
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                if name.to_lowercase().contains(&query_lower) {
+                    results.push(build_file_entry(entry_path, meta));
+                }
+            }
+            true // search always walks the full tree
+        });
     }
 
     // Deterministic ordering: sort by canonical path.
     results.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Recent files
+// ---------------------------------------------------------------------------
+
+/// Default result cap for [`recent_files`]. The operation is bounded: at most
+/// this many entries are returned, never the whole tree.
+pub const RECENT_FILES_DEFAULT_LIMIT: usize = 20;
+
+/// Collect the most recently modified files and directories across every
+/// allowed root, newest first, hard-capped at `limit` entries.
+///
+/// This is a true "recent items" listing built from real modification times —
+/// nothing is invented. Both regular files and directories are returned so the
+/// UI can show folders alongside files.
+///
+/// # Security / traversal contract (mirrors [`search_files`])
+///
+/// - Only canonicalized [`AllowList`] roots are traversed, and each root is
+///   gated through [`ensure_allowed`]; traversal never leaves an allowed root.
+/// - Symbolic links are never followed (via the shared [`walk_recursive`]).
+/// - Unix inode cycle detection prevents infinite loops from hardlink-based
+///   directory cycles or bind mounts.
+/// - Per-branch errors are tolerated: an unreadable subdirectory is skipped
+///   without aborting the scan.
+/// - The result list is sorted descending by raw modification timestamp and
+///   truncated to an explicit hard cap (`limit`). A `limit` of 0 returns an
+///   empty list without scanning.
+pub fn recent_files(allow_list: &AllowList, limit: usize) -> Result<Vec<FileEntry>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut results: Vec<FileEntry> = Vec::new();
+
+    for root in allow_list.roots() {
+        ensure_allowed(allow_list, root)?;
+        let mut visited = std::collections::HashSet::new();
+        walk_recursive(root, &mut visited, &mut |path, meta| {
+            results.push(build_file_entry(path, meta));
+            true // recent files always walks the full tree
+        });
+    }
+
+    // Newest first by raw modification timestamp; deterministic path tie-break
+    // so equal-timestamp entries still order stably.
+    results.sort_by(|a, b| {
+        b.modified_ts
+            .cmp(&a.modified_ts)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    results.truncate(limit);
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Storage by category
+// ---------------------------------------------------------------------------
+
+/// Real aggregated byte total for a single storage category.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageCategory {
+    pub category: String,
+    pub bytes: u64,
+}
+
+/// Real file sizes aggregated by extension-derived category, produced by a
+/// single bounded walk of the allowed roots. Only genuinely scanned files are
+/// counted — nothing is invented or extrapolated.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageBreakdown {
+    /// Every category in canonical order (Documents, Images, Videos, Audio,
+    /// Archives, Code, Other), each with its real aggregated bytes (possibly 0).
+    pub categories: Vec<StorageCategory>,
+    /// Sum of all category bytes — the total size of scanned/classified files.
+    pub total_bytes: u64,
+    /// Number of regular files scanned and classified into a category.
+    pub scanned_file_count: u64,
+    /// True when the scan hit [`STORAGE_SCAN_MAX_FILES`] before finishing the
+    /// tree. Totals then describe the scanned prefix honestly, never the whole
+    /// tree, and the UI can say so.
+    pub scan_capped: bool,
+}
+
+/// Safety cap for a filesystem-wide storage scan: classification stops after
+/// this many regular files, so the scan cannot run unbounded on huge volumes.
+pub const STORAGE_SCAN_MAX_FILES: u64 = 200_000;
+
+/// Canonical category list and display order (Documents, Images, Videos,
+/// Audio, Archives, Code, Other). Every category is always returned, so the UI
+/// gets a stable shape with real (possibly 0 B) totals.
+const STORAGE_CATEGORY_NAMES: [&str; 7] = [
+    "Documents",
+    "Images",
+    "Videos",
+    "Audio",
+    "Archives",
+    "Code",
+    "Other",
+];
+
+/// Classify a lowercased file extension into its storage category. Unknown or
+/// unclassified extensions (and extension-less files) fall through to Other.
+fn storage_category_for_extension(ext: &str) -> &'static str {
+    match ext {
+        "txt" | "rtf" | "doc" | "docx" | "odt" | "pdf" | "xls" | "xlsx" | "csv" | "ods"
+        | "ppt" | "pptx" | "odp" | "pages" | "numbers" | "keynote" | "md" | "tex" | "epub"
+        | "mobi" | "log" => "Documents",
+
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "svg" | "ico"
+        | "heic" | "heif" | "raw" | "psd" | "ai" | "eps" => "Images",
+
+        "mp4" | "mov" | "mkv" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "m2ts"
+        | "3gp" | "mpg" | "mpeg" => "Videos",
+
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "aiff" | "mid"
+        | "midi" | "amr" => "Audio",
+
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "iso" | "dmg"
+        | "cab" | "jar" | "tgz" => "Archives",
+
+        // Note: the plain "ts" extension is unambiguous TypeScript here
+        // (MPEG transport streams use ".m2ts"/".ts" but clash, so "ts"
+        // classifies as Code; ".m2ts" remains a video).
+        "js" | "ts" | "tsx" | "jsx" | "py" | "rb" | "go" | "rs" | "java" | "c" | "h"
+        | "cpp" | "hpp" | "cs" | "php" | "swift" | "kt" | "sh" | "bash" | "zsh" | "fish"
+        | "sql" | "html" | "css" | "scss" | "json" | "xml" | "yaml" | "yml" | "toml"
+        | "ini" | "cfg" => "Code",
+
+        _ => "Other",
+    }
+}
+
+/// Scan every allowed root with the shared safe walker and aggregate REAL file
+/// sizes by extension-derived category.
+///
+/// # Security / traversal contract (mirrors [`search_files`])
+///
+/// - Only canonicalized [`AllowList`] roots are traversed, gated through
+///   [`ensure_allowed`]; traversal never leaves an allowed root.
+/// - Symbolic links are never followed (via the shared [`walk_recursive`]).
+/// - Unix inode cycle detection prevents infinite loops from hardlink-based
+///   directory cycles or bind mounts.
+/// - Per-branch errors are tolerated: unreadable subdirectories are skipped.
+/// - Directories carry no size and are never counted; only regular files are
+///   classified into the seven categories.
+/// - The scan is hard-capped at `max_files` regular files. When the cap is hit
+///   the walk stops early (all roots) and `scan_capped` is set so the caller
+///   can present the result as the scanned prefix — never fabricated totals.
+///
+/// An empty AllowList yields a zeroed breakdown without touching the filesystem.
+pub fn storage_by_category(
+    allow_list: &AllowList,
+    max_files: u64,
+) -> Result<StorageBreakdown, String> {
+    let mut categories: Vec<StorageCategory> = STORAGE_CATEGORY_NAMES
+        .iter()
+        .map(|name| StorageCategory {
+            category: name.to_string(),
+            bytes: 0,
+        })
+        .collect();
+
+    let mut scanned_file_count: u64 = 0;
+    let mut scan_capped = false;
+
+    'roots: for root in allow_list.roots() {
+        ensure_allowed(allow_list, root)?;
+        let mut visited = std::collections::HashSet::new();
+
+        let mut visit = |path: &Path, meta: &fs::Metadata| -> bool {
+            // Only regular files carry size for category totals.
+            if !meta.is_file() {
+                return true;
+            }
+
+            // The cap bounds how many files get classified. As soon as the cap
+            // is met, stop the whole scan (all roots) at the next regular file.
+            if scanned_file_count >= max_files {
+                scan_capped = true;
+                return false;
+            }
+
+            scanned_file_count += 1;
+
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            let category_name = storage_category_for_extension(&ext);
+            if let Some(entry) = categories.iter_mut().find(|c| c.category == category_name) {
+                entry.bytes += meta.len();
+            }
+            true
+        };
+
+        if !walk_recursive(root, &mut visited, &mut visit) {
+            break 'roots; // safety cap reached — do not scan further roots
+        }
+    }
+
+    let total_bytes = categories.iter().map(|c| c.bytes).sum();
+
+    Ok(StorageBreakdown {
+        categories,
+        total_bytes,
+        scanned_file_count,
+        scan_capped,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,6 +1735,264 @@ pub fn restore_item(
     Ok(destination.to_string_lossy().to_string())
 }
 
+/// A single item currently in the application-managed trash.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashEntry {
+    /// Identifier of the entry (its current path inside the trash).
+    pub id: String,
+    pub name: String,
+    /// The item's location inside the trash (the key used for restore).
+    pub path: String,
+    pub is_folder: bool,
+    pub size_bytes: u64,
+    /// Lowercased file extension ("pdf", "docx", ...) or "folder".
+    pub file_type: String,
+    /// Human readable size ("2.4 MB"; folders render as "—").
+    pub size: String,
+    pub created: String,
+    pub modified: String,
+    /// Raw modification time (epoch seconds) so the UI can sort numerically.
+    pub modified_ts: i64,
+    pub created_ts: i64,
+    /// The item's recorded original location. `None` when the sidecar is
+    /// missing or corrupt — the item is still listed (honestly) without a
+    /// full record; it simply cannot be restored to a known original.
+    pub original_path: Option<String>,
+}
+
+/// List the current contents of the application-managed trash directory.
+///
+/// # Security order
+///
+/// 1. the trash root must be configured (fail closed otherwise),
+/// 2. canonicalize + `ensure_allowed` the trash root itself (an empty
+///    allowlist denies everything),
+/// 3. read the trash directory entry-by-entry, skipping sidecar metadata,
+/// 4. attach each entry's recorded original path from its sidecar (optional).
+pub fn list_trash(
+    trash: &TrashRoot,
+    allow_list: &AllowList,
+) -> Result<Vec<TrashEntry>, String> {
+    if trash.root().as_os_str().is_empty() {
+        return Err("Trash is not configured".to_string());
+    }
+    let canonical_root = trash
+        .root()
+        .canonicalize()
+        .map_err(|e| format!("Unable to list trash: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical_root)?;
+
+    let mut entries = Vec::new();
+    let reader = fs::read_dir(&canonical_root)
+        .map_err(|e| format!("Unable to list trash: {}", map_io_error(&e)))?;
+    for dir_entry in reader {
+        let entry = dir_entry.map_err(|e| format!("Unable to list trash: {}", map_io_error(&e)))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Sidecar metadata files are not trash items.
+        if name.ends_with(".trash.json") {
+            continue;
+        }
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("Unable to list trash: {}", map_io_error(&e)))?;
+        let file = build_file_entry(&path, &meta);
+        let sidecar = sidecar_path_for(&path);
+        let original_path = read_sidecar(&sidecar).ok().map(|m| m.original_path);
+
+        entries.push(TrashEntry {
+            id: file.id,
+            name: file.name,
+            path: file.path,
+            is_folder: file.is_folder,
+            size_bytes: file.size_bytes,
+            file_type: file.file_type,
+            size: file.size,
+            created: file.created,
+            modified: file.modified,
+            modified_ts: file.modified_ts,
+            created_ts: file.created_ts,
+            original_path,
+        });
+    }
+
+    // Stable order: most recently modified first.
+    entries.sort_by(|a, b| b.modified_ts.cmp(&a.modified_ts));
+    Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Application metadata — starred paths
+// ---------------------------------------------------------------------------
+
+/// The file name of the app-managed star store inside the app-local data dir.
+pub const STARS_FILE_NAME: &str = "stars.json";
+
+/// Maximum number of starred paths the store will hold.
+pub const MAX_STARRED_PATHS: usize = 10_000;
+
+/// Maximum length of a single starred path (a sane cap, not a path policy).
+pub const MAX_STAR_PATH_LEN: usize = 4_096;
+
+/// The configured location of the app's star store (`stars.json` in the Tauri
+/// app-local data directory).
+///
+/// This is configuration/location state ONLY — like [`TrashRoot`] it is a
+/// fail-closed tombstone (empty path) when the data dir cannot be resolved.
+pub struct StarStore {
+    file: PathBuf,
+}
+
+impl StarStore {
+    /// A store rooted at the given `stars.json` path.
+    pub fn new(file: PathBuf) -> Self {
+        StarStore { file }
+    }
+
+    /// Read-only access to the configured store file.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// An empty-root tombstone so every star operation is denied (fail closed).
+    pub fn empty() -> Self {
+        StarStore {
+            file: PathBuf::from(""),
+        }
+    }
+}
+
+/// Load and validate the starred absolute paths from the star store.
+///
+/// A missing file (first run) is an empty store. Values that are not strings,
+/// over-length, or beyond the count cap are dropped; an unparseable file is an
+/// error so a corrupt store is never silently treated as empty.
+pub fn load_stars(store: &StarStore) -> Result<Vec<String>, String> {
+    if store.file().as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = match fs::read(store.file()) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Unable to load stars: {}", map_io_error(&e))),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Star data is corrupt".to_string())?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "Star data is corrupt".to_string())?;
+
+    let mut out = Vec::new();
+    for item in arr {
+        if out.len() >= MAX_STARRED_PATHS {
+            break;
+        }
+        if let Some(s) = item.as_str() {
+            if s.chars().count() <= MAX_STAR_PATH_LEN {
+                out.push(s.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Persist the starred absolute paths atomically (temp file + rename).
+///
+/// The save refuses (rather than silently truncating) when the set exceeds the
+/// count cap or any single path exceeds the length cap.
+pub fn save_stars(store: &StarStore, paths: &[String]) -> Result<(), String> {
+    if store.file().as_os_str().is_empty() {
+        return Err("Stars are not configured".to_string());
+    }
+    if paths.len() > MAX_STARRED_PATHS {
+        return Err(format!(
+            "Too many starred paths: {} (max {})",
+            paths.len(),
+            MAX_STARRED_PATHS
+        ));
+    }
+    for p in paths {
+        if p.chars().count() > MAX_STAR_PATH_LEN {
+            return Err("Starred path is too long".to_string());
+        }
+    }
+
+    let json = serde_json::to_string(paths).map_err(|_| "Unable to serialize stars".to_string())?;
+    // Write to a temp file next to the target, then atomically rename over it;
+    // a crash mid-write leaves the previous store intact.
+    let file = store.file();
+    let temp: PathBuf = PathBuf::from(format!("{}.tmp", file.to_string_lossy()));
+    fs::write(&temp, json.as_bytes())
+        .map_err(|e| format!("Unable to save stars: {}", map_io_error(&e)))?;
+    fs::rename(&temp, file).map_err(|e| format!("Unable to save stars: {}", map_io_error(&e)))
+}
+
+/// Outcome of resolving the persisted starred paths against the real filesystem.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StarredResolution {
+    /// Entries that exist on disk (already built as normal real [`FileEntry`]s).
+    pub items: Vec<FileEntry>,
+    /// The original starred paths that could NOT be resolved: missing, deleted,
+    /// moved, invalid, non-files (symlinks), or outside the [`AllowList`]. They
+    /// are reported honestly and never synthesized into fake entries.
+    pub missing: Vec<String>,
+}
+
+/// Resolve a batch of persisted starred absolute paths into real [`FileEntry`]s.
+///
+/// # Security order (mirrors `get_file_metadata`/`search_files`)
+///
+/// 1. `symlink_metadata` — verifies the entry exists; missing/deleted/moved
+///    paths and symbolic links are reported as `missing` (symlinks are never
+///    represented as real entries, matching list/search behavior).
+/// 2. `canonicalize` — normalizes `..`/symlinked ancestors so identity is the
+///    canonical filesystem path.
+/// 3. `ensure_allowed` — the AllowList remains the sole authorization boundary;
+///    anything outside the allowed roots is `missing`, never resolved.
+/// 4. `build_file_entry` — the shared entry builder used by `list_directory`
+///    and `search_files`, so resolve results match the listing contract exactly.
+///
+/// Each path resolves or reports independently; a single unusable path never
+/// aborts the batch. An empty AllowList fails closed: every path is `missing`.
+pub fn resolve_starred_paths(
+    allow_list: &AllowList,
+    paths: &[String],
+) -> Result<StarredResolution, String> {
+    let mut items = Vec::new();
+    let mut missing = Vec::new();
+
+    for path in paths.iter() {
+        let target = Path::new(path);
+        let meta = match fs::symlink_metadata(target) {
+            Ok(m) => m,
+            Err(_) => {
+                missing.push(path.clone());
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            missing.push(path.clone());
+            continue;
+        }
+        let canonical = match target.canonicalize() {
+            Ok(c) => c,
+            Err(_) => {
+                missing.push(path.clone());
+                continue;
+            }
+        };
+        if ensure_allowed(allow_list, &canonical).is_err() {
+            missing.push(path.clone());
+            continue;
+        }
+        items.push(build_file_entry(&canonical, &meta));
+    }
+
+    Ok(StarredResolution { items, missing })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1564,6 +2055,17 @@ mod tests {
     /// AllowList rooted at the temp directory (canonicalized on construction).
     fn allow_for(tmp: &TempDir) -> AllowList {
         AllowList::with_root(&str_of(tmp.path())).unwrap()
+    }
+
+    /// Set a deterministic modification time (epoch seconds) on a file so the
+    /// recent-files ordering tests are stable and driven by real metadata.
+    fn set_mtime(path: &Path, epoch_secs: u64) {
+        let times = fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs));
+        fs::File::open(path)
+            .expect("open path for mtime")
+            .set_times(times)
+            .expect("set modified time");
     }
 
     // -- name validation ----------------------------------------------------
@@ -2856,6 +3358,332 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // -- recent_files -------------------------------------------------------
+
+    #[test]
+    fn recent_empty_allowlist_returns_empty() {
+        let tmp = TempDir::new("recent_empty_al");
+        let allow = AllowList::empty();
+        write_file(&tmp.child("file.txt"), "data");
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn recent_limit_zero_returns_empty_without_scanning() {
+        let tmp = TempDir::new("recent_zero");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("file.txt"), "data");
+
+        let results = super::recent_files(&allow, 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn recent_collects_files_and_folders() {
+        let tmp = TempDir::new("recent_both");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("notes.txt"), "data");
+        fs::create_dir(tmp.child("projects")).unwrap();
+        write_file(&tmp.child("projects").join("plan.md"), "data");
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().any(|e| !e.is_folder && e.name == "notes.txt"));
+        assert!(results.iter().any(|e| e.is_folder && e.name == "projects"));
+        assert!(results.iter().any(|e| !e.is_folder && e.name == "plan.md"));
+    }
+
+    #[test]
+    fn recent_sorted_newest_first() {
+        let tmp = TempDir::new("recent_order");
+        let allow = allow_for(&tmp);
+        // Lower epoch = older. Creation order is intentionally out of mtime order.
+        write_file(&tmp.child("old.txt"), "data");
+        write_file(&tmp.child("new.txt"), "data");
+        write_file(&tmp.child("mid.txt"), "data");
+        set_mtime(&tmp.child("old.txt"), 1_000);
+        set_mtime(&tmp.child("mid.txt"), 2_000);
+        set_mtime(&tmp.child("new.txt"), 3_000);
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["new.txt", "mid.txt", "old.txt"]);
+    }
+
+    #[test]
+    fn recent_tie_breaker_is_deterministic_path() {
+        let tmp = TempDir::new("recent_tie");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("zebra.txt"), "data");
+        write_file(&tmp.child("apple.txt"), "data");
+        set_mtime(&tmp.child("zebra.txt"), 5_000);
+        set_mtime(&tmp.child("apple.txt"), 5_000);
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["apple.txt", "zebra.txt"]);
+    }
+
+    #[test]
+    fn recent_limit_truncates_to_newest() {
+        let tmp = TempDir::new("recent_trunc");
+        let allow = allow_for(&tmp);
+        for i in 1..=10u64 {
+            let f = tmp.child(&format!("file{}.txt", i));
+            write_file(&f, "data");
+            set_mtime(&f, i * 100);
+        }
+
+        let results = super::recent_files(&allow, 3).unwrap();
+        assert_eq!(results.len(), 3);
+        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["file10.txt", "file9.txt", "file8.txt"]);
+    }
+
+    #[test]
+    fn recent_multiple_roots_merged() {
+        let tmp1 = TempDir::new("recent_multi_r1");
+        let tmp2 = TempDir::new("recent_multi_r2");
+        let mut allow = AllowList::with_root(&str_of(tmp1.path())).unwrap();
+        allow.register_root(&str_of(tmp2.path())).unwrap();
+        write_file(&tmp1.child("a.txt"), "data");
+        write_file(&tmp2.child("b.txt"), "data");
+        set_mtime(&tmp1.child("a.txt"), 500);
+        set_mtime(&tmp2.child("b.txt"), 500);
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        assert_eq!(results.iter().filter(|e| e.name == "a.txt").count(), 1);
+        assert_eq!(results.iter().filter(|e| e.name == "b.txt").count(), 1);
+    }
+
+    #[test]
+    fn recent_results_remain_inside_allowed_roots() {
+        let tmp = TempDir::new("recent_inside");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("sub")).unwrap();
+        write_file(&tmp.child("sub").join("match.txt"), "data");
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        assert!(!results.is_empty());
+        let root = &allow.roots()[0];
+        for entry in &results {
+            let entry_path = Path::new(&entry.path);
+            assert!(entry_path.starts_with(root));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_skips_symlinks_and_outside_targets() {
+        let root = TempDir::new("recent_sym_r");
+        let outside = TempDir::new("recent_sym_o");
+        let allow = allow_for(&root);
+        write_file(&outside.child("leak.txt"), "data");
+        write_file(&root.child("inside.txt"), "data");
+        std::os::unix::fs::symlink(&outside.child("leak.txt"), &root.child("link.txt")).unwrap();
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        // The symlink entry itself is skipped; its outside target is never reached.
+        assert!(!results.iter().any(|e| e.name == "link.txt"));
+        assert!(!results.iter().any(|e| e.name == "leak.txt"));
+        assert!(results.iter().any(|e| e.name == "inside.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_tolerates_unreadable_branch() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("recent_unreadable");
+        let allow = allow_for(&tmp);
+        fs::create_dir(tmp.child("locked")).unwrap();
+        write_file(&tmp.child("open.txt"), "data");
+        write_file(&tmp.child("locked").join("hidden.txt"), "data");
+
+        fs::set_permissions(&tmp.child("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let results = super::recent_files(&allow, RECENT_FILES_DEFAULT_LIMIT).unwrap();
+        assert!(results.iter().any(|e| e.name == "open.txt"));
+        assert!(!results.iter().any(|e| e.name == "hidden.txt"));
+
+        fs::set_permissions(&tmp.child("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // -- storage_by_category ------------------------------------------------
+
+    #[test]
+    fn storage_categories_are_in_canonical_order() {
+        let tmp = TempDir::new("storage_order");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.pdf"), "data");
+        write_file(&tmp.child("b.png"), "data");
+        write_file(&tmp.child("c.zip"), "data");
+        write_file(&tmp.child("d.xyz"), "data");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        let names: Vec<&str> = breakdown.categories.iter().map(|c| c.category.as_str()).collect();
+        assert_eq!(names, ["Documents", "Images", "Videos", "Audio", "Archives", "Code", "Other"]);
+    }
+
+    #[test]
+    fn storage_empty_allowlist_returns_zeroed_breakdown() {
+        let tmp = TempDir::new("storage_empty_al");
+        let allow = AllowList::empty();
+        write_file(&tmp.child("a.txt"), "data");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        assert_eq!(breakdown.scanned_file_count, 0);
+        assert_eq!(breakdown.total_bytes, 0);
+        assert!(!breakdown.scan_capped);
+        assert!(breakdown.categories.iter().all(|c| c.bytes == 0));
+    }
+
+    #[test]
+    fn storage_aggregates_real_sizes_by_extension() {
+        let tmp = TempDir::new("storage_sizes");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("report.pdf"), "pdf-content-10");
+        write_file(&tmp.child("notes.txt"), "txt-content-10");
+        write_file(&tmp.child("photo.png"), "png-content-10");
+        write_file(&tmp.child("clip.mp4"), "mp4-content-10");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        assert_eq!(breakdown.scanned_file_count, 4);
+
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        let images = breakdown.categories.iter().find(|c| c.category == "Images").unwrap();
+        let videos = breakdown.categories.iter().find(|c| c.category == "Videos").unwrap();
+
+        // "pdf-content-10" is 14 bytes, "txt-content-10" is 14 bytes, etc.
+        assert_eq!(docs.bytes, 28);
+        assert_eq!(images.bytes, 14);
+        assert_eq!(videos.bytes, 14);
+        assert_eq!(breakdown.total_bytes, docs.bytes + images.bytes + videos.bytes);
+    }
+
+    #[test]
+    fn storage_unknown_extensions_go_to_other() {
+        let tmp = TempDir::new("storage_other");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("took.bin"), "bin-content");
+        write_file(&tmp.child("noext"), "no-ext-content");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        let other = breakdown.categories.iter().find(|c| c.category == "Other").unwrap();
+        // Everything else stays 0.
+        let others: Vec<u64> = breakdown
+            .categories
+            .iter()
+            .filter(|c| c.category != "Other")
+            .map(|c| c.bytes)
+            .collect();
+        assert!(others.iter().all(|&b| b == 0));
+        assert_eq!(other.bytes, breakdown.total_bytes);
+        assert!(other.bytes > 0);
+    }
+
+    #[test]
+    fn storage_extension_matching_is_case_insensitive() {
+        let tmp = TempDir::new("storage_case");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("REPORT.PDF"), "pdf-content-10");
+        write_file(&tmp.child("slide.PPTX"), "pptx-content");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        // "pdf-content-10" (14) + "pptx-content" (12).
+        assert_eq!(docs.bytes, 14 + 12);
+    }
+
+    #[test]
+    fn storage_directories_carry_no_size() {
+        let tmp = TempDir::new("storage_dirs");
+        let allow = allow_for(&tmp);
+        fs::create_dir(tmp.child("bigdir")).unwrap();
+        write_file(&tmp.child("bigdir").join("inside.txt"), "txt-content-10");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        assert_eq!(breakdown.scanned_file_count, 1);
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        assert_eq!(docs.bytes, 14);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_skips_symlinks_and_outside_targets() {
+        let root = TempDir::new("storage_sym_r");
+        let outside = TempDir::new("storage_sym_o");
+        let allow = allow_for(&root);
+        write_file(&outside.child("leak.bin"), "outside-bytes");
+        write_file(&root.child("inside.txt"), "txt-content-10");
+        std::os::unix::fs::symlink(&outside.child("leak.bin"), &root.child("link.bin")).unwrap();
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        // Only the real in-root file is counted; the symlink (and its outside
+        // target) contribute nothing.
+        assert_eq!(breakdown.scanned_file_count, 1);
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        let other = breakdown.categories.iter().find(|c| c.category == "Other").unwrap();
+        assert_eq!(docs.bytes, 14);
+        assert_eq!(other.bytes, 0);
+        assert_eq!(breakdown.total_bytes, 14);
+    }
+
+    #[test]
+    fn storage_never_scans_outside_roots() {
+        let root = TempDir::new("storage_out_r");
+        let outside = TempDir::new("storage_out_o");
+        let allow = allow_for(&root);
+        write_file(&outside.child("secret.jpg"), "secret-data");
+        write_file(&root.child("me.txt"), "txt-content-10");
+
+        let breakdown = super::storage_by_category(&allow, STORAGE_SCAN_MAX_FILES).unwrap();
+        assert_eq!(breakdown.scanned_file_count, 1);
+        let images = breakdown.categories.iter().find(|c| c.category == "Images").unwrap();
+        assert_eq!(images.bytes, 0);
+    }
+
+    #[test]
+    fn storage_safety_cap_marks_cap_and_bounds_count() {
+        let tmp = TempDir::new("storage_cap");
+        let allow = allow_for(&tmp);
+        // All files same size (10 bytes) so the scanned prefix total is exact
+        // regardless of the OS's read_dir ordering.
+        for i in 0..8u32 {
+            write_file(&tmp.child(&format!("f{}.txt", i)), "0123456789");
+        }
+
+        let breakdown = super::storage_by_category(&allow, 5).unwrap();
+        assert!(breakdown.scan_capped);
+        assert_eq!(breakdown.scanned_file_count, 5);
+        // Exactly 5 × 10 bytes were classified.
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        assert_eq!(docs.bytes, 50);
+        assert_eq!(breakdown.total_bytes, 50);
+    }
+
+    #[test]
+    fn storage_safety_cap_stops_before_further_roots() {
+        let root1 = TempDir::new("storage_cap_r1");
+        let root2 = TempDir::new("storage_cap_r2");
+        let mut allow = AllowList::with_root(&str_of(root1.path())).unwrap();
+        allow.register_root(&str_of(root2.path())).unwrap();
+        for i in 0..3u32 {
+            write_file(&root1.child(&format!("a{}.txt", i)), "0123456789");
+        }
+        write_file(&root2.child("song.mp3"), "0123456789abcd");
+
+        let breakdown = super::storage_by_category(&allow, 2).unwrap();
+        assert!(breakdown.scan_capped);
+        assert_eq!(breakdown.scanned_file_count, 2);
+        // Root 2 was never reached, so Audio stays 0.
+        let docs = breakdown.categories.iter().find(|c| c.category == "Documents").unwrap();
+        let audio = breakdown.categories.iter().find(|c| c.category == "Audio").unwrap();
+        assert_eq!(docs.bytes, 20);
+        assert_eq!(audio.bytes, 0);
+    }
+
     // -- trash / restore helpers -------------------------------------------
 
     /// AllowList rooted at a temp dir, with a canonical `.trash` subdirectory
@@ -3292,6 +4120,312 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- list_trash --------------------------------------------------------
+
+    #[test]
+    fn list_trash_lists_real_files_and_folders() {
+        let tmp = TempDir::new("list_trash_items");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("a.txt"), "data");
+        fs::create_dir_all(tmp.child("proj").join("src")).unwrap();
+        write_file(&tmp.child("proj").join("src").join("b.txt"), "b");
+
+        let original_file = canonical_str(&tmp.child("a.txt"));
+        let original_dir = canonical_str(&tmp.child("proj"));
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("a.txt"))).unwrap();
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("proj"))).unwrap();
+
+        let entries = super::list_trash(&trash, &allow).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let file = entries.iter().find(|e| e.name == "a.txt").unwrap();
+        assert!(!file.is_folder);
+        assert_eq!(file.size_bytes, 4);
+        assert_eq!(file.file_type, "txt");
+        assert_eq!(file.original_path.as_deref(), Some(original_file.as_str()));
+
+        let dir = entries.iter().find(|e| e.name == "proj").unwrap();
+        assert!(dir.is_folder);
+        assert_eq!(dir.file_type, "folder");
+        assert_eq!(dir.original_path.as_deref(), Some(original_dir.as_str()));
+    }
+
+    #[test]
+    fn list_trash_skips_sidecar_files_and_stays_empty_when_trash_empty() {
+        let tmp = TempDir::new("list_trash_skip");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let entries = super::list_trash(&trash, &allow).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn list_trash_reports_original_path_when_sidecar_is_missing() {
+        let tmp = TempDir::new("list_trash_no_sidecar");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("orphan.txt"), "x");
+        fs::create_dir_all(tmp.child(".trash")).unwrap();
+        // Simulate a sidecar-less entry inside the trash.
+        fs::rename(tmp.child("orphan.txt"), tmp.child(".trash").join("orphan.txt")).unwrap();
+
+        let entries = super::list_trash(&trash, &allow).unwrap();
+        let orphan = entries.iter().find(|e| e.name == "orphan.txt").unwrap();
+        assert_eq!(orphan.original_path, None);
+    }
+
+    #[test]
+    fn list_trash_fails_closed_with_unconfigured_root() {
+        let tmp = TempDir::new("list_trash_unconfigured");
+        let allow = allow_for(&tmp);
+        let empty = TrashRoot { root: PathBuf::from("") };
+
+        let err = super::list_trash(&empty, &allow).unwrap_err();
+        assert_eq!(err, "Trash is not configured".to_string());
+    }
+
+    #[test]
+    fn list_trash_denied_by_empty_allowlist() {
+        let tmp = TempDir::new("list_trash_empty_al");
+        let trash = trash_for(&tmp);
+
+        let err = super::list_trash(&trash, &AllowList::empty()).unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- StarStore (starred paths) ----------------------------------------
+
+    fn star_store_for(tmp: &TempDir) -> StarStore {
+        StarStore::new(tmp.child("stars.json"))
+    }
+
+    #[test]
+    fn star_store_round_trip() {
+        let tmp = TempDir::new("stars_roundtrip");
+        let store = star_store_for(&tmp);
+        let paths = vec!["/Users/me/Desktop/a.txt".to_string(), "/Users/me/Docs/b".to_string()];
+
+        super::save_stars(&store, &paths).unwrap();
+
+        let loaded = super::load_stars(&store).unwrap();
+        assert_eq!(loaded, paths);
+    }
+
+    #[test]
+    fn star_store_missing_file_is_empty() {
+        let tmp = TempDir::new("stars_missing");
+        let store = star_store_for(&tmp);
+
+        let loaded = super::load_stars(&store).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn star_store_save_atomically_replaces_previous() {
+        let tmp = TempDir::new("stars_replace");
+        let store = star_store_for(&tmp);
+        super::save_stars(&store, &["/one".to_string()]).unwrap();
+        super::save_stars(&store, &["/two".to_string(), "/three".to_string()]).unwrap();
+
+        let loaded = super::load_stars(&store).unwrap();
+        assert_eq!(loaded, vec!["/two".to_string(), "/three".to_string()]);
+        // The temp file is cleaned up by the rename.
+        assert!(!tmp.child("stars.json.tmp").exists());
+    }
+
+    #[test]
+    fn star_store_load_drops_non_strings_and_over_limit_values() {
+        let tmp = TempDir::new("stars_validate");
+        let store = star_store_for(&tmp);
+        let long: String = "x".repeat(super::MAX_STAR_PATH_LEN + 1);
+        fs::write(
+            tmp.child("stars.json"),
+            format!("[\"/ok\", 42, true, {}, \"\", \"/kept\"]", serde_json::to_string(&long).unwrap()),
+        )
+        .unwrap();
+
+        let loaded = super::load_stars(&store).unwrap();
+        assert_eq!(loaded, vec!["/ok".to_string(), String::new(), "/kept".to_string()]);
+    }
+
+    #[test]
+    fn star_store_load_caps_entry_count() {
+        let tmp = TempDir::new("stars_cap");
+        let store = star_store_for(&tmp);
+        let many: Vec<String> = (0..(super::MAX_STARRED_PATHS + 5) as i32)
+            .map(|i| format!("/path/{}", i))
+            .collect();
+        super::save_stars(&store, &many).unwrap_err();
+        // Even so, loading collapses an over-limit file down to the cap.
+        let json = serde_json::to_string(&many).unwrap();
+        fs::write(tmp.child("stars.json"), json).unwrap();
+        let loaded = super::load_stars(&store).unwrap();
+        assert_eq!(loaded.len(), super::MAX_STARRED_PATHS);
+    }
+
+    #[test]
+    fn star_store_load_rejects_corrupt_file() {
+        let tmp = TempDir::new("stars_corrupt");
+        let store = star_store_for(&tmp);
+        fs::write(tmp.child("stars.json"), "not json at all {").unwrap();
+
+        let err = super::load_stars(&store).unwrap_err();
+        assert_eq!(err, "Star data is corrupt".to_string());
+    }
+
+    #[test]
+    fn star_store_save_rejects_empty_root() {
+        let store = StarStore::empty();
+        assert!(super::load_stars(&store).unwrap().is_empty());
+        let err = super::save_stars(&store, &["/x".to_string()]).unwrap_err();
+        assert_eq!(err, "Stars are not configured".to_string());
+    }
+
+    #[test]
+    fn star_store_save_rejects_too_many_paths() {
+        let tmp = TempDir::new("stars_save_cap");
+        let store = star_store_for(&tmp);
+        let many: Vec<String> = (0..(super::MAX_STARRED_PATHS + 1) as i32)
+            .map(|i| format!("/path/{}", i))
+            .collect();
+
+        let err = super::save_stars(&store, &many).unwrap_err();
+        assert!(err.contains("Too many starred paths"));
+    }
+
+    #[test]
+    fn star_store_save_rejects_oversized_path() {
+        let tmp = TempDir::new("stars_save_long");
+        let store = star_store_for(&tmp);
+        let over: String = "x".repeat(super::MAX_STAR_PATH_LEN + 1);
+
+        let err = super::save_stars(&store, &["/ok".to_string(), over]).unwrap_err();
+        assert_eq!(err, "Starred path is too long".to_string());
+    }
+
+    // -- resolve_starred_paths ---------------------------------------------
+
+    #[test]
+    fn resolve_starred_paths_resolves_existing_file() {
+        let tmp = TempDir::new("resolve_file");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("report.pdf"), "pdf");
+
+        let res = super::resolve_starred_paths(&allow, &[str_of(&tmp.child("report.pdf"))]).unwrap();
+
+        assert!(res.missing.is_empty());
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(res.items[0].name, "report.pdf");
+        assert_eq!(
+            res.items[0].path,
+            str_of(&tmp.child("report.pdf").canonicalize().unwrap())
+        );
+        assert!(!res.items[0].is_folder);
+        assert_eq!(res.items[0].file_type, "pdf");
+    }
+
+    #[test]
+    fn resolve_starred_paths_resolves_existing_folder() {
+        let tmp = TempDir::new("resolve_folder");
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("Docs")).unwrap();
+        fs::create_dir_all(tmp.child("Docs").join("sub")).unwrap();
+
+        let res = super::resolve_starred_paths(&allow, &[str_of(&tmp.child("Docs"))]).unwrap();
+
+        assert!(res.missing.is_empty());
+        assert_eq!(res.items.len(), 1);
+        assert!(res.items[0].is_folder);
+        assert_eq!(res.items[0].file_type, "folder");
+        assert_eq!(res.items[0].item_count, Some(1));
+    }
+
+    #[test]
+    fn resolve_starred_paths_reports_missing_alongside_resolved() {
+        let tmp = TempDir::new("resolve_mixed");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("present.txt"), "hi");
+
+        let missing_path = str_of(&tmp.child("gone.txt"));
+        let res = super::resolve_starred_paths(
+            &allow,
+            &[str_of(&tmp.child("present.txt")), missing_path.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(res.items[0].name, "present.txt");
+        assert_eq!(res.missing, vec![missing_path]);
+    }
+
+    #[test]
+    fn resolve_starred_paths_reports_deleted_path() {
+        let tmp = TempDir::new("resolve_deleted");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("temp.txt"), "x");
+        let path = str_of(&tmp.child("temp.txt"));
+        fs::remove_file(&path).unwrap();
+
+        let res = super::resolve_starred_paths(&allow, &[path.clone()]).unwrap();
+
+        assert!(res.items.is_empty());
+        assert_eq!(res.missing, vec![path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_starred_paths_skips_symlinks() {
+        let tmp = TempDir::new("resolve_symlink");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("real.txt"), "hi");
+        std::os::unix::fs::symlink(tmp.child("real.txt"), tmp.child("alias")).unwrap();
+        let alias = str_of(&tmp.child("alias"));
+
+        let res = super::resolve_starred_paths(&allow, &[alias.clone()]).unwrap();
+
+        assert!(res.items.is_empty());
+        assert_eq!(res.missing, vec![alias]);
+    }
+
+    #[test]
+    fn resolve_starred_paths_reports_outside_allowlist() {
+        let tmp = TempDir::new("resolve_outside");
+        let outside = TempDir::new("resolve_outside_root");
+        let allow = allow_for(&tmp);
+        write_file(&outside.child("secret.txt"), "s");
+        let secret = str_of(&outside.child("secret.txt"));
+
+        let res = super::resolve_starred_paths(&allow, &[secret.clone()]).unwrap();
+
+        assert!(res.items.is_empty());
+        assert_eq!(res.missing, vec![secret]);
+    }
+
+    #[test]
+    fn resolve_starred_paths_empty_input() {
+        let tmp = TempDir::new("resolve_empty");
+        let allow = allow_for(&tmp);
+
+        let res = super::resolve_starred_paths(&allow, &[]).unwrap();
+
+        assert!(res.items.is_empty());
+        assert!(res.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_starred_paths_empty_allowlist_fails_closed() {
+        let tmp = TempDir::new("resolve_no_allow");
+        write_file(&tmp.child("real.txt"), "hi");
+        let real = str_of(&tmp.child("real.txt"));
+
+        let res = super::resolve_starred_paths(&AllowList::empty(), &[real.clone()]).unwrap();
+
+        assert!(res.items.is_empty());
+        assert_eq!(res.missing, vec![real]);
     }
 
     // -- duplicate_item ---------------------------------------------------

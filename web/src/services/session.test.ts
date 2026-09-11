@@ -4,6 +4,7 @@ const authApiMock = vi.hoisted(() => ({
   login: vi.fn(),
   me: vi.fn(),
   logout: vi.fn(),
+  register: vi.fn(),
 }));
 
 vi.mock("./api", () => ({
@@ -15,6 +16,7 @@ import {
   getSessionSnapshot,
   login,
   logout,
+  register,
   requireSessionToken,
   subscribeSession,
 } from "./session";
@@ -100,6 +102,44 @@ describe("session", () => {
     await login("a@example.com", "pw");
 
     await expect(logout()).resolves.toBeUndefined();
+    expect(getSessionSnapshot().user).toBeNull();
+    expect(() => requireSessionToken()).toThrow(SessionNotAuthenticatedError);
+  });
+
+  it("register creates the account, then signs the new user in", async () => {
+    authApiMock.register.mockResolvedValue({
+      user: { id: "u2", email: "new@example.com", displayName: "New", status: "active" },
+    });
+    authApiMock.login.mockResolvedValue({
+      user: { id: "u2", email: "new@example.com", displayName: "New", status: "active" },
+      token: "session-token-new",
+    });
+
+    const user = await register("new@example.com", "New", "password123");
+
+    expect(authApiMock.register).toHaveBeenCalledWith({
+      email: "new@example.com",
+      displayName: "New",
+      password: "password123",
+    });
+    expect(authApiMock.login).toHaveBeenCalledWith({
+      email: "new@example.com",
+      password: "password123",
+    });
+    expect(user.email).toBe("new@example.com");
+    expect(getSessionSnapshot().user?.id).toBe("u2");
+    expect(requireSessionToken()).toBe("session-token-new");
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it("register propagates a backend failure and never signs in", async () => {
+    authApiMock.register.mockRejectedValue(new Error("An account with this email already exists."));
+
+    await expect(register("new@example.com", "New", "password123")).rejects.toThrow(
+      "An account with this email already exists.",
+    );
+    expect(authApiMock.login).not.toHaveBeenCalled();
     expect(getSessionSnapshot().user).toBeNull();
     expect(() => requireSessionToken()).toThrow(SessionNotAuthenticatedError);
   });

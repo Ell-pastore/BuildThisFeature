@@ -43,9 +43,13 @@ function settings(overrides?: Partial<ProviderSettings>): ProviderSettings {
 
 function validInput(overrides?: Partial<ProviderDiagnosticsInput>): ProviderDiagnosticsInput {
   return {
-    chain: [ProviderId.Grok, ProviderId.Gemini, ProviderId.Ollama],
+    chain: [ProviderId.Grok, ProviderId.Groq, ProviderId.Gemini, ProviderId.Ollama],
     settings: {
       [ProviderId.Grok]: settings({ model: "grok-3" }),
+      [ProviderId.Groq]: settings({
+        model: "openai/gpt-oss-20b",
+        baseUrl: "https://api.groq.com/openai/v1",
+      }),
       [ProviderId.Gemini]: settings({
         model: "gemini-3.5-flash",
         baseUrl: "https://generativelanguage.googleapis.com/v1beta",
@@ -61,6 +65,7 @@ function validInput(overrides?: Partial<ProviderDiagnosticsInput>): ProviderDiag
     },
     credentials: {
       [ProviderId.Grok]: ["grok-key-1", "grok-key-2"],
+      [ProviderId.Groq]: ["groq-key-1"],
       [ProviderId.Gemini]: ["gemini-key-1"],
       [ProviderId.OpenRouter]: ["openrouter-key-1"],
     },
@@ -84,6 +89,7 @@ describe("provider diagnostics — valid configuration", () => {
     expect(report.issues).toEqual([]);
     expect(report.providers.map((p) => p.provider)).toEqual([
       ProviderId.Grok,
+      ProviderId.Groq,
       ProviderId.Gemini,
       ProviderId.Ollama,
     ]);

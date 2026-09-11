@@ -49,6 +49,7 @@ function summary(overrides: Partial<AiConversationSummary> = {}): AiConversation
     updatedAt: ISO,
     turnState: "completed",
     pendingApprovals: [],
+    pendingHostExecutions: [],
     ...overrides,
   };
 }
