@@ -50,6 +50,8 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
   const onNewFile = vi.fn();
   const onDuplicate = vi.fn();
   const onCopy = vi.fn();
+  const onOpenFolder = vi.fn();
+  const onOpenPreview = vi.fn();
   render(
     <Files
       items={items}
@@ -58,8 +60,8 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       path="/Users/usr/Desktop"
       isHome={false}
       onUp={() => {}}
-      onOpenFolder={() => {}}
-      onOpenPreview={() => {}}
+      onOpenFolder={onOpenFolder}
+      onOpenPreview={onOpenPreview}
       onOpenDisk={() => {}}
       onNewFolder={onNewFolder}
       onNewFile={onNewFile}
@@ -72,7 +74,7 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       onRefresh={() => {}}
     />,
   );
-  return { onNewFolder, onNewFile, onDuplicate, onCopy };
+  return { onNewFolder, onNewFile, onDuplicate, onCopy, onOpenFolder, onOpenPreview };
 }
 
 describe("Files", () => {
@@ -95,6 +97,26 @@ describe("Files", () => {
 
     expect(screen.getByText("Projects")).toBeInTheDocument();
     expect(screen.getByText("report.pdf")).toBeInTheDocument();
+  });
+
+  it("navigates into a folder row via onOpenFolder instead of opening the preview", () => {
+    const { onOpenFolder, onOpenPreview } = renderFiles();
+
+    fireEvent.click(screen.getByText("Projects"));
+
+    expect(onOpenFolder).toHaveBeenCalledTimes(1);
+    expect(onOpenFolder).toHaveBeenCalledWith(folder("Projects"));
+    expect(onOpenPreview).not.toHaveBeenCalled();
+  });
+
+  it("opens the file preview when a file row is clicked", () => {
+    const { onOpenFolder, onOpenPreview } = renderFiles();
+
+    fireEvent.click(screen.getByText("report.pdf"));
+
+    expect(onOpenPreview).toHaveBeenCalledTimes(1);
+    expect(onOpenPreview).toHaveBeenCalledWith(fileItem("report.pdf"));
+    expect(onOpenFolder).not.toHaveBeenCalled();
   });
 
   it("creates a folder through the existing onNewFolder flow", () => {

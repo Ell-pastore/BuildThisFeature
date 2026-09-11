@@ -41,8 +41,9 @@ function folderItem(name: string): FileItem {
 
 function renderRecent(props: Partial<React.ComponentProps<typeof Recent>> = {}) {
   const onOpenFile = vi.fn();
-  render(<Recent items={[]} onOpenFile={onOpenFile} {...props} />);
-  return { onOpenFile };
+  const onOpenFolder = vi.fn();
+  render(<Recent items={[]} onOpenFile={onOpenFile} onOpenFolder={onOpenFolder} {...props} />);
+  return { onOpenFile, onOpenFolder };
 }
 
 describe("Recent", () => {
@@ -72,6 +73,16 @@ describe("Recent", () => {
 
     expect(onOpenFile).toHaveBeenCalledTimes(1);
     expect(onOpenFile).toHaveBeenCalledWith(fileItem("photo.jpg"));
+  });
+
+  it("navigates into a folder row via onOpenFolder instead of opening the preview", () => {
+    const { onOpenFile, onOpenFolder } = renderRecent({ items: [folderItem("Projects")] });
+
+    fireEvent.click(screen.getByText("Projects"));
+
+    expect(onOpenFolder).toHaveBeenCalledTimes(1);
+    expect(onOpenFolder).toHaveBeenCalledWith(folderItem("Projects"));
+    expect(onOpenFile).not.toHaveBeenCalled();
   });
 
   it("shows the honest empty state when nothing has been modified yet", () => {

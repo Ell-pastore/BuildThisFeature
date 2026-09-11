@@ -5,6 +5,8 @@ import type { FileItem } from "../../types";
 interface SearchProps {
   query: string;
   onOpenFile: (file: FileItem) => void;
+  /** Navigate into a folder (falls back to onOpenFile when unset). */
+  onOpenFolder?: (item: FileItem) => void;
   /** Real results from the recursive desktop filesystem search. */
   results?: FileItem[];
   /** True while the recursive search is in flight. */
@@ -16,6 +18,7 @@ interface SearchProps {
 export default function Search({
   query,
   onOpenFile,
+  onOpenFolder,
   results = [],
   searching = false,
   error = null,
@@ -93,7 +96,7 @@ export default function Search({
                 {results.map((file) => (
                   <button
                     key={file.id}
-                    onClick={() => onOpenFile(file)}
+                    onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
                     className="w-full flex items-center gap-4 bg-card border border-border rounded-xl px-5 py-4 hover:border-accent/40 hover:shadow-sm transition-all text-left"
                   >
                     <FileIcon type={file.type} size="sm" />

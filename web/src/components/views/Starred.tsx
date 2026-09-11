@@ -4,6 +4,8 @@ import type { FileItem } from "../../types";
 
 interface StarredProps {
   onOpenFile: (file: FileItem) => void;
+  /** Navigate into a folder (falls back to onOpenFile when unset). */
+  onOpenFolder?: (item: FileItem) => void;
   /** Real starred files resolved from the persisted star store. */
   items?: FileItem[];
   /** Persisted starred paths that could not be resolved (moved/deleted/outside allowed folders). */
@@ -18,6 +20,7 @@ interface StarredProps {
 
 export default function Starred({
   onOpenFile,
+  onOpenFolder,
   items = [],
   missingPaths = [],
   loading = false,
@@ -69,7 +72,7 @@ export default function Starred({
               {items.map((file) => (
                 <button
                   key={file.id}
-                  onClick={() => onOpenFile(file)}
+                  onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
                   className="w-full flex items-center gap-4 px-5 py-3.5 hover:bg-secondary transition-colors text-left"
                 >
                   <FileIcon type={file.type} size="sm" />

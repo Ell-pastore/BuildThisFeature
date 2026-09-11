@@ -63,6 +63,28 @@ describe("Starred", () => {
     expect(onOpenFile).toHaveBeenCalledWith(expect.objectContaining({ name: "report.pdf" }));
   });
 
+  it("navigates into a starred folder via onOpenFolder instead of opening the preview", () => {
+    const folderItem: FileItem = starredItem({
+      id: "/Users/usr/Desktop/Projects",
+      name: "Projects",
+      type: "folder",
+      isFolder: true,
+      itemCount: 3,
+      size: "—",
+      sizeBytes: 0,
+    });
+    const onOpenFile = vi.fn();
+    const onOpenFolder = vi.fn();
+
+    render(<Starred onOpenFile={onOpenFile} onOpenFolder={onOpenFolder} items={[folderItem]} />);
+
+    fireEvent.click(screen.getByText("Projects"));
+
+    expect(onOpenFolder).toHaveBeenCalledTimes(1);
+    expect(onOpenFolder).toHaveBeenCalledWith(expect.objectContaining({ name: "Projects" }));
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
   it("shows the honest empty state when nothing is starred", () => {
     render(<Starred onOpenFile={() => {}} />);
 

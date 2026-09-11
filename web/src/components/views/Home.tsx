@@ -9,6 +9,8 @@ interface HomeProps {
   /** Real files provided by the app (the loaded directory contents). */
   recentFiles?: FileItem[];
   onOpenFile: (file: FileItem) => void;
+  /** Navigate into a folder (falls back to onOpenFile when unset). */
+  onOpenFolder?: (item: FileItem) => void;
   onNavigate: (view: string) => void;
   /** Real volume capacity from the Rust backend (null while loading/unsupported). */
   diskUsage?: DiskUsage | null;
@@ -18,7 +20,7 @@ interface HomeProps {
  * Home dashboard. Presentational only: `recentFiles` and `diskUsage` come from
  * the real filesystem via App/Rust. No hardcoded file entries live here.
  */
-export default function Home({ recentFiles = [], onOpenFile, onNavigate, diskUsage }: HomeProps) {
+export default function Home({ recentFiles = [], onOpenFile, onOpenFolder, onNavigate, diskUsage }: HomeProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const recent = recentFiles.slice(0, 5);
   const totalBytes = diskUsage?.totalBytes ?? 0;
@@ -145,7 +147,7 @@ export default function Home({ recentFiles = [], onOpenFile, onNavigate, diskUsa
               {recent.map((file) => (
                 <button
                   key={file.id}
-                  onClick={() => onOpenFile(file)}
+                  onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
                   className="grid grid-cols-[auto_1fr_80px_100px_90px] gap-4 items-center px-4 py-3 w-full hover:bg-secondary transition-colors text-left"
                 >
                   <FileIcon type={file.type} size="sm" />
@@ -164,7 +166,7 @@ export default function Home({ recentFiles = [], onOpenFile, onNavigate, diskUsa
               {recent.map((file) => (
                 <button
                   key={file.id}
-                  onClick={() => onOpenFile(file)}
+                  onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
                   className="bg-card border border-border rounded-xl p-4 hover:border-accent/40 hover:shadow-sm transition-all text-left group"
                 >
                   <div className="flex items-start gap-3">

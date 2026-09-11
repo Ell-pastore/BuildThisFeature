@@ -4,6 +4,8 @@ import type { FileItem } from "../../types";
 
 interface RecentProps {
   onOpenFile: (file: FileItem) => void;
+  /** Navigate into a folder (falls back to onOpenFile when unset). */
+  onOpenFolder?: (item: FileItem) => void;
   /** Real, most recently modified files and folders from the allowed roots. */
   items?: FileItem[];
   /** True while the recent-files scan is in flight. */
@@ -20,6 +22,7 @@ interface RecentProps {
  */
 export default function Recent({
   onOpenFile,
+  onOpenFolder,
   items = [],
   loading = false,
   error = null,
@@ -69,7 +72,7 @@ export default function Recent({
             {items.map((file) => (
               <button
                 key={file.id}
-                onClick={() => onOpenFile(file)}
+                onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
                 className="w-full flex items-center gap-4 px-5 py-3 hover:bg-secondary transition-colors text-left"
               >
                 <FileIcon type={file.type} size="sm" />

@@ -386,7 +386,7 @@ export default function App() {
 
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 flex overflow-hidden">
-            {view === "home" && <Home onOpenFile={openPreview} onNavigate={navigate} recentFiles={seenFiles} diskUsage={diskUsage} />}
+            {view === "home" && <Home onOpenFile={openPreview} onOpenFolder={openFolder} onNavigate={navigate} recentFiles={seenFiles} diskUsage={diskUsage} />}
             {view === "files" && (
               <Files
                 items={seenFiles}
@@ -412,6 +412,7 @@ export default function App() {
             {view === "recent" && (
               <Recent
                 onOpenFile={openPreview}
+                onOpenFolder={openFolder}
                 items={recentItems}
                 loading={recentLoading}
                 error={recentError}
@@ -421,6 +422,7 @@ export default function App() {
             {view === "starred" && (
               <Starred
                 onOpenFile={openPreview}
+                onOpenFolder={openFolder}
                 items={starredItems}
                 missingPaths={starredMissing}
                 loading={starredLoading}
@@ -435,6 +437,7 @@ export default function App() {
                 searching={searching}
                 error={searchError}
                 onOpenFile={openPreview}
+                onOpenFolder={openFolder}
                 results={searchResults}
               />
             )}

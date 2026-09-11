@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import Search from "./Search";
 import type { FileItem } from "../../types";
 
@@ -45,6 +45,51 @@ describe("Search", () => {
     expect(screen.queryByText(/AI Understanding/i)).toBeNull();
     // Real metadata shown.
     expect(screen.getByText(/\/Users\/usr\/Desktop · Sep 1, 2026/)).toBeInTheDocument();
+  });
+
+  it("navigates into a folder result via onOpenFolder instead of opening the preview", () => {
+    const folderResult: FileItem = file({
+      id: "/Users/usr/Documents/Current Projects",
+      name: "Current Projects",
+      type: "folder",
+      isFolder: true,
+      itemCount: 3,
+      size: "—",
+      sizeBytes: 0,
+      location: "/Users/usr/Documents",
+    });
+    const onOpenFile = vi.fn();
+    const onOpenFolder = vi.fn();
+
+    render(
+      <Search
+        query="projects"
+        results={[folderResult]}
+        onOpenFile={onOpenFile}
+        onOpenFolder={onOpenFolder}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Current Projects"));
+
+    expect(onOpenFolder).toHaveBeenCalledTimes(1);
+    expect(onOpenFolder).toHaveBeenCalledWith(expect.objectContaining({ name: "Current Projects" }));
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("still opens the preview for a file result", () => {
+    const onOpenFile = vi.fn();
+    const onOpenFolder = vi.fn();
+
+    render(
+      <Search query="notes" results={[file()]} onOpenFile={onOpenFile} onOpenFolder={onOpenFolder} />,
+    );
+
+    fireEvent.click(screen.getByText("notes.txt"));
+
+    expect(onOpenFile).toHaveBeenCalledTimes(1);
+    expect(onOpenFile).toHaveBeenCalledWith(expect.objectContaining({ name: "notes.txt" }));
+    expect(onOpenFolder).not.toHaveBeenCalled();
   });
 
   it("shows the honest prompt on an empty query and never a fake result set", () => {
