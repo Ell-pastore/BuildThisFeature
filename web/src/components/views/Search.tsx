@@ -1,6 +1,32 @@
+import { useState } from "react";
 import { Filter } from "../../components/Icons";
 import FileIcon from "../FileIcon";
 import type { FileItem } from "../../types";
+
+/**
+ * Client-side quick filters; only ever applied to non-folder results.
+ *
+ * Extension sets mirror the canonical classification in
+ * `desktop/src/fs_service.rs` (`storage_category_for_extension`). PDF is its
+ * own chip (only `pdf`); the Documents chip takes the remaining canonical
+ * Documents extensions.
+ */
+const TYPE_FILTERS: Record<string, Set<string>> = {
+  PDF: new Set(["pdf"]),
+  Documents: new Set([
+    "txt", "rtf", "doc", "docx", "odt", "xls", "xlsx", "csv", "ods", "ppt",
+    "pptx", "odp", "pages", "numbers", "keynote", "md", "tex", "epub", "mobi",
+    "log",
+  ]),
+  Images: new Set([
+    "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "svg", "ico",
+    "heic", "heif", "raw", "psd", "ai", "eps",
+  ]),
+  Videos: new Set([
+    "mp4", "mov", "mkv", "avi", "webm", "flv", "wmv", "m4v", "m2ts", "3gp",
+    "mpg", "mpeg",
+  ]),
+};
 
 interface SearchProps {
   query: string;
@@ -24,6 +50,15 @@ export default function Search({
   error = null,
 }: SearchProps) {
   const hasQuery = query.trim().length > 0;
+  const [activeFilter, setActiveFilter] = useState("All");
+
+  // Folders always pass a quick filter; only non-folder results are filtered.
+  const filtered =
+    activeFilter === "All"
+      ? results
+      : results.filter(
+          (r) => r.isFolder || (TYPE_FILTERS[activeFilter]?.has(r.type.toLowerCase()) ?? false),
+        );
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -48,8 +83,9 @@ export default function Search({
           {["All", "PDF", "Documents", "Images", "Videos"].map((f) => (
             <button
               key={f}
+              onClick={() => setActiveFilter(f)}
               className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
-                ${f === "All" ? "bg-foreground text-primary-foreground" : "bg-secondary text-muted-foreground hover:bg-border"}`}
+                ${activeFilter === f ? "bg-foreground text-primary-foreground" : "bg-secondary text-muted-foreground hover:bg-border"}`}
             >
               {f}
             </button>
@@ -89,11 +125,18 @@ export default function Search({
                 Nothing in your folders matches "{query}".
               </p>
             </div>
+          ) : filtered.length === 0 ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
+              <p className="text-sm font-medium text-foreground">No matching results</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Nothing matches the "{activeFilter}" filter.
+              </p>
+            </div>
           ) : (
             <>
-              <div className="text-xs text-muted-foreground mb-3">{results.length} results</div>
+              <div className="text-xs text-muted-foreground mb-3">{filtered.length} results</div>
               <div className="space-y-2">
-                {results.map((file) => (
+                {filtered.map((file) => (
                   <button
                     key={file.id}
                     onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
