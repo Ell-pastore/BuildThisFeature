@@ -1,4 +1,4 @@
-AI File Manager — Design-First Flutter Scaffold
+Smart File Manager — Design-First Flutter Scaffold
 Static UI implementation of the 8-screen design board approved earlier.
 No business logic yet — every screen renders hard-coded dummy data so your
 group can iterate on the look & feel before wiring any state.
