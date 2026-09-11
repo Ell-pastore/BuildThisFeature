@@ -11,7 +11,7 @@ interface FilePreviewProps {
   onOpen?: () => void;
   onStar?: () => void;
   onDelete?: () => void;
-  onRename?: (newName: string) => void;
+  onRename?: (newName: string) => Promise<string | null> | string | null | void;
   onMove?: (destDir: string) => void;
   onDuplicate?: () => void;
   onCopy?: (destDir: string) => void;
@@ -159,6 +159,24 @@ export default function FilePreview({
 }: FilePreviewProps) {
   const [moveOpen, setMoveOpen] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState(false);
+
+  async function submitRename() {
+    const name = renameValue.trim();
+    if (!name || !onRename || renaming) return;
+    setRenaming(true);
+    setRenameError(null);
+    const result = await onRename(name);
+    setRenaming(false);
+    if (result) {
+      setRenameError(result);
+      return;
+    }
+    setRenameOpen(false);
+  }
 
   return (
     <>
@@ -198,8 +216,9 @@ export default function FilePreview({
               <button
                 onClick={() => {
                   if (!onRename) return;
-                  const name = window.prompt("New name", file.name);
-                  if (name && name.trim()) onRename(name.trim());
+                  setRenameValue(file.name);
+                  setRenameError(null);
+                  setRenameOpen(true);
                 }}
                 className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-foreground hover:bg-secondary transition-colors"
               >
@@ -293,6 +312,40 @@ export default function FilePreview({
           }}
           onClose={() => setCopyOpen(false)}
         />
+      )}
+      {renameOpen && (
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
+          <div className="bg-card border border-border rounded-2xl p-6 max-w-sm w-full shadow-xl">
+            <div className="text-base font-semibold text-foreground">Rename</div>
+            {renameError && (
+              <p className="text-xs text-red-500 mt-2">{renameError}</p>
+            )}
+            <input
+              autoFocus
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void submitRename();
+              }}
+              className="mt-4 w-full px-4 py-2 text-sm border border-border rounded-lg outline-none focus:border-accent bg-transparent text-foreground"
+            />
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={() => setRenameOpen(false)}
+                className="flex-1 px-4 py-2 text-sm border border-border rounded-lg hover:bg-secondary transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void submitRename()}
+                disabled={renaming}
+                className="flex-1 px-4 py-2 text-sm bg-accent text-white rounded-lg hover:bg-indigo-600 transition-colors"
+              >
+                {renaming ? "Renaming…" : "Rename"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
       </div>
     </>

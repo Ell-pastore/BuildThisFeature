@@ -48,6 +48,7 @@ function fileItem(name: string): FileItem {
 function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.pdf")]) {
   const onNewFolder = vi.fn();
   const onNewFile = vi.fn();
+  const onRename = vi.fn();
   const onDuplicate = vi.fn();
   const onCopy = vi.fn();
   const onOpenFolder = vi.fn();
@@ -65,7 +66,7 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       onOpenDisk={() => {}}
       onNewFolder={onNewFolder}
       onNewFile={onNewFile}
-      onRename={() => {}}
+      onRename={onRename}
       onDelete={() => {}}
       onMove={() => {}}
       onCopy={onCopy}
@@ -74,7 +75,7 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       onRefresh={() => {}}
     />,
   );
-  return { onNewFolder, onNewFile, onDuplicate, onCopy, onOpenFolder, onOpenPreview };
+  return { onNewFolder, onNewFile, onRename, onDuplicate, onCopy, onOpenFolder, onOpenPreview };
 }
 
 describe("Files", () => {
@@ -179,5 +180,65 @@ describe("Files", () => {
       expect(onCopy).toHaveBeenCalledTimes(1);
     });
     expect(onCopy).toHaveBeenCalledWith(fileItem("report.pdf"), "/Users/usr/Desktop");
+  });
+
+  it("renames a selected item, trims the name, and closes the dialog on success", async () => {
+    const { onRename } = renderFiles([fileItem("report.pdf")]);
+    onRename.mockResolvedValue(null);
+
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await screen.findByText("1 selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "  notes.txt  " },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(onRename).toHaveBeenCalledTimes(1);
+    });
+    expect(onRename).toHaveBeenCalledWith(fileItem("report.pdf"), "notes.txt");
+    expect(screen.queryByDisplayValue("notes.txt")).not.toBeInTheDocument();
+  });
+
+  it("keeps the rename dialog open and shows the error inline when the rename fails", async () => {
+    const { onRename } = renderFiles([fileItem("report.pdf")]);
+    onRename.mockResolvedValue("A file or folder with that name already exists.");
+
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await screen.findByText("1 selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "notes.txt" },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    expect(
+      await screen.findByText("A file or folder with that name already exists."),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("notes.txt")).toBeInTheDocument();
+    expect(onRename).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not submit a blank rename name and keeps the dialog open", async () => {
+    const { onRename } = renderFiles([fileItem("report.pdf")]);
+    onRename.mockResolvedValue(null);
+
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await screen.findByText("1 selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "   " },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("button", { name: "Rename" }).length).toBe(2);
   });
 });

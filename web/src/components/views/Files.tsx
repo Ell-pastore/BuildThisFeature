@@ -34,7 +34,7 @@ interface FilesProps {
   onOpenDisk: (item: FileItem) => void;
   onNewFolder: (name: string) => void;
   onNewFile: (name: string) => void;
-  onRename: (item: FileItem, newName: string) => void;
+  onRename: (item: FileItem, newName: string) => Promise<string | null> | string | null | void;
   onDelete: (item: FileItem) => void;
   onMove: (item: FileItem, destDir: string) => void;
   onCopy: (item: FileItem, destDir: string) => void;
@@ -75,9 +75,25 @@ export default function Files({
   const [newName, setNewName] = useState("");
   const [renameItem, setRenameItem] = useState<FileItem | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState(false);
   const [moveItem, setMoveItem] = useState<FileItem | null>(null);
   const [copyItems, setCopyItems] = useState<FileItem[]>([]);
   const [deleteItem, setDeleteItem] = useState<FileItem | null>(null);
+
+  async function submitRename() {
+    const name = renameValue.trim();
+    if (!renameItem || !name || renaming) return;
+    setRenaming(true);
+    setRenameError(null);
+    const result = await onRename(renameItem, name);
+    setRenaming(false);
+    if (result) {
+      setRenameError(result);
+      return;
+    }
+    setRenameItem(null);
+  }
 
   function toggleSelect(id: string, e: React.MouseEvent) {
     e.stopPropagation();
@@ -231,7 +247,7 @@ export default function Files({
             <button
               onClick={() => {
                 const item = selectedItems[0];
-                if (item) { setRenameItem(item); setRenameValue(item.name); }
+                if (item) { setRenameItem(item); setRenameValue(item.name); setRenameError(null); }
               }}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs hover:bg-white/10 transition-colors"
             >
@@ -524,12 +540,15 @@ export default function Files({
         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
           <div className="bg-card border border-border rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <div className="text-base font-semibold text-foreground">Rename</div>
+            {renameError && (
+              <p className="text-xs text-red-500 mt-2">{renameError}</p>
+            )}
             <input
               autoFocus
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && renameValue.trim()) { onRename(renameItem, renameValue.trim()); setRenameItem(null); }
+                if (e.key === "Enter") void submitRename();
               }}
               className="mt-4 w-full px-4 py-2 text-sm border border-border rounded-lg outline-none focus:border-accent bg-transparent text-foreground"
             />
@@ -541,10 +560,11 @@ export default function Files({
                 Cancel
               </button>
               <button
-                onClick={() => { if (renameValue.trim()) { onRename(renameItem, renameValue.trim()); setRenameItem(null); } }}
+                onClick={() => void submitRename()}
+                disabled={renaming}
                 className="flex-1 px-4 py-2 text-sm bg-accent text-white rounded-lg hover:bg-indigo-600 transition-colors"
               >
-                Rename
+                {renaming ? "Renaming…" : "Rename"}
               </button>
             </div>
           </div>

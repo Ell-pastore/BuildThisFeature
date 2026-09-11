@@ -57,6 +57,18 @@ function buildPathCrumbs(path: string, onNavigate: (p: string) => void): Crumb[]
   }
   return crumbs;
 }
+
+/** Build a FileItem that reflects a successful leaf rename. */
+function renamedItemPreview(item: FileItem, newName: string): FileItem {
+  const oldPath = item.path ?? item.id;
+  const sepIdx = Math.max(oldPath.lastIndexOf("/"), oldPath.lastIndexOf("\\"));
+  const parent = item.location || (sepIdx >= 0 ? oldPath.slice(0, sepIdx) : "");
+  const sep = parent.includes("\\") && !parent.includes("/") ? "\\" : "/";
+  const newPath = parent ? `${parent}${sep}${newName}` : newName;
+  const dot = newName.lastIndexOf(".");
+  const type = item.isFolder ? "folder" : dot > 0 ? newName.slice(dot + 1).toLowerCase() : "file";
+  return { ...item, id: newPath, path: newPath, name: newName, type, location: parent };
+}
 export default function App() {
   const [view, setView] = useState<View>("home");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -314,12 +326,18 @@ export default function App() {
     }
   }
 
-  async function doRename(item: FileItem, newName: string) {
+  async function doRename(item: FileItem, newName: string): Promise<string | null> {
+    const name = newName.trim();
+    if (!name) return "Name cannot be empty";
     try {
-      if (item.path) await filesystem.renameItem(item.path, newName);
+      if (item.path) await filesystem.renameItem(item.path, name);
       await loadDir(dirPath);
+      if (previewFile?.path === item.path) {
+        setPreviewFile(renamedItemPreview(item, name));
+      }
+      return null;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      return err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -475,7 +493,7 @@ export default function App() {
           onOpen={() => void openOnDisk(previewFile)}
           onStar={() => doToggleStar(previewFile)}
           onDelete={() => void doDelete(previewFile)}
-          onRename={(name) => void doRename(previewFile, name)}
+          onRename={(name) => doRename(previewFile, name)}
           onMove={(dest) => void doMove(previewFile, dest)}
           onCopy={(dest) => void doCopy([previewFile], dest)}
           onDuplicate={() => void doDuplicate(previewFile)}

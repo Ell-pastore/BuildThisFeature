@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import FilePreview from "./FilePreview";
 import type { FileItem } from "../types";
 
@@ -34,7 +34,7 @@ interface PreviewActions {
   onOpen?: () => void;
   onStar?: () => void;
   onDelete?: () => void;
-  onRename?: (name: string) => void;
+  onRename?: (name: string) => Promise<string | null> | string | null | void;
   onMove?: (dest: string) => void;
   onDuplicate?: () => void;
   onCopy?: (dest: string) => void;
@@ -182,5 +182,68 @@ describe("FilePreview", () => {
 
     expect(onCopy).toHaveBeenCalledTimes(1);
     expect(onCopy).toHaveBeenCalledWith("/Users/usr/Desktop");
+  });
+
+  it("uses an inline rename dialog instead of window.prompt, trims, and closes on success", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("hacked.png");
+    const onRename = vi.fn().mockResolvedValue(null);
+
+    renderPreview({}, { onRename });
+    await screen.findByRole("img");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    const input = screen.getByDisplayValue("photo.png");
+    fireEvent.change(input, { target: { value: "  new.png  " } });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(onRename).toHaveBeenCalledTimes(1);
+    });
+    expect(onRename).toHaveBeenCalledWith("new.png");
+    expect(promptSpy).not.toHaveBeenCalled();
+    expect(screen.queryByDisplayValue("new.png")).not.toBeInTheDocument();
+  });
+
+  it("keeps the inline rename dialog open and shows the error when the rename fails", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const onRename = vi
+      .fn()
+      .mockResolvedValue("A file or folder with that name already exists.");
+
+    renderPreview({}, { onRename });
+    await screen.findByRole("img");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("photo.png"), {
+      target: { value: "new.png" },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    expect(
+      await screen.findByText("A file or folder with that name already exists."),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("new.png")).toBeInTheDocument();
+    expect(onRename).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not submit a blank name through the inline rename dialog", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const onRename = vi.fn().mockResolvedValue(null);
+
+    renderPreview({}, { onRename });
+    await screen.findByRole("img");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("photo.png"), {
+      target: { value: "   " },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("button", { name: "Rename" }).length).toBe(2);
   });
 });

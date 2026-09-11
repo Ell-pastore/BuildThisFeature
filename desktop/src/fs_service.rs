@@ -462,7 +462,16 @@ pub fn rename_item(allow_list: &AllowList, from: &str, new_name: &str) -> Result
     if destination == source {
         return Ok(());
     }
-    if destination.exists() {
+    // Case-only renames (e.g. "Report.pdf" -> "report.pdf") are valid on the
+    // default macOS case-insensitive filesystem, where the destination always
+    // "exists" as the same entry. Allow them without weakening the conflict
+    // check for genuinely different names; allow-list and parent binding are
+    // already enforced above.
+    let case_only = source
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        == Some(name.to_lowercase());
+    if destination.exists() && !case_only {
         return Err("A file or folder with that name already exists.".to_string());
     }
     fs::rename(&source, &destination).map_err(|e| format!("Unable to rename: {}", map_io_error(&e)))
@@ -2309,6 +2318,32 @@ mod tests {
         let err = rename_item(&allow, &str_of(&outside.child("c.txt")), "d.txt").unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
         assert!(outside.child("c.txt").is_file());
+    }
+
+    #[test]
+    fn rename_item_allows_case_only_rename() {
+        let root = TempDir::new("rn_case");
+        let allow = allow_for(&root);
+
+        write_file(&root.child("Report.PDF"), "x");
+        rename_item(&allow, &str_of(&root.child("Report.PDF")), "report.pdf").unwrap();
+
+        // true everywhere: in-place case change on a case-insensitive
+        // filesystem, plain rename on a case-sensitive filesystem
+        assert!(root.child("report.pdf").exists());
+    }
+
+    #[test]
+    fn rename_item_rejects_existing_destination() {
+        let root = TempDir::new("rn_conflict");
+        let allow = allow_for(&root);
+        write_file(&root.child("a.txt"), "a");
+        write_file(&root.child("b.txt"), "b");
+
+        let err = rename_item(&allow, &str_of(&root.child("a.txt")), "b.txt").unwrap_err();
+        assert_eq!(err, "A file or folder with that name already exists.".to_string());
+        assert!(root.child("a.txt").is_file());
+        assert!(root.child("b.txt").is_file());
     }
 
     #[test]
