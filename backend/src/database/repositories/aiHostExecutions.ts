@@ -112,6 +112,8 @@ export interface HostExecutionRecord {
   updatedAt: Date;
   expiresAt: Date;
   executedAt: Date | null;
+  /** Owning approving tool approval (set only for approved host writes, §6.9). */
+  approvalId: string | null;
 }
 
 /** Input for creating a NEW pending host execution. */
@@ -132,6 +134,9 @@ export interface CreateHostExecutionInput {
   round: number;
   /** Host-execution window bound; after this instant a pending row is expired. */
   expiresAt: Date;
+  /** Owner of the approving tool approval this write executes (§6.9), or
+   *  `null` for a normal ungated host-delegated read. */
+  approvalId: string | null;
   /** Authoritative "now" for timestamps + expiry checks (injectable). */
   now: Date;
 }
@@ -154,6 +159,7 @@ function toRecord(row: {
   updatedAt: Date;
   expiresAt: Date;
   executedAt: Date | null;
+  approvalId: string | null;
 }): HostExecutionRecord {
   return {
     id: row.id,
@@ -169,6 +175,7 @@ function toRecord(row: {
     updatedAt: row.updatedAt,
     expiresAt: row.expiresAt,
     executedAt: row.executedAt,
+    approvalId: row.approvalId,
   };
 }
 
@@ -217,6 +224,7 @@ export async function createHostExecution(
         updatedAt: input.now,
         expiresAt: input.expiresAt,
         executedAt: null,
+        approvalId: input.approvalId,
       },
     });
     return toRecord(created);
@@ -264,6 +272,30 @@ export async function getPendingHostExecution(
       messageId,
       toolName,
       callId,
+      status: HostExecutionStatus.Pending,
+    },
+  });
+  return row === null ? null : toRecord(row);
+}
+
+/**
+ * Load the ONE `pending` host execution linked to an approving tool approval,
+ * or `null` when none is pending (approved host writes, §6.9). An approval is
+ * SINGLE-USE: at most one pending execution may be authorized by it (enforced
+ * by the partial unique index on `(approval_id) WHERE status = 'pending'` in
+ * the migration). This read makes a re-submitted approval-resume IDEMPOTENT:
+ * a second resume surfaces the FIRST pending execution instead of attempting
+ * a second row. Ownership is enforced by the `userId` predicate.
+ */
+export async function getPendingHostExecutionByApproval(
+  userId: string,
+  approvalId: string,
+): Promise<HostExecutionRecord | null> {
+  const db = getDatabase();
+  const row = await db.aiHostExecution.findFirst({
+    where: {
+      userId,
+      approvalId,
       status: HostExecutionStatus.Pending,
     },
   });

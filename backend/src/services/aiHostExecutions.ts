@@ -6,11 +6,18 @@
  * The contract is SMALL and provider-independent:
  *
  *   - CREATE validates the request BEFORE any write: the ids are UUID-shaped,
- *     `toolName` must be a REGISTERED tool, that tool must NOT declare
- *     `requiresApproval: true` (approval-gated tools are never host-delegated:
- *     they stay behind the Phase 10.28 approval flow), `arguments` must
- *     satisfy the tool's `inputSchema`, and `expiresAt` must be a future
- *     instant.
+ *     `toolName` must be a REGISTERED tool, THE TOOL MUST MATCH ITS GATE
+ *     (ungated reads do NOT carry an `approvalId`; approved writes MUST — the
+ *     container is what makes a deferred request host-delegable without first
+ *     "executing" it through the Phase 10.28 resume), `arguments` must satisfy
+ *     the tool's `inputSchema`, and `expiresAt` must be a future instant.
+ *   - APPROVAL-LINKED WRITES (§6.9, today only `move_file`) additionally bind
+ *     the execution to a PENDING, user-owned, unexpired approval whose stored
+ *     tool name and arguments EXACTLY match the deferred call. The link is
+ *     single-use: at most one pending execution per approval (DB partial unique
+ *     index), and the approval is consumed by `persistentAgentTurn.seal()` the
+ *     same transaction the execution seals — so an approved move runs exactly
+ *     once, then the approval is terminal.
  *   - SUBMIT is a single-use seal via the repository (`sealHostExecution`):
  *     the row becomes `executed` with `executed_at` stamped and can never be
  *     replayed. Expiry is enforced at the seal boundary.
@@ -42,13 +49,17 @@ import {
   createHostExecution,
   getHostExecution,
   getPendingHostExecution,
+  getPendingHostExecutionByApproval,
   listHostExecutionsForConversations as listHostExecutionsForConversationsRepo,
   listPendingHostExecutions as listPendingHostExecutionsRepo,
   sealHostExecution,
   type HostExecutionRecord,
 } from "../database/repositories/aiHostExecutions.js";
 import {
+  ToolApprovalExpiredError,
   ToolApprovalInvalidArgumentsError,
+  assertToolApprovalExecutable,
+  getToolApproval,
   validateToolApprovalArguments,
 } from "./aiToolApprovals.js";
 
@@ -61,12 +72,24 @@ export {
   HostExecutionNotFoundError,
   getHostExecution,
   getPendingHostExecution,
+  getPendingHostExecutionByApproval,
   type HostExecutionRecord,
 };
 
 // ---------------------------------------------------------------------------
 // Contract errors (application-level gates)
 // ---------------------------------------------------------------------------
+
+/**
+ * Registered APPROVED-WRITE tools that run on the DESKTOP HOST (§6.9). Only
+ * the tools in this container may be created with an `approvalId`: they defer
+ * behind a host execution the moment their approval is granted, instead of
+ * resuming through the Phase 10.28 executor. The container is deliberately
+ * minimal and grows one blessed tool at a time.
+ */
+export const HOST_DELEGATED_APPROVED_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  "move_file",
+]);
 
 /** Thrown when a request cannot form a valid host execution. */
 export class HostExecutionValidationError extends Error {
@@ -112,6 +135,35 @@ export class HostExecutionInvalidArgumentsError extends Error {
   }
 }
 
+/**
+ * Thrown when a create request with an `approvalId` cannot bind to the
+ * approving approval (approved host writes, §6.9). The `.kind` discriminates
+ * the exact reason for API mapping and tests.
+ */
+export class HostExecutionApprovalError extends Error {
+  readonly code = "host-execution/approval";
+  readonly kind:
+    | "missing"
+    | "not-pending"
+    | "expired"
+    | "not-owned"
+    | "tool-mismatch"
+    | "arguments-mismatch"
+    | "required"
+    | "not-allowed";
+  readonly toolName?: string;
+  constructor(
+    kind: HostExecutionApprovalError["kind"],
+    message: string,
+    toolName?: string,
+  ) {
+    super(message);
+    this.name = "HostExecutionApprovalError";
+    this.kind = kind;
+    if (toolName !== undefined) this.toolName = toolName;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------
@@ -131,6 +183,10 @@ export interface CreateHostExecutionRequest {
   round: unknown;
   /** Untrusted tool arguments — validated against the tool's schema. */
   arguments: unknown;
+  /** The granting approval for an APPROVED WRITE (§6.9), or undefined for a
+   *  normal ungated host-delegated request. Validated against the approval's
+   *  stored tool name + arguments and bound single-use to this execution. */
+  approvalId?: string;
   /** End of the host-execution window, as a `Date` strictly after `now`. */
   expiresAt: unknown;
   /** Injectable "now"; defaults to `new Date()`. */
@@ -139,13 +195,28 @@ export interface CreateHostExecutionRequest {
 
 /**
  * Create a pending host execution after validating the FULL request against
- * the tool registry: known tool, NOT approval-gated, schema-valid arguments,
- * a future expiry. Defers the pending-row write to the repository (which
- * enforces the one-pending-per-(message, tool, call) rule and ownership).
+ * the tool registry: known tool, schema-valid arguments (gated by the tool's
+ * approval posture — see below), a future expiry, and, for APPROVED WRITES,
+ * a matching pendable approval owned by this user. Defers the pending-row
+ * write to the repository (which enforces the one-pending-per-(message,
+ * tool, call) rule, the one-pending-per-(approval) partial unique index, and
+ * ownership).
+ *
+ * Gate pairing (§6.9): `approvalId` is REQUIRED exactly for the approved-write
+ * container `HOST_DELEGATED_APPROVED_WRITE_TOOLS` and FORBIDDEN for every
+ * other tool. Approval-gated tools outside the container are not host-delegable
+ * (they belong to the Phase 10.28 approval flow), and ungated reads must not
+ * masquerade as approved writes.
  *
  * @throws `HostExecutionValidationError` on malformed ids / expiry.
  * @throws `HostExecutionUnknownToolError` for unregistered tool names.
- * @throws `HostExecutionNotDelegableError` when the tool is approval-gated.
+ * @throws `HostExecutionNotDelegableError` when the tool is approval-gated
+ *         AND outside the approved-write container.
+ * @throws `HostExecutionApprovalError` (kind `required` / `not-allowed`) when
+ *         the approvalId ↔ tool gate pairing is violated.
+ * @throws `HostExecutionApprovalError` (kinds `missing`, `expired`,
+ *         `not-pending`, `not-owned`, `tool-mismatch`, `arguments-mismatch`)
+ *         when the provided approval cannot authorize this exact call.
  * @throws `HostExecutionInvalidArgumentsError` for schema-invalid arguments.
  * @throws the repository's duplicate/DB errors unchanged.
  */
@@ -194,8 +265,24 @@ export async function createAiHostExecution(
     throw new HostExecutionUnknownToolError(request.toolName);
   }
 
-  if (requiresToolApproval(definition)) {
+  const isApprovedWrite = HOST_DELEGATED_APPROVED_WRITE_TOOLS.has(definition.name);
+  const hasApprovalId = request.approvalId !== undefined;
+  if (isApprovedWrite && !hasApprovalId) {
+    throw new HostExecutionApprovalError(
+      "required",
+      `Tool "${definition.name}" is an approved host write and requires an approvalId.`,
+      definition.name,
+    );
+  }
+  if (!isApprovedWrite && requiresToolApproval(definition)) {
     throw new HostExecutionNotDelegableError(definition.name);
+  }
+  if (!isApprovedWrite && hasApprovalId) {
+    throw new HostExecutionApprovalError(
+      "not-allowed",
+      `Tool "${definition.name}" is not an approved host write and cannot carry an approvalId.`,
+      definition.name,
+    );
   }
 
   try {
@@ -208,6 +295,53 @@ export async function createAiHostExecution(
     throw error;
   }
 
+  let approvalId: string | null = null;
+  if (request.approvalId !== undefined) {
+    if (!isUuid(request.approvalId)) {
+      throw new HostExecutionValidationError("A valid approvalId is required.");
+    }
+    const approval = await getToolApproval(request.userId, request.approvalId);
+    if (approval === null) {
+      throw new HostExecutionApprovalError(
+        "missing",
+        "The approving tool approval does not exist for this user.",
+      );
+    }
+    try {
+      assertToolApprovalExecutable(approval, now);
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "The approving tool approval is not pending.";
+      if (error instanceof ToolApprovalExpiredError) {
+        throw new HostExecutionApprovalError(
+          "expired",
+          `The approving tool approval is expired: ${reason}`,
+          approval.toolName,
+        );
+      }
+      throw new HostExecutionApprovalError(
+        "not-pending",
+        `The approving tool approval cannot authorize this execution: ${reason}`,
+        approval.toolName,
+      );
+    }
+    if (approval.toolName !== definition.name) {
+      throw new HostExecutionApprovalError(
+        "tool-mismatch",
+        `Approval "${approval.id}" authorizes tool "${approval.toolName}", not "${definition.name}".`,
+        definition.name,
+      );
+    }
+    if (!deepEqualJson(approval.arguments, request.arguments)) {
+      throw new HostExecutionApprovalError(
+        "arguments-mismatch",
+        `Approval "${approval.id}" authorizes different tool arguments.`,
+        definition.name,
+      );
+    }
+    approvalId = approval.id;
+  }
+
   return createHostExecution({
     userId: request.userId,
     conversationId: request.conversationId,
@@ -217,6 +351,7 @@ export async function createAiHostExecution(
     arguments: request.arguments,
     round: request.round,
     expiresAt,
+    approvalId,
     now,
   });
 }
@@ -390,4 +525,20 @@ export async function listConversationHostExecutions(
 
 function isUuid(value: unknown): value is string {
   return typeof value === "string" && CONVERSATION_ID_PATTERN.test(value);
+}
+
+// ---------------------------------------------------------------------------
+// Ordered JSON equality (approved-write argument binding, §6.9)
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical deep-equality for approving a deferred host call against the
+ * approval's STORED arguments: both sides are valid JSON values, so a
+ * recursively-ordered stringify is a UNSAFE-FALLBACK-free, locale-independent
+ * exact comparison. Used by `createAiHostExecution` to guarantee the host
+ * executes EXACTLY the operation the user approved (the approval's persisted
+ * `arguments` must equal the deferred call's `arguments` field-for-field).
+ */
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }

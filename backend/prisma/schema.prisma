@@ -635,9 +635,10 @@ model AiToolApproval {
   expiresAt      DateTime @map("expires_at") @db.Timestamptz
   decidedAt      DateTime? @map("decided_at") @db.Timestamptz // set only on a terminal decision
 
-  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  message      AiMessage     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation  AiConversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message       AiMessage         @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  hostExecutions AiHostExecution[] // one pending host execution per approval (single-use), §6.9
 
   @@index([userId, status, createdAt]) // user's approvals by state
   @@index([conversationId, createdAt]) // per-conversation approval history
@@ -646,18 +647,24 @@ model AiToolApproval {
 }
 
 // ---------------------------------------------------------------------------
-// Host-execution round-trips (Phase 10.39). SCHEMA.md §6.9 — a scoped request
-// for the DESKTOP HOST to execute one of the AI's ungated (read-only) tool
-// calls locally, because that call's executor is `host-delegated` in THIS
-// process. Unlike approvals (§6.8), the record carries a `round` (the loop
-// round in which the request was batched) and a `callId` (the provider intent
-// it belongs to); `executed_at` is stamped when the host's result is sealed
-// on resume. The record stores ONLY the validated tool arguments identifying
-// the requested operation — never file contents, provider responses, or
-// results. Records are transient conversation state (CASCADE like §6.8).
+// Host-execution round-trips (Phase 10.39 + approved writes). SCHEMA.md §6.9 —
+// a scoped request for the DESKTOP HOST to execute one of the AI's tool calls
+// locally, because that call's executor is `host-delegated` in THIS process.
+// Unlike approvals (§6.8), the record carries a `round` (the loop round in
+// which the request was batched) and a `callId` (the provider intent it
+// belongs to); `executed_at` is stamped when the host's result is sealed on
+// resume. For an APPROVED WRITE (`approval_id` set — today only `move_file`),
+// it additionally encodes the owning approval: the submit path seals the
+// execution AND consumes that approval together, so a single approved
+// operation can never run twice. The record stores ONLY the validated tool
+// arguments identifying the requested operation — never file contents,
+// provider responses, or results. Records are transient conversation state
+// (CASCADE like §6.8).
 // CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.9:
 //   - CHECK (status IN ('pending','executed','expired'))
 //   - partial (user_id, expires_at) WHERE status = 'pending' — pending queue
+//   - partial UNIQUE (approval_id) WHERE approval_id IS NOT NULL AND
+//     status = 'pending' — one pending execution per approval (single-use)
 // State machine (application-enforced, §6.9): pending → executed (single-use
 // seal on resume) | expired.
 // ---------------------------------------------------------------------------
@@ -676,13 +683,16 @@ model AiHostExecution {
   updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz
   expiresAt      DateTime @map("expires_at") @db.Timestamptz // sealed single-use window
   executedAt     DateTime? @map("executed_at") @db.Timestamptz // set on single-use seal
+  approvalId     String?   @map("approval_id") @db.Uuid // the approving tool approval this execution authorizes (§6.9)
 
-  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  message      AiMessage     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation AiConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      AiMessage      @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  approval     AiToolApproval? @relation(fields: [approvalId], references: [id], onDelete: Cascade)
 
   @@index([userId, status, createdAt]) // user's executions by state
   @@index([conversationId, createdAt]) // per-conversation execution history
   @@index([messageId]) // per-turn executions
+  @@index([approvalId]) // approval-linked pending lookup (§6.9)
   @@map("ai_host_executions")
 }

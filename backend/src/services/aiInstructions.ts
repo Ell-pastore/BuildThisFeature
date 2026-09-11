@@ -47,6 +47,7 @@ import {
   ToolApprovalNotExecutableError,
 } from "./aiToolApprovals.js";
 import {
+  HostExecutionApprovalError,
   HostExecutionExpiredError,
   HostExecutionNotFoundError,
   HostExecutionNotExecutableError,
@@ -389,6 +390,13 @@ export function mapAgentTurnError(error: unknown): unknown {
     error instanceof HostExecutionNotExecutableError ||
     error instanceof HostExecutionValidationError
   ) {
+    return AppError.badRequest(error.message);
+  }
+  // §6.9 approved-write binding failures: an approval that cannot authorize
+  // the deferred host call (missing/foreign, not pending, expired, wrong tool,
+  // different arguments, or gate-pairing violations) is a 400 — nothing is
+  // deferred and nothing executes.
+  if (error instanceof HostExecutionApprovalError) {
     return AppError.badRequest(error.message);
   }
   return error;

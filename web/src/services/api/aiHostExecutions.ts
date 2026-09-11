@@ -14,9 +14,13 @@
  *     (`isTauriEnv()`). In a plain browser it returns `null` and the caller
  *     keeps the paused conversation state — the backend never receives an
  *     execution result it cannot attribute.
- *   - Only the four backend-registered READ tools are executable here
- *     (`list_directory`, `search_files`, `get_file_metadata`, `read_file`);
+ *   - Only the four backend-registered READ tools plus the single
+ *     APPROVED-WRITE tool are executable here (`list_directory`,
+ *     `search_files`, `get_file_metadata`, `read_file`, and `move_file`);
  *     anything else is submitted as a categorized failure, never executed.
+ *     `move_file` is bound 1:1 to a user-approved tool approval on the backend
+ *     (it REJECTS executions without an approval id) — the driver never
+ *     decides what to move, it only carries out the exact approved paths.
  *   - Results are submitted with a bounded iteration count. Every execution
  *     row is sealed once (pending → executed/expired) by the backend on
  *     resume, so a fresh resume cannot double-execute.
@@ -49,6 +53,19 @@ export const HOST_EXECUTABLE_READ_TOOLS: ReadonlySet<string> = new Set([
   "search_files",
   "get_file_metadata",
   "read_file",
+]);
+
+/**
+ * The single APPROVED-WRITE tool the desktop host executes (§6.9). The
+ * backend only defers it under an executable, single-use approval, so
+ * arriving here means the OPERATION was already user-approved.
+ */
+export const HOST_EXECUTABLE_APPROVED_WRITE_TOOLS: ReadonlySet<string> = new Set(["move_file"]);
+
+/** Every tool the driver actually executes; anything else is a categorized failure. */
+export const HOST_EXECUTABLE_TOOLS: ReadonlySet<string> = new Set([
+  ...HOST_EXECUTABLE_READ_TOOLS,
+  ...HOST_EXECUTABLE_APPROVED_WRITE_TOOLS,
 ]);
 
 /** Bounded resume churn: a stalled/slow turn can never loop forever. */
@@ -88,7 +105,7 @@ function bytesToBase64(bytes: Uint8Array): string {
  * returning the tool handler's canonical result shape. Throws when the
  * operation cannot be executed; the caller categorizes the failure.
  */
-export async function executeHostReadExecution(
+export async function executeHostExecution(
   execution: HostExecutionRequest,
 ): Promise<unknown> {
   const provider = getFilesystemProvider();
@@ -110,6 +127,12 @@ export async function executeHostReadExecution(
       const bytes = await provider.readFile(path);
       return { encoding: "base64", data: bytesToBase64(bytes) };
     }
+    case "move_file": {
+      const sourcePath = requireArgumentString(execution.arguments, "sourcePath");
+      const destinationPath = requireArgumentString(execution.arguments, "destinationPath");
+      await provider.moveFile(sourcePath, destinationPath);
+      return { movedFrom: sourcePath, movedTo: destinationPath };
+    }
     default:
       throw new Error(`Unsupported host-execution tool "${execution.toolName}".`);
   }
@@ -120,7 +143,7 @@ export async function buildHostExecutionSubmission(
   execution: HostExecutionRequest,
 ): Promise<AiHostExecutionSubmission> {
   try {
-    const result = await executeHostReadExecution(execution);
+    const result = await executeHostExecution(execution);
     return { executionId: execution.executionId, ok: true, result };
   } catch {
     return {

@@ -243,6 +243,162 @@ vi.mock("../database/repositories/aiToolApprovals.js", () => ({
 }));
 
 // ---------------------------------------------------------------------------
+// In-memory host-execution service seam (§6.9 approved host writes). The
+// service-level functions persistentAgentTurn calls are scripted against a
+// small row store that mirrors create → get-pending-by-approval → seal
+// (single-use). The REAL contract classes and executable assertions stay real.
+// ---------------------------------------------------------------------------
+
+const hostStore = vi.hoisted(() => {
+  type Row = {
+    id: string;
+    userId: string;
+    conversationId: string;
+    messageId: string;
+    toolName: string;
+    callId: string;
+    arguments: unknown;
+    round: number;
+    status: string;
+    createdAt: Date;
+    updatedAt: Date;
+    expiresAt: Date;
+    executedAt: Date | null;
+    approvalId: string | null;
+  };
+  const Status = {
+    Pending: "pending",
+    Executed: "executed",
+    Expired: "expired",
+  } as const;
+
+  class NotFoundError extends Error {
+    constructor() {
+      super("Host execution not found for this user.");
+      this.name = "HostExecutionNotFoundError";
+    }
+  }
+  class DuplicateError extends Error {
+    constructor() {
+      super("A pending host execution already exists for this approval.");
+      this.name = "HostExecutionDuplicateError";
+    }
+  }
+  class AlreadyExecutedError extends Error {
+    readonly status: string;
+    constructor(status: string) {
+      super(`This host execution is already ${status}.`);
+      this.name = "HostExecutionAlreadyExecutedError";
+      this.status = status;
+    }
+  }
+  class ExpiredError extends Error {
+    constructor() {
+      super("This host execution has expired.");
+      this.name = "HostExecutionExpiredError";
+    }
+  }
+
+  const rows: Row[] = [];
+  let seq = 0;
+  function reset(): void {
+    rows.length = 0;
+    seq = 0;
+  }
+
+  async function createAiHostExecution(req: {
+    userId: string;
+    conversationId: string;
+    messageId: string;
+    toolName: string;
+    callId: string;
+    arguments: unknown;
+    round: number;
+    expiresAt: Date;
+    now: Date;
+    approvalId?: string;
+  }): Promise<Row> {
+    const duplicate = rows.find(
+      (r) =>
+        r.approvalId !== null &&
+        r.approvalId === req.approvalId &&
+        r.status === Status.Pending,
+    );
+    if (duplicate !== undefined) throw new DuplicateError();
+    seq += 1;
+    const created: Row = {
+      id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(seq).padStart(12, "0")}`,
+      userId: req.userId,
+      conversationId: req.conversationId,
+      messageId: req.messageId,
+      toolName: req.toolName,
+      callId: req.callId,
+      arguments: req.arguments,
+      round: req.round,
+      status: Status.Pending,
+      createdAt: req.now,
+      updatedAt: req.now,
+      expiresAt: req.expiresAt,
+      executedAt: null,
+      approvalId: req.approvalId ?? null,
+    };
+    rows.push(created);
+    return created;
+  }
+
+  async function getPendingHostExecutionByApproval(
+    userId: string,
+    approvalId: string,
+  ): Promise<Row | null> {
+    return (
+      rows.find(
+        (r) => r.userId === userId && r.approvalId === approvalId && r.status === Status.Pending,
+      ) ?? null
+    );
+  }
+
+  async function getAiHostExecution(userId: string, executionId: string): Promise<Row | null> {
+    return rows.find((r) => r.userId === userId && r.id === executionId) ?? null;
+  }
+
+  async function submitHostExecution(userId: string, executionId: string, now: Date): Promise<Row> {
+    const target = rows.find((r) => r.userId === userId && r.id === executionId);
+    if (target === undefined) throw new NotFoundError();
+    if (target.status !== Status.Pending) throw new AlreadyExecutedError(target.status);
+    if (now.getTime() >= target.expiresAt.getTime()) {
+      target.status = Status.Expired;
+      target.updatedAt = now;
+      throw new ExpiredError();
+    }
+    target.status = Status.Executed;
+    target.executedAt = now;
+    target.updatedAt = now;
+    return target;
+  }
+
+  return {
+    rows,
+    reset,
+    Status,
+    createAiHostExecution,
+    getPendingHostExecutionByApproval,
+    getAiHostExecution,
+    submitHostExecution,
+  };
+});
+
+vi.mock("./aiHostExecutions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./aiHostExecutions.js")>();
+  return {
+    ...actual,
+    createAiHostExecution: hostStore.createAiHostExecution,
+    getPendingHostExecutionByApproval: hostStore.getPendingHostExecutionByApproval,
+    getAiHostExecution: hostStore.getAiHostExecution,
+    submitHostExecution: hostStore.submitHostExecution,
+  };
+});
+
+// ---------------------------------------------------------------------------
 // Agent-conversation persistence (the eager turn transcript), as Phase 10.8.
 // ---------------------------------------------------------------------------
 
@@ -441,6 +597,7 @@ async function createApprovedApproval(
 
 beforeEach(() => {
   approvalRepo.reset();
+  hostStore.reset();
   vi.clearAllMocks();
   conversationMocks.loadAgentConversationState
     .mockReset()
@@ -753,5 +910,180 @@ describe("instruction flow — approvalId body validation", () => {
         approvalId: CONVERSATION_ID,
       }),
     ).rejects.toMatchObject({ status: 400, code: "common/bad-request" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Approved host writes (§6.9): an approved move_file DEFERS behind a host
+//    execution (never runs through the executor here), and the approval is
+//    consumed only on the subsequent host-execution resume — exactly once.
+// ---------------------------------------------------------------------------
+
+describe("instruction flow — approved host write (move_file) defers to the host (§6.9)", () => {
+  const MOVED_ARGS = {
+    sourcePath: "/home/receipt.pdf",
+    destinationPath: "/home/docs/receipt.pdf",
+  };
+
+  /** Seed an approved, unexpired `move_file` approval directly into the repo. */
+  async function seedApprovedMoveFileApproval(): Promise<string> {
+    const id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const now = new Date();
+    approvalRepo.rows.push({
+      id,
+      userId: USER_ID,
+      conversationId: CONVERSATION_ID,
+      messageId: MESSAGE_ID,
+      toolName: "move_file",
+      arguments: MOVED_ARGS,
+      status: approvalRepo.Status.Approved,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(Date.now() + 60_000),
+      decidedAt: now,
+    });
+    return id;
+  }
+
+  it("DEFERS an approved move_file: pauses with a pending execution, nothing executes here, approval unconsumed", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const filesystem = makeFilesystem();
+    const { generate } = scriptedProvider([{ text: "must not run" }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }, { filesystem }));
+
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+
+    // The approved operation did NOT resume through the executor: the move was
+    // recorded as ONE pending host execution for the desktop host instead.
+    expect(filesystem.calls).toEqual([]);
+    expect(generate).not.toHaveBeenCalled();
+    expect(response.conversationId).toBe(CONVERSATION_ID);
+    expect(response.turn.pendingApprovals).toEqual([]);
+    expect(hostStore.rows).toHaveLength(1);
+    const pending = response.turn.pendingExecutions;
+    expect(pending).toHaveLength(1);
+    if (pending[0] === undefined) return;
+    expect(pending[0]).toMatchObject({
+      executionId: hostStore.rows[0]!.id,
+      toolName: "move_file",
+      arguments: MOVED_ARGS,
+    });
+    // The eager transcript persisted THIS deferred round by design — no
+    // finalize, nothing compensated (a pause, not a failure).
+    expect(conversationMocks.beginAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: USER_ID,
+        conversationId: CONVERSATION_ID,
+        toolCalls: [{ id: approvalId, toolName: "move_file", input: MOVED_ARGS }],
+      }),
+    );
+    expect(conversationMocks.completeAgentTurn).not.toHaveBeenCalled();
+    expect(conversationMocks.cancelAgentTurn).not.toHaveBeenCalled();
+    // The approval is NOT consumed at defer time — it stays decidable until
+    // the execution actually SEALS on the host-execution resume.
+    expect(approvalRepo.rows[0]?.status).toBe("approved");
+    expect(approvalRepo.rows[0]?.expiresAt.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it("SEALS the execution AND consumes the approval on host resume, then completes the turn", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const filesystem = makeFilesystem();
+    const { generate, requests } = scriptedProvider([{ text: "Moved." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }, { filesystem }));
+
+    // 1. The approved move pauses as a pending execution (real flow).
+    const paused = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+    const executionId = paused.turn.pendingExecutions[0]!.executionId;
+    expect(hostStore.rows[0]?.status).toBe("pending");
+
+    // 2. The desktop host moves the file locally; its result is submitted.
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after the requested operations have been executed.",
+      resumeExecutions: [
+        {
+          executionId,
+          ok: true,
+          result: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+        },
+      ],
+    });
+
+    // Sealed exactly once and the loop seeded the host's result as context.
+    expect(hostStore.rows[0]?.status).toBe("executed");
+    expect(hostStore.rows[0]?.executedAt).not.toBeNull();
+    expect(requests[0]?.toolResults).toEqual([
+      {
+        ok: true,
+        callId: approvalId,
+        data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+      },
+    ]);
+    expect(response.turn.finalText).toBe("Moved.");
+    expect(response.turn.pendingExecutions).toEqual([]);
+    // The approval was consumed ONLY AFTER successful sealing.
+    expect(approvalRepo.rows[0]?.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("is IDEMPOTENT on a re-submitted approval resume: reuses the first pending execution", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const { generate } = scriptedProvider([{ text: "must not run" }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }));
+
+    const first = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+    const firstId = first.turn.pendingExecutions[0]!.executionId;
+    expect(hostStore.rows).toHaveLength(1);
+
+    const again = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+
+    expect(hostStore.rows).toHaveLength(1); // no second execution for the same approval
+    expect(again.turn.pendingExecutions).toHaveLength(1);
+    expect(again.turn.pendingExecutions[0]?.executionId).toBe(firstId);
+    expect(conversationMocks.beginAgentTurn).toHaveBeenCalledTimes(1);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("refuses a SECOND host-execution submission (single-use seal) with 400", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const { generate } = scriptedProvider([{ text: "Once." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }));
+
+    const paused = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+    const executionId = paused.turn.pendingExecutions[0]!.executionId;
+
+    const submit = () =>
+      runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+        instruction: "Continue.",
+        resumeExecutions: [
+          {
+            executionId,
+            ok: true,
+            result: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+          },
+        ],
+      });
+
+    await submit();
+    // The sealed execution can never authorize a second submission.
+    await expect(submit()).rejects.toMatchObject({
+      status: 400,
+      code: "common/bad-request",
+    });
+    expect(hostStore.rows[0]?.status).toBe("executed");
+    expect(generate).toHaveBeenCalledTimes(1);
   });
 });

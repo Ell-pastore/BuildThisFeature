@@ -138,6 +138,9 @@ export interface FilesystemProvider {
   /** Copy an item (file, or folder recursively) into destDir, keeping its name. */
   copyItem(source: string, destDir: string): Promise<void>;
 
+  /** Move an item to an exact absolute destination path (the AI's move_file). */
+  moveFile(sourcePath: string, destinationPath: string): Promise<void>;
+
   /** Free/total space of the volume containing `path` (defaults to home). */
   diskUsage(path?: string): Promise<DiskUsage>;
 

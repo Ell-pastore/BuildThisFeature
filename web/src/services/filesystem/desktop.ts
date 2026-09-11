@@ -189,6 +189,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke("copy_item", { source, destDir });
   }
 
+  moveFile(sourcePath: string, destinationPath: string): Promise<void> {
+    return invoke("move_file", { source: sourcePath, destination: destinationPath });
+  }
+
   diskUsage(path?: string): Promise<DiskUsage> {
     return invoke<DiskUsage>("disk_usage", { path });
   }

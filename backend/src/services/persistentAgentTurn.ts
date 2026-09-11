@@ -83,8 +83,13 @@ import type { AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { ToolError, type ToolErrorCategory } from "../tools/errors.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
-import type { HostExecutionRequestInfo, InvokeToolOptions, ToolApprovalRequestInfo } from "./tools.js";
-import { invokeTool } from "./tools.js";
+import {
+  HOST_EXECUTION_WINDOW_MS,
+  invokeTool,
+  type HostExecutionRequestInfo,
+  type InvokeToolOptions,
+  type ToolApprovalRequestInfo,
+} from "./tools.js";
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import type { RawToolInput } from "../tools/handlers/handler.js";
 import {
@@ -95,9 +100,13 @@ import {
   type ToolApprovalRecord,
 } from "./aiToolApprovals.js";
 import {
+  HOST_DELEGATED_APPROVED_WRITE_TOOLS,
+  HostExecutionDuplicateError,
   HostExecutionNotFoundError,
   assertHostExecutionExecutable,
+  createAiHostExecution,
   getAiHostExecution,
+  getPendingHostExecutionByApproval,
   submitHostExecution,
   type HostExecutionRecord,
 } from "./aiHostExecutions.js";
@@ -263,6 +272,16 @@ function toTurnRecord(round: AgentLoopRound): AgentTurnRecord {
   };
 }
 
+/** The narrow pending-execution view a paused turn exposes to the caller (§6.9). */
+function toHostExecutionRequestInfo(record: HostExecutionRecord): HostExecutionRequestInfo {
+  return {
+    executionId: record.id,
+    toolName: record.toolName,
+    arguments: record.arguments,
+    expiresAt: record.expiresAt,
+  };
+}
+
 /** A validated, sealed host-execution resume, ready to seed a loop. */
 interface ResolvedHostResume {
   /** The ONE conversation all submitted executions belong to. */
@@ -307,6 +326,23 @@ async function resolveHostExecutionsResume(
   // Phase 2 — seal EVERY record exactly once (single-use; cannot be replayed).
   for (const { record } of resolved) {
     await submitHostExecution(userId, record.id, now);
+  }
+  // §6.9 — BEST-EFFORT approval consumption AFTER successful submission/sealing.
+  // Only an APPROVAL-LINKED execution (an approved host write, today move_file)
+  // consumes an approval, and it does so exactly here. The seal is the true
+  // single-use guarantee: a failed consume cannot un-seal the execution, and a
+  // later submit of the same execution is rejected as `already-executed`. This
+  // is the same single-request semantics caveat the Phase 10.30 approval
+  // execution path documents (consume is bookkeeping for the approval card).
+  for (const { record } of resolved) {
+    if (record.approvalId !== null) {
+      try {
+        await consumeToolApproval(userId, record.approvalId, now);
+      } catch {
+        // The approved operation already ran exactly once; never mask the
+        // executed turn with a bookkeeping failure.
+      }
+    }
   }
   const seeds: AgentToolResult[] = resolved.map(({ record, submission }) => {
     if (!submission.ok) {
@@ -473,6 +509,87 @@ export async function runPersistentTurn(
     const observed: AgentLoopRound[] = [];
     let resumeSeeded: { toolResult: AgentToolResult; approvedCall: AgentToolCall } | undefined;
     if (resumeRecord !== undefined) {
+      // §6.9 — APPROVED HOST WRITE (today only move_file): the approved
+      // operation does NOT resume through the Phase 10.28 executor (in this
+      // process that executor is the read-only host-delegated harness — it can
+      // never move files). Instead the turn PAUSES with one host execution
+      // bound 1:1 to this approval; the DESKTOP HOST then executes the exact
+      // approved arguments against the real filesystem. The approval is NOT
+      // consumed here — it is consumed only AFTER that execution SEALS on the
+      // later host-execution resume (§6.9), so "approved once" becomes
+      // "executed exactly once" atomically with the execution.
+      if (HOST_DELEGATED_APPROVED_WRITE_TOOLS.has(resumeRecord.toolName)) {
+        if (input.resumeHostExecutions !== undefined && input.resumeHostExecutions.length > 0) {
+          throw AppError.badRequest(
+            "Cannot submit host executions at the same time as an approval resume.",
+          );
+        }
+        const now = new Date();
+        let execution: HostExecutionRecord;
+        const existing = await getPendingHostExecutionByApproval(userId, resumeRecord.id);
+        if (existing !== null) {
+          // A RE-SUBMITTED approval resume is IDEMPOTENT: surface the FIRST
+          // pending execution instead of writing a second row (the DB partial
+          // unique index on the pending approval is the backstop, §6.9).
+          execution = existing;
+        } else {
+          const begun = await beginAgentTurn({
+            userId,
+            conversationId: resumeRecord.conversationId,
+            instruction: context.instruction,
+            maxToolRounds,
+            toolCalls: [
+              {
+                id: resumeRecord.id,
+                toolName: resumeRecord.toolName,
+                input: resumeRecord.arguments as RawToolInput,
+              },
+            ],
+          });
+          conversationId = begun.conversationId;
+          created = begun.created;
+          instructionMessageId = begun.instructionMessageId;
+          engaged = true;
+          roundSlots.push({ messageId: begun.messageId });
+          try {
+            execution = await createAiHostExecution(
+              {
+                userId,
+                conversationId: begun.conversationId,
+                messageId: begun.messageId,
+                toolName: resumeRecord.toolName,
+                callId: resumeRecord.id,
+                round: 1,
+                arguments: resumeRecord.arguments,
+                approvalId: resumeRecord.id,
+                expiresAt: new Date(now.getTime() + HOST_EXECUTION_WINDOW_MS),
+                now,
+              },
+              { registry: options.registry },
+            );
+          } catch (error) {
+            if (error instanceof HostExecutionDuplicateError) {
+              // A racing resume created the execution first — reuse it.
+              const raced = await getPendingHostExecutionByApproval(userId, resumeRecord.id);
+              if (raced === null) throw error;
+              execution = raced;
+            } else {
+              throw error;
+            }
+          }
+        }
+        // PAUSE, like the read-gate: the eager rows (conversation, and this
+        // round's persisted message when created above) are committed BY
+        // DESIGN and never compensated — there is simply no final reply yet.
+        // The AI resumes when the host's sealed result is submitted.
+        return {
+          conversationId: execution.conversationId,
+          created,
+          state: createConversationState({ instruction: context.instruction, maxToolRounds }),
+          pendingApprovals: [],
+          pendingExecutions: [toHostExecutionRequestInfo(execution)],
+        };
+      }
       const executed = await invokeTool(
         c,
         resumeRecord.toolName,

@@ -18,6 +18,7 @@ const provider = vi.hoisted(() => ({
   readFile: vi.fn(),
   writeFile: vi.fn(),
   copyItem: vi.fn(),
+  moveFile: vi.fn(),
   diskUsage: vi.fn(),
   searchFiles: vi.fn(),
   trashItem: vi.fn(),
@@ -158,6 +159,55 @@ describe("host-execution driver (Phase 10.39)", () => {
       ok: true,
       result: { encoding: "base64", data: "aGk=" },
     });
+  });
+
+  it("executes an approved move_file through the local provider with the canonical result shape", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    provider.moveFile.mockResolvedValue(undefined);
+
+    const submission = await buildHostExecutionSubmission(
+      execution({
+        toolName: "move_file",
+        arguments: { sourcePath: "/home/receipt.pdf", destinationPath: "/home/docs/receipt.pdf" },
+      }),
+    );
+
+    // The EXACT approved paths ran — the driver decides nothing.
+    expect(provider.moveFile).toHaveBeenCalledWith("/home/receipt.pdf", "/home/docs/receipt.pdf");
+    expect(submission).toEqual({
+      executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      ok: true,
+      result: { movedFrom: "/home/receipt.pdf", movedTo: "/home/docs/receipt.pdf" },
+    });
+  });
+
+  it("submits a categorized failure when the approved move_file cannot be executed", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    provider.moveFile.mockRejectedValue(new Error("destination exists"));
+
+    const submission = await buildHostExecutionSubmission(
+      execution({
+        toolName: "move_file",
+        arguments: { sourcePath: "/home/receipt.pdf", destinationPath: "/home/docs/receipt.pdf" },
+      }),
+    );
+
+    expect(provider.moveFile).toHaveBeenCalledTimes(1);
+    expect(submission).toEqual({
+      executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      ok: false,
+      error: { code: "tools/host-execution-failed", category: "tools" },
+    });
+  });
+
+  it("submits a failure for missing move_file paths (nothing executed)", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    const submission = await buildHostExecutionSubmission(
+      execution({ toolName: "move_file", arguments: { sourcePath: "" } }),
+    );
+
+    expect(provider.moveFile).not.toHaveBeenCalled();
+    expect(submission.ok).toBe(false);
   });
 
   it("submits a categorized failure when the local operation cannot be executed", async () => {

@@ -450,6 +450,7 @@ describe("invokeTool — host-execution gate (Phase 10.39)", () => {
       updatedAt: new Date("2026-01-01T00:00:00.000Z"),
       expiresAt: new Date("2099-01-01T00:00:00.000Z"),
       executedAt: null,
+      approvalId: null,
     };
   }
 
