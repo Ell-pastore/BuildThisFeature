@@ -1479,11 +1479,25 @@ pub fn storage_by_category(
 // Duplicate
 // ---------------------------------------------------------------------------
 
+/// Maximum number of " (copy n)" collision candidates to try before returning
+/// an error instead of failing to find a free name. This is the same safety
+/// ceiling the duplicate operation has always used, kept explicit so the
+/// candidate search stays bounded.
+pub const DUPLICATE_NAME_MAX_COLLISIONS: u32 = 1_000_000;
+
 /// Compute a collision-safe duplicate name inside `parent` for `name`.
 ///
 /// Produces `name (copy).ext`, then `name (copy 2).ext`, `name (copy 3).ext`, …
 /// Never overwrites an existing item. Component-aware Path comparison.
-fn unique_duplicate_name(parent: &Path, name: &str) -> PathBuf {
+///
+/// Returns an error (never panics) once `max_collisions` candidate names have
+/// all been taken, so an unduplicable item fails cleanly instead of crashing
+/// the process.
+fn unique_duplicate_name(
+    parent: &Path,
+    name: &str,
+    max_collisions: u32,
+) -> Result<PathBuf, String> {
     let dot_pos = name.rfind('.');
     let (stem, ext) = match dot_pos {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
@@ -1492,18 +1506,18 @@ fn unique_duplicate_name(parent: &Path, name: &str) -> PathBuf {
 
     let first = parent.join(format!("{} (copy){}", stem, ext));
     if !first.exists() {
-        return first;
+        return Ok(first);
     }
 
     let mut n = 2u32;
     loop {
         let candidate = parent.join(format!("{} (copy {}){}", stem, n, ext));
         if !candidate.exists() {
-            return candidate;
+            return Ok(candidate);
         }
         n += 1;
-        if n > 1_000_000 {
-            panic!("Unable to allocate a unique duplicate name");
+        if n > max_collisions {
+            return Err("Unable to allocate a unique duplicate name".to_string());
         }
     }
 }
@@ -1537,7 +1551,7 @@ pub fn duplicate_item(allow_list: &AllowList, source: &str) -> Result<String, St
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| "Invalid source item".to_string())?;
 
-    let destination = unique_duplicate_name(parent, &name);
+    let destination = unique_duplicate_name(parent, &name, DUPLICATE_NAME_MAX_COLLISIONS)?;
 
     let meta = fs::metadata(&canonical)
         .map_err(|e| format!("Unable to duplicate: {}", map_io_error(&e)))?;
@@ -4683,6 +4697,23 @@ mod tests {
             fs::read_to_string(&tmp.child("x (copy).txt")).unwrap(),
             "existing"
         );
+    }
+
+    #[test]
+    fn duplicate_collision_limit_returns_error_instead_of_panicking() {
+        let tmp = TempDir::new("dup_limit");
+        // Occupy the bare " (copy)" name plus every " (copy n)" slot up to the
+        // tiny test limit, so name allocation cannot yield a free candidate.
+        let parent = tmp.path();
+        fs::write(parent.join("a.txt"), "orig").unwrap();
+        fs::write(parent.join("a (copy).txt"), "1").unwrap();
+        fs::write(parent.join("a (copy 2).txt"), "2").unwrap();
+        fs::write(parent.join("a (copy 3).txt"), "3").unwrap();
+
+        // With just three collisions allowed, slot 3 is the last candidate —
+        // exhaustion must degrade to an Err, never a panic.
+        let result = super::unique_duplicate_name(parent, "a.txt", 3);
+        assert_eq!(result.unwrap_err(), "Unable to allocate a unique duplicate name");
     }
 
     #[test]
