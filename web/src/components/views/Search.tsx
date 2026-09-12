@@ -55,14 +55,39 @@ export default function Search({
 }: SearchProps) {
   const hasQuery = query.trim().length > 0;
   const [activeFilter, setActiveFilter] = useState("All");
+  const [showMore, setShowMore] = useState(false);
+  const [sizeFilter, setSizeFilter] = useState<"Any" | "Large">("Any");
+  const [modifiedFilter, setModifiedFilter] = useState<
+    "Any" | "Past 7 days" | "Past 30 days"
+  >("Any");
+  const [foldersOnly, setFoldersOnly] = useState(false);
 
-  // Folders always pass a quick filter; only non-folder results are filtered.
-  const filtered =
-    activeFilter === "All"
-      ? results
-      : results.filter(
-          (r) => r.isFolder || (TYPE_FILTERS[activeFilter]?.has(r.type.toLowerCase()) ?? false),
-        );
+  const LARGE_FILE_BYTES = 100 * 1024 * 1024;
+  const DAY_SECONDS = 24 * 60 * 60;
+
+  const filtered = results.filter((r) => {
+    const matchesType =
+      activeFilter === "All" ||
+      r.isFolder ||
+      (TYPE_FILTERS[activeFilter]?.has(r.type.toLowerCase()) ?? false);
+    const matchesSize =
+      sizeFilter === "Any" || r.isFolder || r.sizeBytes >= LARGE_FILE_BYTES;
+    const matchesModified =
+      modifiedFilter === "Any" ||
+      !r.modifiedTs ||
+      r.modifiedTs >=
+        Date.now() / 1000 - (modifiedFilter === "Past 7 days" ? 7 : 30) * DAY_SECONDS;
+    const matchesFoldersOnly = !foldersOnly || r.isFolder === true;
+    return matchesType && matchesSize && matchesModified && matchesFoldersOnly;
+  });
+
+  const anyFilterActive = sizeFilter !== "Any" || modifiedFilter !== "Any" || foldersOnly;
+
+  const resetFilters = () => {
+    setSizeFilter("Any");
+    setModifiedFilter("Any");
+    setFoldersOnly(false);
+  };
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -94,11 +119,76 @@ export default function Search({
               {f}
             </button>
           ))}
-          <button className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
+          <button
+            onClick={() => setShowMore((open) => !open)}
+            aria-expanded={showMore}
+            className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
             <Filter size={12} />
             More filters
           </button>
         </div>
+
+        {/* More filters panel */}
+        {showMore && (
+          <div className="bg-card border border-border rounded-xl p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+                More Filters
+              </span>
+              {anyFilterActive && (
+                <button
+                  onClick={resetFilters}
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Reset filters
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-6">
+              <div role="group" aria-label="Size" className="space-y-1.5">
+                <div className="text-xs text-muted-foreground">Size</div>
+                <div className="flex gap-1.5">
+                  {(["Any", "Large"] as const).map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => setSizeFilter(s)}
+                      className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
+                        ${sizeFilter === s ? "bg-foreground text-primary-foreground" : "bg-secondary text-muted-foreground hover:bg-border"}`}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[10px] text-muted-foreground">Large ≥ 100 MB</div>
+              </div>
+              <div role="group" aria-label="Modified" className="space-y-1.5">
+                <div className="text-xs text-muted-foreground">Modified</div>
+                <div className="flex gap-1.5">
+                  {(["Any", "Past 7 days", "Past 30 days"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setModifiedFilter(m)}
+                      className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
+                        ${modifiedFilter === m ? "bg-foreground text-primary-foreground" : "bg-secondary text-muted-foreground hover:bg-border"}`}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-foreground cursor-pointer mt-1">
+                <input
+                  type="checkbox"
+                  checked={foldersOnly}
+                  onChange={(e) => setFoldersOnly(e.target.checked)}
+                  className="accent-foreground"
+                />
+                Folders only
+              </label>
+            </div>
+          </div>
+        )}
 
         {/* Results — rendered only from real provider data; honest states. */}
         <div>

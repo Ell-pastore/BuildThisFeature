@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import Search from "./Search";
 import type { FileItem } from "../../types";
 
@@ -319,5 +319,167 @@ describe("Search", () => {
 
     expect(screen.getByRole("button", { name: "Images" })).toHaveClass("bg-foreground");
     expect(allChip).not.toHaveClass("bg-foreground");
+  });
+
+  it("opens and closes the more-filters panel", () => {
+    render(<Search query="re" results={[file()]} onOpenFile={() => {}} />);
+
+    expect(screen.queryByText("Folders only")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset filters" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+
+    expect(screen.getByText("Folders only")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reset filters" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+
+    expect(screen.queryByText("Folders only")).toBeNull();
+  });
+
+  it("filters to large files (≥ 100 MB)", () => {
+    const big = file({
+      id: "/Users/usr/Videos/movie.mp4",
+      name: "movie.mp4",
+      type: "mp4",
+      sizeBytes: 150 * 1024 * 1024,
+      size: "150 MB",
+    });
+
+    render(<Search query="re" results={[file(), big]} onOpenFile={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+
+    expect(screen.getByText("movie.mp4")).toBeInTheDocument();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(screen.getByText("1 results")).toBeInTheDocument();
+  });
+
+  it("filters to files modified in the past 7 days", () => {
+    const now = Date.now() / 1000;
+    const recent = file({
+      id: "/Users/usr/Documents/notes.md",
+      name: "notes.md",
+      type: "md",
+      modifiedTs: now - 2 * 86400,
+    });
+    const old = file({
+      id: "/Users/usr/Documents/old.pdf",
+      name: "old.pdf",
+      type: "pdf",
+      modifiedTs: now - 60 * 86400,
+    });
+
+    render(<Search query="re" results={[recent, old]} onOpenFile={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Modified" })).getByRole("button", {
+        name: "Past 7 days",
+      }),
+    );
+
+    expect(screen.getByText("notes.md")).toBeInTheDocument();
+    expect(screen.queryByText("old.pdf")).toBeNull();
+  });
+
+  it("filters to folders only", () => {
+    const folder = file({
+      id: "/Users/usr/Documents/Projects",
+      name: "Projects",
+      type: "folder",
+      isFolder: true,
+      itemCount: 2,
+      size: "—",
+      sizeBytes: 0,
+    });
+
+    render(<Search query="re" results={[file(), folder]} onOpenFile={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Folders only" }));
+
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("composes type chips with size and folders-only filters", () => {
+    const now = Date.now() / 1000;
+    const bigPdf = file({
+      id: "/Users/usr/Documents/big.pdf",
+      name: "big.pdf",
+      type: "pdf",
+      sizeBytes: 120 * 1024 * 1024,
+      modifiedTs: now - 86400,
+    });
+    const smallPdf = file({
+      id: "/Users/usr/Documents/small.pdf",
+      name: "small.pdf",
+      type: "pdf",
+      sizeBytes: 1024,
+    });
+    const folder = file({
+      id: "/Users/usr/Documents/Projects",
+      name: "Projects",
+      type: "folder",
+      isFolder: true,
+      itemCount: 2,
+      size: "—",
+      sizeBytes: 0,
+    });
+
+    render(<Search query="do" results={[bigPdf, smallPdf, folder]} onOpenFile={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "PDF" }));
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+
+    expect(screen.getByText("big.pdf")).toBeInTheDocument();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.queryByText("small.pdf")).toBeNull();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Folders only" }));
+
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.queryByText("big.pdf")).toBeNull();
+  });
+
+  it("resets active more filters back to any size/time and clears folders-only", () => {
+    const now = Date.now() / 1000;
+    const bigOld = file({
+      id: "/Users/usr/Movies/movie.mp4",
+      name: "movie.mp4",
+      type: "mp4",
+      sizeBytes: 200 * 1024 * 1024,
+      modifiedTs: now - 60 * 86400,
+    });
+    const smallRecent = file({ sizeBytes: 10, modifiedTs: now - 86400 });
+
+    render(<Search query="re" results={[bigOld, smallRecent]} onOpenFile={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Modified" })).getByRole("button", {
+        name: "Past 7 days",
+      }),
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Folders only" }));
+
+    expect(screen.getByText("No matching results")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reset filters" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
+
+    expect(screen.getByText("movie.mp4")).toBeInTheDocument();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    expect(screen.getByText("2 results")).toBeInTheDocument();
   });
 });
