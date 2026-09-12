@@ -347,6 +347,8 @@ export default function App() {
         // Keep a star pointing at the renamed item, not its stale old path.
         updateStarPath(oldPath, renamedItemPreview(item, name).path);
       }
+      // Refresh a visible Recent view without requiring a manual Retry.
+      setRecentReloadKey((k) => k + 1);
       return null;
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
@@ -367,6 +369,8 @@ export default function App() {
         // Keep a star pointing at the moved item, not its stale old path.
         updateStarPath(oldPath, movedItemPreview(item, destDir).path);
       }
+      // Refresh a visible Recent view without requiring a manual Retry.
+      setRecentReloadKey((k) => k + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -403,6 +407,8 @@ export default function App() {
       }
       if (previewFile?.path === item.path) setPreviewFile(null);
       await loadDir(dirPath);
+      // Refresh a visible Recent view without requiring a manual Retry.
+      setRecentReloadKey((k) => k + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }

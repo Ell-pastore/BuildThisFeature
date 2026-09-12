@@ -120,6 +120,7 @@ describe("App move preview synchronization", () => {
 
     fireEvent.click(await screen.findByText("report.pdf"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+    const recentFetchedBefore = providerMock.recentFiles.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Move" }));
     const dialogCard = await screen.findByText("Selected destination").then((el) =>
@@ -146,6 +147,9 @@ describe("App move preview synchronization", () => {
         "/Users/usr/Desktop/Documents/report.pdf",
       );
     });
+    await waitFor(() => {
+      expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentFetchedBefore);
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     await waitFor(() => {
@@ -161,6 +165,7 @@ describe("App move preview synchronization", () => {
 
     fireEvent.click(await screen.findByText("report.pdf"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+    const recentFetchedBefore = providerMock.recentFiles.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
@@ -169,6 +174,9 @@ describe("App move preview synchronization", () => {
     });
     await waitFor(() => {
       expect(starsHook.removeStarPath).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    await waitFor(() => {
+      expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentFetchedBefore);
     });
 
     confirmSpy.mockRestore();
@@ -264,6 +272,23 @@ describe("App rename preview synchronization", () => {
         "/Users/usr/Desktop/report.pdf",
         "/Users/usr/Desktop/renamed.pdf",
       );
+    });
+  });
+
+  it("refreshes recent files after a successful rename", async () => {
+    render(<App />);
+    const fetchedBefore = providerMock.recentFiles.mock.calls.length;
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "renamed.pdf" },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(fetchedBefore);
     });
   });
 });
