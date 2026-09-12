@@ -396,6 +396,7 @@ export default function App() {
     try {
       await filesystem.createFolder(dirPath, name);
       await loadDir(dirPath);
+      refreshDerivedState();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -406,9 +407,22 @@ export default function App() {
       const sep = dirPath.endsWith("/") ? "" : "/";
       await filesystem.createFile(`${dirPath}${sep}${name}`);
       await loadDir(dirPath);
+      refreshDerivedState();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  /**
+   * After a successful filesystem mutation, re-read the derived filesystem
+   * views (Recent, Storage) and re-run an already-open Search so none of them
+   * show stale results. Storage's effect guards on `view`, so bumping its key
+   * costs nothing until the Storage view is actually open.
+   */
+  function refreshDerivedState() {
+    setRecentReloadKey((k) => k + 1);
+    setStorageReloadKey((k) => k + 1);
+    if (view === "search" && searchQuery.trim()) void runSearch(searchQuery);
   }
 
   async function doRename(item: FileItem, newName: string): Promise<string | null> {
@@ -425,8 +439,8 @@ export default function App() {
         // Keep a star pointing at the renamed item, not its stale old path.
         updateStarPath(oldPath, renamedItemPreview(item, name).path);
       }
-      // Refresh a visible Recent view without requiring a manual Retry.
-      setRecentReloadKey((k) => k + 1);
+      // Re-read Recent/Storage and re-run an open Search after the change.
+      refreshDerivedState();
       return null;
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
@@ -447,8 +461,8 @@ export default function App() {
         // Keep a star pointing at the moved item, not its stale old path.
         updateStarPath(oldPath, movedItemPreview(item, destDir).path);
       }
-      // Refresh a visible Recent view without requiring a manual Retry.
-      setRecentReloadKey((k) => k + 1);
+      // Re-read Recent/Storage and re-run an open Search after the change.
+      refreshDerivedState();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -460,6 +474,7 @@ export default function App() {
         if (item.path) await filesystem.copyItem(item.path, destDir);
       }
       await loadDir(dirPath);
+      refreshDerivedState();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -469,6 +484,7 @@ export default function App() {
     try {
       if (item.path) await filesystem.duplicateItem(item.path);
       await loadDir(dirPath);
+      refreshDerivedState();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -485,8 +501,8 @@ export default function App() {
       }
       if (previewFile?.path === item.path) setPreviewFile(null);
       await loadDir(dirPath);
-      // Refresh a visible Recent view without requiring a manual Retry.
-      setRecentReloadKey((k) => k + 1);
+      // Re-read Recent/Storage and re-run an open Search after the change.
+      refreshDerivedState();
       // Refresh an open Trash view: its mount-load re-reads the real trash.
       setTrashReloadKey((k) => k + 1);
     } catch (err) {

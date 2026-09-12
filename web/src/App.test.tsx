@@ -545,3 +545,151 @@ describe("App dead-directory recovery", () => {
     expect(providerMock.listDirectory).not.toHaveBeenCalledWith("/Users/usr/Desktop");
   });
 });
+
+describe("App derived-view refresh after mutations", () => {
+  beforeEach(() => {
+    providerMock.listDirectory.mockResolvedValue(
+      listing([
+        {
+          ...fileItem("Documents"),
+          type: "folder",
+          isFolder: true,
+          size: "—",
+          sizeBytes: 0,
+          location: "/Users/usr/Desktop",
+          path: "/Users/usr/Desktop/Documents",
+          id: "/Users/usr/Desktop/Documents",
+        },
+        fileItem("report.pdf"),
+      ]),
+    );
+    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
+    providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
+    providerMock.openItem.mockResolvedValue(undefined);
+    providerMock.searchFiles.mockResolvedValue([]);
+    providerMock.duplicateItem.mockResolvedValue("/Users/usr/Desktop/report (copy).pdf");
+    providerMock.copyItem.mockResolvedValue(undefined);
+    providerMock.storageByCategory.mockResolvedValue({
+      categories: [],
+      totalBytes: 0,
+      scannedFileCount: 0,
+      scanCapped: false,
+    });
+    providerMock.createFolder.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    cleanup();
+  });
+
+  it("re-reads Recent after duplicating a previewed file", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+    const recentBefore = providerMock.recentFiles.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+
+    await waitFor(() => {
+      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    await waitFor(() => {
+      expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentBefore);
+    });
+  });
+
+  it("re-reads Recent after creating a folder in the Files view", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    const recentBefore = providerMock.recentFiles.mock.calls.length;
+
+    fireEvent.click(await screen.findByRole("button", { name: "New" }));
+    fireEvent.change(screen.getByPlaceholderText("Folder name"), {
+      target: { value: "Assets" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => {
+      expect(providerMock.createFolder).toHaveBeenCalledWith("/Users/usr/Desktop", "Assets");
+    });
+    await waitFor(() => {
+      expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentBefore);
+    });
+  });
+
+  it("re-runs an open Search after a rename so results stay live", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    const searchBox = screen.getByPlaceholderText("Search files, folders, or ask anything…");
+    fireEvent.change(searchBox, { target: { value: "report" } });
+    fireEvent.submit(searchBox.closest("form") as HTMLFormElement);
+    await waitFor(() => {
+      expect(providerMock.searchFiles).toHaveBeenCalledWith("report");
+    });
+    const searchBefore = providerMock.searchFiles.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "renamed.pdf" },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(providerMock.renameItem).toHaveBeenCalledWith(
+        "/Users/usr/Desktop/report.pdf",
+        "renamed.pdf",
+      );
+    });
+    // The already-open Search view re-queried the real filesystem.
+    await waitFor(() => {
+      expect(providerMock.searchFiles.mock.calls.length).toBeGreaterThan(searchBefore);
+    });
+    expect(providerMock.searchFiles).toHaveBeenLastCalledWith("report");
+  });
+
+  it("rescans Storage after a mutation while the Storage view is open", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Storage" }));
+    await waitFor(() => {
+      expect(providerMock.storageByCategory.mock.calls.length).toBeGreaterThan(0);
+    });
+    const storageBefore = providerMock.storageByCategory.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    await waitFor(() => {
+      expect(providerMock.storageByCategory.mock.calls.length).toBeGreaterThan(storageBefore);
+    });
+
+    confirmSpy.mockRestore();
+  });
+
+  it("does not rescan Storage when the Storage view is not open", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    await waitFor(() => {
+      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    expect(providerMock.storageByCategory).not.toHaveBeenCalled();
+  });
+});
