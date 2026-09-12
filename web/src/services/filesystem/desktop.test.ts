@@ -112,3 +112,29 @@ describe("DesktopFilesystemProvider.duplicateGroups", () => {
     expect(result.truncated).toBe(true);
   });
 });
+
+describe("DesktopFilesystemProvider.permanentlyDeleteTrashItem", () => {
+  it("invokes permanently_delete_trash_item with the trashed path", async () => {
+    invoke.mockResolvedValue("/home/.trash-smart-file-manager/report.pdf");
+
+    const deleted =
+      await new DesktopFilesystemProvider().permanentlyDeleteTrashItem(
+        "/home/.trash-smart-file-manager/report.pdf",
+      );
+
+    expect(invoke).toHaveBeenCalledWith("permanently_delete_trash_item", {
+      trashedPath: "/home/.trash-smart-file-manager/report.pdf",
+    });
+    expect(deleted).toBe("/home/.trash-smart-file-manager/report.pdf");
+  });
+
+  it("propagates the Rust denial or error unchanged", async () => {
+    invoke.mockRejectedValue(new Error("Not a trash entry"));
+
+    await expect(
+      new DesktopFilesystemProvider().permanentlyDeleteTrashItem(
+        "/home/.trash-smart-file-manager/report.pdf",
+      ),
+    ).rejects.toThrow("Not a trash entry");
+  });
+});

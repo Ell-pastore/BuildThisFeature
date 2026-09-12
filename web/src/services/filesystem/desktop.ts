@@ -267,6 +267,10 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke<RawTrashEntry[]>("list_trash").then((entries) => entries.map(mapTrashEntry));
   }
 
+  permanentlyDeleteTrashItem(trashedPath: string): Promise<string> {
+    return invoke<string>("permanently_delete_trash_item", { trashedPath });
+  }
+
   loadStarredPaths(): Promise<string[]> {
     return invoke<string[]>("load_starred_paths");
   }

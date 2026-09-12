@@ -8,12 +8,17 @@ import type { TrashItem } from "../../types";
  * Trash. Shows the REAL contents of the application-managed trash through the
  * FilesystemProvider.listTrash() bridge (→ Rust `list_trash`). Restore uses
  * the existing restoreItem() flow, then refreshes the view from the provider.
+ * Permanent deletion runs through FilesystemProvider.permanentlyDeleteTrashItem
+ * (→ Rust `permanently_delete_trash_item`) behind an explicit confirmation —
+ * the row is never removed optimistically.
  */
 export default function Trash() {
   const [items, setItems] = useState<TrashItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<TrashItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -42,6 +47,23 @@ export default function Trash() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setRestoring(null);
+    }
+  }
+
+  async function deleteForever(item: TrashItem) {
+    setDeleting(true);
+    setError(null);
+    try {
+      await getFilesystemProvider().permanentlyDeleteTrashItem(item.path);
+      setConfirming(null);
+      // Only reload after a confirmed, successful deletion.
+      await load();
+    } catch (err) {
+      setConfirming(null);
+      // Keep the item listed — never remove the row on failure.
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -114,7 +136,7 @@ export default function Trash() {
                 <div className="text-xs font-mono text-muted-foreground truncate" title={item.originalPath ?? undefined}>
                   {item.originalPath ?? "Unknown"}
                 </div>
-                <div className="flex justify-end">
+                <div className="flex justify-end gap-2">
                   <button
                     onClick={() => void restore(item)}
                     disabled={restoring === item.path}
@@ -123,9 +145,51 @@ export default function Trash() {
                     <RotateCcw size={12} className={restoring === item.path ? "animate-spin" : ""} />
                     {restoring === item.path ? "Restoring…" : "Restore"}
                   </button>
+                  <button
+                    onClick={() => setConfirming(item)}
+                    disabled={deleting}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-border rounded-lg hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    <Trash2 size={12} />
+                    Delete
+                  </button>
                 </div>
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Permanent-delete confirmation */}
+        {confirming && (
+          <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex items-center justify-center p-8">
+            <div className="bg-card border border-border rounded-2xl p-6 max-w-sm w-full shadow-xl">
+              <div className="w-10 h-10 rounded-xl bg-red-50 flex items-center justify-center mb-4">
+                <Trash2 size={18} className="text-red-500" />
+              </div>
+              <h2 className="text-base font-semibold text-foreground">
+                Delete {confirming.name} permanently?
+              </h2>
+              <p className="text-sm text-muted-foreground mt-2">
+                This will permanently remove the item from the app-managed trash and it cannot be
+                restored.
+              </p>
+              <div className="flex gap-3 mt-6">
+                <button
+                  onClick={() => setConfirming(null)}
+                  disabled={deleting}
+                  className="flex-1 px-4 py-2 text-sm border border-border rounded-lg hover:bg-secondary transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => void deleteForever(confirming)}
+                  disabled={deleting}
+                  className="flex-1 px-4 py-2 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {deleting ? "Deleting…" : "Delete permanently"}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

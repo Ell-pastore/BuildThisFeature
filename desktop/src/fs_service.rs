@@ -1939,6 +1939,68 @@ pub fn list_trash(
     Ok(entries)
 }
 
+/// Permanently delete a genuine trash entry — the item AND its paired sidecar
+/// metadata — never anything else. This is the ONLY operation that removes a
+/// trashed item for good; `delete_item` is deliberately NOT reused here so the
+/// trash-root containment below is always enforced.
+///
+/// # Security order
+///
+/// 1. the trash root must be configured (fail closed otherwise),
+/// 2. canonicalize the trashed path,
+/// 3. `ensure_allowed` (the AllowList is the boundary),
+/// 4. PRIMARY CHECK: the canonical path must be a DIRECT child of the trash
+///    root (component-aware) — never the root itself, an ancestor, a sibling,
+///    or an arbitrary allowed path,
+/// 5. remove the item with the same file/directory removal semantics as
+///    [`delete_item`],
+/// 6. remove the paired sidecar so no orphaned metadata remains.
+pub fn permanently_delete_trash_entry(
+    trash: &TrashRoot,
+    allow_list: &AllowList,
+    trashed_path: &str,
+) -> Result<String, String> {
+    if trash.root().as_os_str().is_empty() {
+        return Err("Trash is not configured".to_string());
+    }
+    let target = Path::new(trashed_path);
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("Unable to delete from trash: {}", map_io_error(&e)))?;
+    ensure_allowed(allow_list, &canonical)?;
+
+    let trash_root = trash.root();
+    // PRIMARY CHECK: only a direct child of the trash root is a genuine trash
+    // entry. The root itself, ancestors of the root, sibling directories, and
+    // arbitrary allowed paths must never be deleted through this operation.
+    let inside = canonical != trash_root && canonical.starts_with(trash_root);
+    if !inside || canonical.parent() != Some(trash_root) {
+        return Err("Not a trash entry".to_string());
+    }
+
+    let sidecar = sidecar_path_for(&canonical);
+
+    let meta =
+        fs::metadata(&canonical).map_err(|e| format!("Unable to delete from trash: {}", map_io_error(&e)))?;
+    let result = if meta.is_dir() {
+        fs::remove_dir_all(&canonical)
+    } else {
+        fs::remove_file(&canonical)
+    };
+    result.map_err(|e| format!("Unable to delete from trash: {}", map_io_error(&e)))?;
+
+    // Remove the paired sidecar. If cleanup fails the item is already gone —
+    // report the failure clearly instead of pretending full success.
+    if let Err(e) = fs::remove_file(&sidecar) {
+        return Err(format!(
+            "The item was deleted but its metadata could not be removed: {}",
+            map_io_error(&e)
+        ));
+    }
+
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Application metadata — starred paths
 // ---------------------------------------------------------------------------
@@ -4703,6 +4765,176 @@ mod tests {
 
         let err = super::list_trash(&trash, &AllowList::empty()).unwrap_err();
         assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+    }
+
+    // -- permanently_delete_trash_entry ------------------------------------
+
+    #[test]
+    fn trash_delete_successful_file() {
+        let tmp = TempDir::new("trash_delete_file");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "hello world");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("foo.txt"))).unwrap();
+
+        let trashed = str_of(&tmp.child(".trash").join("foo.txt"));
+        let expected = canonical_str(&tmp.child(".trash").join("foo.txt"));
+        let deleted = super::permanently_delete_trash_entry(&trash, &allow, &trashed).unwrap();
+        assert_eq!(deleted, expected);
+
+        // The item AND its sidecar are gone; the trash is otherwise untouched.
+        assert!(!tmp.child(".trash").join("foo.txt").exists());
+        assert!(!tmp.child(".trash").join("foo.txt.trash.json").exists());
+        assert!(super::list_trash(&trash, &allow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_delete_successful_folder() {
+        let tmp = TempDir::new("trash_delete_folder");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child("proj").join("nested")).unwrap();
+        write_file(&tmp.child("proj").join("nested").join("a.txt"), "a");
+        super::trash_item(&trash, &allow, &str_of(&tmp.child("proj"))).unwrap();
+
+        super::permanently_delete_trash_entry(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("proj")),
+        )
+        .unwrap();
+
+        // The whole subtree is removed, not just the top-level folder.
+        assert!(!tmp.child(".trash").join("proj").exists());
+        assert!(!tmp.child(".trash").join("proj.trash.json").exists());
+        assert!(super::list_trash(&trash, &allow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_delete_rejects_trash_root_itself() {
+        let tmp = TempDir::new("trash_delete_root");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err =
+            super::permanently_delete_trash_entry(&trash, &allow, &str_of(&tmp.child(".trash")))
+                .unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+        assert!(tmp.child(".trash").is_dir());
+    }
+
+    #[test]
+    fn trash_delete_rejects_home_directory() {
+        let tmp = TempDir::new("trash_delete_home");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        // The temp dir CONTAINS the trash root — an ancestor — must fail.
+        let err = super::permanently_delete_trash_entry(&trash, &allow, &str_of(tmp.path()))
+            .unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+    }
+
+    #[test]
+    fn trash_delete_rejects_arbitrary_allowed_file_outside_trash() {
+        let tmp = TempDir::new("trash_delete_arbitrary");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("plain.txt"), "data");
+
+        let err =
+            super::permanently_delete_trash_entry(&trash, &allow, &str_of(&tmp.child("plain.txt")))
+                .unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+        // The allowed file was NOT deleted.
+        assert!(tmp.child("plain.txt").is_file());
+    }
+
+    #[test]
+    fn trash_delete_rejects_sibling_dir_beside_trash() {
+        let tmp = TempDir::new("trash_delete_sibling");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child(".trash-sibling")).unwrap();
+        write_file(&tmp.child(".trash-sibling").join("keep.txt"), "keep");
+
+        let err = super::permanently_delete_trash_entry(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash-sibling")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+        assert!(tmp.child(".trash-sibling").join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn trash_delete_rejects_nested_descendant_inside_trash() {
+        let tmp = TempDir::new("trash_delete_nested");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+        fs::create_dir_all(tmp.child(".trash").join("proj")).unwrap();
+        write_file(&tmp.child(".trash").join("proj").join("inner.txt"), "inner");
+
+        // A direct child of the trash root is the ONLY acceptable target; a
+        // nested descendant of a (hypothetical) trashed folder is not.
+        let err = super::permanently_delete_trash_entry(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("proj").join("inner.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Not a trash entry".to_string());
+        assert!(tmp.child(".trash").join("proj").join("inner.txt").is_file());
+    }
+
+    #[test]
+    fn trash_delete_with_unconfigured_root() {
+        let tmp = TempDir::new("trash_delete_unconfigured");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("foo.txt"), "data");
+        let empty_trash = TrashRoot::empty();
+
+        let err = super::permanently_delete_trash_entry(
+            &empty_trash,
+            &allow,
+            &str_of(&tmp.child("foo.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Trash is not configured".to_string());
+        assert!(tmp.child("foo.txt").is_file());
+    }
+
+    #[test]
+    fn trash_delete_denied_by_empty_allowlist() {
+        let tmp = TempDir::new("trash_delete_empty_al");
+        let trash = trash_for(&tmp);
+        write_file(&tmp.child(".trash").join("orphan.txt"), "x");
+
+        let err = super::permanently_delete_trash_entry(
+            &trash,
+            &AllowList::empty(),
+            &str_of(&tmp.child(".trash").join("orphan.txt")),
+        )
+        .unwrap_err();
+        assert_eq!(err, SECURITY_POLICY_ERROR.to_string());
+        // Fail closed: nothing was removed.
+        assert!(tmp.child(".trash").join("orphan.txt").is_file());
+    }
+
+    #[test]
+    fn trash_delete_missing_entry_fails_closed() {
+        let tmp = TempDir::new("trash_delete_missing");
+        let trash = trash_for(&tmp);
+        let allow = allow_for(&tmp);
+
+        let err = super::permanently_delete_trash_entry(
+            &trash,
+            &allow,
+            &str_of(&tmp.child(".trash").join("ghost.txt")),
+        )
+        .unwrap_err();
+        assert!(err.contains("Unable to delete from trash"));
     }
 
     // -- StarStore (starred paths) ----------------------------------------

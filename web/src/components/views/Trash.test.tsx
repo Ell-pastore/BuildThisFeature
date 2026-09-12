@@ -5,9 +5,14 @@ import type { TrashItem } from "../../types";
 
 const listTrashMock = vi.hoisted(() => vi.fn());
 const restoreItemMock = vi.hoisted(() => vi.fn());
+const permanentlyDeleteMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../services/filesystem", () => ({
-  getFilesystemProvider: () => ({ listTrash: listTrashMock, restoreItem: restoreItemMock }),
+  getFilesystemProvider: () => ({
+    listTrash: listTrashMock,
+    restoreItem: restoreItemMock,
+    permanentlyDeleteTrashItem: permanentlyDeleteMock,
+  }),
 }));
 
 function trashed(overrides: Partial<TrashItem> = {}): TrashItem {
@@ -32,6 +37,7 @@ describe("Trash", () => {
   beforeEach(() => {
     listTrashMock.mockResolvedValue([]);
     restoreItemMock.mockResolvedValue("/Users/usr/Desktop/report.pdf");
+    permanentlyDeleteMock.mockResolvedValue("/Users/usr/.trash-smart-file-manager/report.pdf");
   });
 
   afterEach(() => {
@@ -97,5 +103,52 @@ describe("Trash", () => {
     render(<Trash />);
 
     expect(await screen.findByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("permanently deletes through the provider after confirmation and reloads", async () => {
+    listTrashMock.mockResolvedValue([trashed()]);
+
+    render(<Trash />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    expect(screen.getByText("Delete report.pdf permanently?")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
+
+    await waitFor(() => {
+      expect(permanentlyDeleteMock).toHaveBeenCalledWith(
+        "/Users/usr/.trash-smart-file-manager/report.pdf",
+      );
+    });
+    // The list is re-read from the provider only after the deletion succeeds.
+    expect(listTrashMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancelling the confirmation deletes nothing and does not reload", async () => {
+    listTrashMock.mockResolvedValue([trashed()]);
+
+    render(<Trash />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByText("Delete report.pdf permanently?")).not.toBeInTheDocument();
+    expect(permanentlyDeleteMock).not.toHaveBeenCalled();
+    expect(listTrashMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a deletion error honestly and keeps the row listed", async () => {
+    listTrashMock.mockResolvedValue([trashed()]);
+    permanentlyDeleteMock.mockRejectedValue(new Error("Unable to delete from trash: denied"));
+
+    render(<Trash />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
+
+    expect(await screen.findByText("Unable to delete from trash: denied")).toBeInTheDocument();
+    // No optimistic removal and no reload on failure.
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(listTrashMock).toHaveBeenCalledTimes(1);
   });
 });

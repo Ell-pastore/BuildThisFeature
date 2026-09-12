@@ -206,6 +206,16 @@ fn list_trash(
     fs_service::list_trash(trash.inner(), allow_list.inner())
 }
 
+/// Permanently delete a single genuine trash entry (item and its sidecar).
+#[tauri::command]
+fn permanently_delete_trash_item(
+    trashed_path: String,
+    allow_list: tauri::State<fs_service::AllowList>,
+    trash: tauri::State<fs_service::TrashRoot>,
+) -> Result<String, String> {
+    fs_service::permanently_delete_trash_entry(trash.inner(), allow_list.inner(), &trashed_path)
+}
+
 /// Load the user's starred absolute paths from the app-local star store.
 #[tauri::command]
 fn load_starred_paths(store: tauri::State<fs_service::StarStore>) -> Result<Vec<String>, String> {
@@ -331,6 +341,7 @@ pub fn run() {
             trash_item,
             restore_item,
             list_trash,
+            permanently_delete_trash_item,
             load_starred_paths,
             save_starred_paths,
             resolve_starred_paths,

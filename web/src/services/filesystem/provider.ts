@@ -198,6 +198,9 @@ export interface FilesystemProvider {
   /** List the current contents of the application-managed trash. */
   listTrash(): Promise<TrashItem[]>;
 
+  /** Permanently delete a single genuine trash entry (item and its sidecar). The UI must confirm before calling this. */
+  permanentlyDeleteTrashItem(trashedPath: string): Promise<string>;
+
   /** Load the user's starred absolute paths (application metadata, provider-persisted). */
   loadStarredPaths(): Promise<string[]>;
 
