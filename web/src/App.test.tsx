@@ -133,7 +133,7 @@ describe("App move preview synchronization", () => {
         fileItem("report.pdf"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
@@ -216,7 +216,7 @@ describe("App move preview synchronization", () => {
 describe("App rename preview synchronization", () => {
   beforeEach(() => {
     providerMock.listDirectory.mockResolvedValue(listing([fileItem("report.pdf")]));
-    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
@@ -357,7 +357,7 @@ describe("App trash view synchronization", () => {
         fileItem("report.pdf"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
@@ -563,7 +563,7 @@ describe("App derived-view refresh after mutations", () => {
         fileItem("report.pdf"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);

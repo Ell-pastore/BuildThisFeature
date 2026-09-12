@@ -6,8 +6,16 @@ import type { DiskUsage } from "../../services/filesystem";
 import { formatBytes } from "../../services/format";
 
 interface HomeProps {
-  /** Real files provided by the app (the loaded directory contents). */
+  /** Real files provided by the app (the loaded directory contents). Used only
+   * for the folder-scoped stats row (recent/folder counts in the current folder). */
   recentFiles?: FileItem[];
+  /** Real, most recently modified files and folders across ALL allowed roots
+   * (the same bounded recent_files scan the dedicated Recent view uses). */
+  recents?: FileItem[];
+  /** True while the recent-files scan is in flight. */
+  recentsLoading?: boolean;
+  /** Honest recent-files scan error, or null. */
+  recentsError?: string | null;
   onOpenFile: (file: FileItem) => void;
   /** Navigate into a folder (falls back to onOpenFile when unset). */
   onOpenFolder?: (item: FileItem) => void;
@@ -17,12 +25,23 @@ interface HomeProps {
 }
 
 /**
- * Home dashboard. Presentational only: `recentFiles` and `diskUsage` come from
- * the real filesystem via App/Rust. No hardcoded file entries live here.
+ * Home dashboard. Presentational only: the stats row and the "Recent Files"
+ * section come from real data supplied by App/Rust — the folder stats derive
+ * from the loaded directory, the "Recent Files" list from the bounded
+ * cross-folder recent_files scan. No hardcoded file entries live here.
  */
-export default function Home({ recentFiles = [], onOpenFile, onOpenFolder, onNavigate, diskUsage }: HomeProps) {
+export default function Home({
+  recentFiles = [],
+  recents = [],
+  recentsLoading = false,
+  recentsError = null,
+  onOpenFile,
+  onOpenFolder,
+  onNavigate,
+  diskUsage,
+}: HomeProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
-  const recent = recentFiles.slice(0, 5);
+  const recentsShown = recents.slice(0, 5);
   const totalBytes = diskUsage?.totalBytes ?? 0;
   const usedBytes =
     diskUsage && diskUsage.totalBytes >= diskUsage.freeBytes
@@ -128,11 +147,23 @@ export default function Home({ recentFiles = [], onOpenFile, onOpenFolder, onNav
             </div>
           </div>
 
-          {recent.length === 0 ? (
+          {recentsLoading && !recentsError ? (
             <div className="bg-card border border-border rounded-xl px-5 py-10 text-center">
-              <p className="text-sm font-medium text-foreground">Nothing to show yet</p>
+              <div className="w-8 h-8 rounded-full border-2 border-border border-t-accent animate-spin mx-auto mb-4" />
+              <p className="text-sm font-medium text-foreground">Loading recent files…</p>
               <p className="text-xs text-muted-foreground mt-1">
-                Items from your real filesystem will appear here.
+                Scanning your allowed folders for the most recently modified items.
+              </p>
+            </div>
+          ) : recentsError ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-3">
+              <p className="text-sm text-foreground">{recentsError}</p>
+            </div>
+          ) : recentsShown.length === 0 ? (
+            <div className="bg-card border border-border rounded-xl px-5 py-10 text-center">
+              <p className="text-sm font-medium text-foreground">No recent files yet</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Files you modify or create in your allowed folders will appear here.
               </p>
             </div>
           ) : viewMode === "list" ? (
@@ -144,7 +175,7 @@ export default function Home({ recentFiles = [], onOpenFile, onOpenFolder, onNav
                 <div>Location</div>
                 <div>Modified</div>
               </div>
-              {recent.map((file) => (
+              {recentsShown.map((file) => (
                 <button
                   key={file.id}
                   onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
@@ -163,7 +194,7 @@ export default function Home({ recentFiles = [], onOpenFile, onOpenFolder, onNav
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-3">
-              {recent.map((file) => (
+              {recentsShown.map((file) => (
                 <button
                   key={file.id}
                   onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}

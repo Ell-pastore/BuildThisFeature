@@ -549,7 +549,7 @@ export default function App() {
 
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 flex overflow-hidden">
-            {view === "home" && <Home onOpenFile={openPreview} onOpenFolder={openFolder} onNavigate={navigate} recentFiles={seenFiles} diskUsage={diskUsage} />}
+            {view === "home" && <Home onOpenFile={openPreview} onOpenFolder={openFolder} onNavigate={navigate} recentFiles={seenFiles} recents={recentItems} recentsLoading={recentLoading} recentsError={recentError} diskUsage={diskUsage} />}
             {view === "files" && (
               <Files
                 items={seenFiles}
