@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
 import type { FileItem } from "./types";
 
@@ -71,6 +71,70 @@ function listing(items: FileItem[]) {
     items,
   };
 }
+
+describe("App move preview synchronization", () => {
+  beforeEach(() => {
+    providerMock.listDirectory.mockResolvedValue(
+      listing([
+        {
+          ...fileItem("Documents"),
+          type: "folder",
+          isFolder: true,
+          size: "—",
+          sizeBytes: 0,
+          location: "/Users/usr/Desktop",
+          path: "/Users/usr/Desktop/Documents",
+          id: "/Users/usr/Desktop/Documents",
+        },
+        fileItem("report.pdf"),
+      ]),
+    );
+    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
+    providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
+    providerMock.openItem.mockResolvedValue(undefined);
+    providerMock.moveItem.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    cleanup();
+  });
+
+  it("updates the open preview after a move so later actions target the new path", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move" }));
+    const dialogCard = await screen.findByText("Selected destination").then((el) =>
+      el.closest(".bg-card"),
+    );
+    expect(dialogCard).not.toBeNull();
+    const dialog = within(dialogCard as HTMLElement);
+    fireEvent.click(dialog.getByRole("button", { name: "Documents" }));
+    expect(
+      await dialog.findByText("/Users/usr/Desktop/Documents"),
+    ).toBeInTheDocument();
+    fireEvent.click(dialog.getByRole("button", { name: "Move here" }));
+
+    await waitFor(() => {
+      expect(providerMock.moveItem).toHaveBeenCalledWith(
+        "/Users/usr/Desktop/report.pdf",
+        "/Users/usr/Desktop/Documents",
+      );
+    });
+    expect(screen.getAllByText("/Users/usr/Desktop/Documents").length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    await waitFor(() => {
+      expect(providerMock.openItem).toHaveBeenCalledWith(
+        "/Users/usr/Desktop/Documents/report.pdf",
+      );
+    });
+  });
+});
 
 describe("App rename preview synchronization", () => {
   beforeEach(() => {

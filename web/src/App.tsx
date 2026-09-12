@@ -58,6 +58,13 @@ function buildPathCrumbs(path: string, onNavigate: (p: string) => void): Crumb[]
   return crumbs;
 }
 
+/** Build a FileItem that reflects a successful leaf move into destDir. */
+function movedItemPreview(item: FileItem, destDir: string): FileItem {
+  const sep = destDir.includes("\\") && !destDir.includes("/") ? "\\" : "/";
+  const newPath = destDir ? `${destDir}${sep}${item.name}` : item.name;
+  return { ...item, id: newPath, path: newPath, location: destDir };
+}
+
 /** Build a FileItem that reflects a successful leaf rename. */
 function renamedItemPreview(item: FileItem, newName: string): FileItem {
   const oldPath = item.path ?? item.id;
@@ -345,6 +352,11 @@ export default function App() {
     try {
       if (item.path) await filesystem.moveItem(item.path, destDir);
       await loadDir(dirPath);
+      if (previewFile?.path === item.path) {
+        // Keep the open preview pointing at the moved item so later actions
+        // (Open/Rename/Star/Delete) target the new location, not the old path.
+        setPreviewFile(movedItemPreview(item, destDir));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
