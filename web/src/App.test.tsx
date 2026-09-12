@@ -30,8 +30,22 @@ vi.mock("./services/filesystem", () => ({
   getFilesystemProvider: () => providerMock,
 }));
 
+const starsHook = vi.hoisted(() => ({
+  stars: [] as string[],
+  isStarred: vi.fn(() => false),
+  toggleStar: vi.fn(),
+  updateStarPath: vi.fn(),
+  removeStarPath: vi.fn(),
+}));
+
 vi.mock("./services/stars", () => ({
-  useStars: () => ({ stars: [], isStarred: () => false, toggleStar: vi.fn() }),
+  useStars: () => ({
+    stars: starsHook.stars,
+    isStarred: starsHook.isStarred,
+    toggleStar: starsHook.toggleStar,
+    updateStarPath: starsHook.updateStarPath,
+    removeStarPath: starsHook.removeStarPath,
+  }),
 }));
 
 vi.mock("./components/AIAssistant", () => ({ default: () => null }));
@@ -126,6 +140,12 @@ describe("App move preview synchronization", () => {
       );
     });
     expect(screen.getAllByText("/Users/usr/Desktop/Documents").length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(starsHook.updateStarPath).toHaveBeenCalledWith(
+        "/Users/usr/Desktop/report.pdf",
+        "/Users/usr/Desktop/Documents/report.pdf",
+      );
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     await waitFor(() => {
@@ -133,6 +153,25 @@ describe("App move preview synchronization", () => {
         "/Users/usr/Desktop/Documents/report.pdf",
       );
     });
+  });
+
+  it("releases the stored star path when a previewed file is moved to trash", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    await waitFor(() => {
+      expect(starsHook.removeStarPath).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+
+    confirmSpy.mockRestore();
   });
 });
 
@@ -205,5 +244,26 @@ describe("App rename preview synchronization", () => {
     fireEvent.click(screen.getByRole("button", { name: "Files" }));
     expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
     expect(screen.queryByText("Couldn't load this folder")).not.toBeInTheDocument();
+  });
+
+  it("keeps a starred file starred after a rename by migrating the stored path", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
+      target: { value: "renamed.pdf" },
+    });
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    fireEvent.click(renameButtons[renameButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(starsHook.updateStarPath).toHaveBeenCalledWith(
+        "/Users/usr/Desktop/report.pdf",
+        "/Users/usr/Desktop/renamed.pdf",
+      );
+    });
   });
 });

@@ -119,5 +119,33 @@ export function useStars() {
     );
   }
 
-  return { stars, isStarred, toggleStar };
+  /**
+   * Migrate a starred path to a new absolute path after a rename/move. Only
+   * applied when the old path is actually starred; the existing persist effect
+   * writes the updated set through the provider.
+   */
+  function updateStarPath(oldPath: string, newPath: string): void {
+    if (!hydrated.current) {
+      dirtyBeforeHydration.current = true;
+    }
+    setStars((prev) => {
+      if (!prev.includes(oldPath)) {
+        return prev;
+      }
+      return [...prev.filter((p) => p !== oldPath && p !== newPath), newPath];
+    });
+  }
+
+  /**
+   * Release a starred path when its item is deleted/moved to trash. Only
+   * applied when the path is currently starred.
+   */
+  function removeStarPath(path: string): void {
+    if (!hydrated.current) {
+      dirtyBeforeHydration.current = true;
+    }
+    setStars((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : prev));
+  }
+
+  return { stars, isStarred, toggleStar, updateStarPath, removeStarPath };
 }

@@ -59,14 +59,14 @@ function buildPathCrumbs(path: string, onNavigate: (p: string) => void): Crumb[]
 }
 
 /** Build a FileItem that reflects a successful leaf move into destDir. */
-function movedItemPreview(item: FileItem, destDir: string): FileItem {
+function movedItemPreview(item: FileItem, destDir: string): FileItem & { path: string } {
   const sep = destDir.includes("\\") && !destDir.includes("/") ? "\\" : "/";
   const newPath = destDir ? `${destDir}${sep}${item.name}` : item.name;
   return { ...item, id: newPath, path: newPath, location: destDir };
 }
 
 /** Build a FileItem that reflects a successful leaf rename. */
-function renamedItemPreview(item: FileItem, newName: string): FileItem {
+function renamedItemPreview(item: FileItem, newName: string): FileItem & { path: string } {
   const oldPath = item.path ?? item.id;
   const sepIdx = Math.max(oldPath.lastIndexOf("/"), oldPath.lastIndexOf("\\"));
   const parent = item.location || (sepIdx >= 0 ? oldPath.slice(0, sepIdx) : "");
@@ -96,7 +96,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const { stars, isStarred, toggleStar } = useStars();
+  const { stars, isStarred, toggleStar, updateStarPath, removeStarPath } = useStars();
 
   // Starred view state: ALL persisted starred paths resolved against the real
   // filesystem (source of truth = the persisted star store), so stars outside
@@ -342,6 +342,11 @@ export default function App() {
       if (previewFile?.path === item.path) {
         setPreviewFile(renamedItemPreview(item, name));
       }
+      const oldPath = item.path;
+      if (oldPath) {
+        // Keep a star pointing at the renamed item, not its stale old path.
+        updateStarPath(oldPath, renamedItemPreview(item, name).path);
+      }
       return null;
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
@@ -356,6 +361,11 @@ export default function App() {
         // Keep the open preview pointing at the moved item so later actions
         // (Open/Rename/Star/Delete) target the new location, not the old path.
         setPreviewFile(movedItemPreview(item, destDir));
+      }
+      const oldPath = item.path;
+      if (oldPath) {
+        // Keep a star pointing at the moved item, not its stale old path.
+        updateStarPath(oldPath, movedItemPreview(item, destDir).path);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -387,6 +397,10 @@ export default function App() {
       // The normal Delete action moves an item to the app-managed trash —
       // never a permanent delete.
       if (item.path) await filesystem.trashItem(item.path);
+      if (item.path) {
+        // The item no longer exists at its path, so release any stale star.
+        removeStarPath(item.path);
+      }
       if (previewFile?.path === item.path) setPreviewFile(null);
       await loadDir(dirPath);
     } catch (err) {

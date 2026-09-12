@@ -119,4 +119,76 @@ describe("useStars", () => {
     // only as long as the provider cannot take over.
     expect(localStorage.getItem(LEGACY_KEY)).not.toBeNull();
   });
+
+  it("migrates a starred path to its new path on rename", async () => {
+    loadStarredPathsMock.mockResolvedValue(["/Users/usr/Desktop/report.pdf"]);
+
+    const { result } = renderHook(() => useStars());
+
+    await waitFor(() => {
+      expect(result.current.isStarred("/Users/usr/Desktop/report.pdf")).toBe(true);
+    });
+
+    act(() => {
+      result.current.updateStarPath(
+        "/Users/usr/Desktop/report.pdf",
+        "/Users/usr/Desktop/renamed.pdf",
+      );
+    });
+
+    expect(result.current.isStarred("/Users/usr/Desktop/renamed.pdf")).toBe(true);
+    expect(result.current.isStarred("/Users/usr/Desktop/report.pdf")).toBe(false);
+    await waitFor(() => {
+      expect(
+        saveStarredPathsMock.mock.calls.some((call) =>
+          call[0]?.includes("/Users/usr/Desktop/renamed.pdf"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("does not migrate when the old path was never starred", async () => {
+    loadStarredPathsMock.mockResolvedValue(["/Users/usr/Desktop/other.txt"]);
+
+    const { result } = renderHook(() => useStars());
+
+    await waitFor(() => {
+      expect(result.current.isStarred("/Users/usr/Desktop/other.txt")).toBe(true);
+    });
+
+    act(() => {
+      result.current.updateStarPath(
+        "/Users/usr/Desktop/notes.txt",
+        "/Users/usr/Desktop/renamed.txt",
+      );
+    });
+
+    expect(result.current.isStarred("/Users/usr/Desktop/renamed.txt")).toBe(false);
+    expect(
+      saveStarredPathsMock.mock.calls.some((call) => call[0]?.includes("renamed.txt")),
+    ).toBe(false);
+  });
+
+  it("removes the starred path for an item sent to trash", async () => {
+    loadStarredPathsMock.mockResolvedValue(["/Users/usr/Desktop/report.pdf"]);
+
+    const { result } = renderHook(() => useStars());
+
+    await waitFor(() => {
+      expect(result.current.isStarred("/Users/usr/Desktop/report.pdf")).toBe(true);
+    });
+
+    act(() => {
+      result.current.removeStarPath("/Users/usr/Desktop/report.pdf");
+    });
+
+    expect(result.current.isStarred("/Users/usr/Desktop/report.pdf")).toBe(false);
+    await waitFor(() => {
+      expect(
+        saveStarredPathsMock.mock.calls.some(
+          (call) => call[0] !== undefined && !call[0].includes("/Users/usr/Desktop/report.pdf"),
+        ),
+      ).toBe(true);
+    });
+  });
 });
