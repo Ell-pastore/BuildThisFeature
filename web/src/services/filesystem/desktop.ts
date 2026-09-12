@@ -3,6 +3,8 @@ import type { FileItem, TrashItem } from "../../types";
 import type {
   DirListing,
   DiskUsage,
+  DuplicateGroup,
+  DuplicateGroupsResult,
   FileMetadata,
   FilesystemProvider,
   SearchFilesResult,
@@ -93,6 +95,20 @@ interface RawSearchFilesResult {
   truncated: boolean;
 }
 
+/** Raw `DuplicateGroup` serialized by the Rust `duplicate_groups` command. */
+interface RawDuplicateGroup {
+  id: string;
+  sizeBytes: number;
+  size: string;
+  items: DirEntryResponse[];
+}
+
+/** Raw `DuplicateGroupsResult` serialized by the Rust `duplicate_groups` command. */
+interface RawDuplicateGroupsResult {
+  groups: RawDuplicateGroup[];
+  truncated: boolean;
+}
+
 /** Map a raw Rust storage category into the shared StorageCategory model. */
 function mapStorageCategory(category: RawStorageCategory): StorageCategory {
   return { category: category.category as StorageCategory["category"], bytes: category.bytes };
@@ -134,6 +150,18 @@ function mapEntry(entry: DirEntryResponse): FileItem {
     starred: false,
     isFolder,
     itemCount: entry.itemCount ?? 0,
+  };
+}
+
+/** Map a raw Rust duplicate group into the shared DuplicateGroup model. The
+ * group-level `id`/`sizeBytes`/`size` and the member order pass through
+ * unchanged; only members are mapped into the shared FileItem shape. */
+function mapDuplicateGroup(group: RawDuplicateGroup): DuplicateGroup {
+  return {
+    id: group.id,
+    sizeBytes: group.sizeBytes,
+    size: group.size,
+    items: group.items.map(mapEntry),
   };
 }
 
@@ -256,5 +284,12 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
 
   duplicateItem(path: string): Promise<string> {
     return invoke<string>("duplicate_item", { path });
+  }
+
+  duplicateGroups(): Promise<DuplicateGroupsResult> {
+    return invoke<RawDuplicateGroupsResult>("duplicate_groups").then((raw) => ({
+      groups: raw.groups.map(mapDuplicateGroup),
+      truncated: raw.truncated,
+    }));
   }
 }

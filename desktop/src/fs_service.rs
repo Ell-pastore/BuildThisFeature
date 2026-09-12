@@ -1099,6 +1099,30 @@ fn walk_recursive<F>(
 where
     F: FnMut(&Path, &fs::Metadata) -> bool,
 {
+    // Default: skip nothing. The duplicate scan uses the skippable variant to
+    // exclude the app trash subtree without changing how every other scan
+    // traverses the tree.
+    walk_recursive_skipping(dir, visited, visit, &mut |_| false)
+}
+
+/// [`walk_recursive`] with a per-directory skip predicate.
+///
+/// The predicate is consulted before recursing into a directory; when it
+/// returns `true` the subtree is NOT entered (the directory itself is still
+/// visited, so a skipped root is never itself a candidate). All other
+/// semantics are identical to [`walk_recursive`]: symlinks are never followed,
+/// Unix inode cycle detection guards hardlink/bind-mount loops, per-branch
+/// errors are tolerated, and an early stop from the visitor propagates.
+fn walk_recursive_skipping<F, S>(
+    dir: &Path,
+    visited: &mut std::collections::HashSet<(u64, u64)>,
+    visit: &mut F,
+    skip_dir: &mut S,
+) -> bool
+where
+    F: FnMut(&Path, &fs::Metadata) -> bool,
+    S: FnMut(&Path) -> bool,
+{
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return true, // unreadable directory — skip silently
@@ -1134,8 +1158,12 @@ where
             return false; // visitor asked to stop the traversal early
         }
 
-        // Recurse into subdirectories, propagating an early stop upward.
-        if meta.is_dir() && !walk_recursive(&entry_path, visited, visit) {
+        // Recurse into subdirectories (unless the skip predicate blocks the
+        // whole subtree), propagating an early stop upward.
+        if meta.is_dir()
+            && !skip_dir(&entry_path)
+            && !walk_recursive_skipping(&entry_path, visited, visit, &mut *skip_dir)
+        {
             return false;
         }
     }
@@ -2080,6 +2108,273 @@ pub fn resolve_starred_paths(
     }
 
     Ok(StarredResolution { items, missing })
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate detection (candidate discovery)
+// ---------------------------------------------------------------------------
+
+/// A single group of VERIFIED duplicate files: members share the exact same
+/// byte size AND the exact same SHA-256 content digest (streamed, never loaded
+/// whole into memory). Zero-byte files group naturally via their shared empty
+/// digest.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    /// Canonical path of the first member when sorted by path (stable id).
+    pub id: String,
+    /// Exact shared byte size of every member.
+    pub size_bytes: u64,
+    /// Human-readable shared size for display, e.g. "2.4 MB".
+    pub size: String,
+    /// Member entries, sorted by path (always 2+, singletons are never emitted).
+    pub items: Vec<FileEntry>,
+}
+
+/// Result of a bounded duplicate-verification scan.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroupsResult {
+    /// Confirmed duplicate groups (2+ same-size, same-content files each),
+    /// deterministically ordered.
+    pub groups: Vec<DuplicateGroup>,
+    /// True when a traversal, hashing, or result budget was reached before the
+    /// whole allowed tree was verified, so `groups` may be a partial view.
+    pub truncated: bool,
+}
+
+/// Safety cap for a duplicate scan: the walk stops after this many visited
+/// entries (files AND directories) across all allowed roots, so the scan
+/// cannot traverse an unbounded tree.
+pub const DUPLICATE_SCAN_MAX_VISITED_ENTRIES: usize = 100_000;
+
+/// Safety cap for a duplicate scan: at most this many groups are returned.
+/// Any groups beyond the cap are dropped and `truncated` is set.
+pub const DUPLICATE_SCAN_MAX_GROUPS: usize = 500;
+
+/// Safety cap for a duplicate scan: at most this many CONTENT BYTES are
+/// streamed through SHA-256 across the whole scan. When the budget is
+/// exhausted mid-hash, hashing stops immediately, the in-progress group is
+/// dropped, and `truncated` is set. 512 MiB bounds worst-case read amplification
+/// (e.g. a heap of 100,000 max-size files) while allowing realistic catalog
+/// scans to complete untouched.
+pub const DUPLICATE_SCAN_MAX_BYTES_HASHED: u64 = 512 * 1024 * 1024;
+
+/// Scan every allowed root for VERIFIED duplicate files: size-bucket the
+/// traversal, then stream-hash each size-matched candidate set and keep only
+/// members whose SHA-256 digests agree. Delegates to
+/// [`find_duplicate_groups_budgeted`] with the global hashing budget
+/// [`DUPLICATE_SCAN_MAX_BYTES_HASHED`].
+///
+/// # Security / traversal contract (mirrors [`search_files`])
+///
+/// - Only canonicalized [`AllowList`] roots are traversed, gated through
+///   [`ensure_allowed`]; traversal never leaves an allowed root.
+/// - Symbolic links are never followed (via the shared [`walk_recursive`]).
+/// - Unix inode cycle detection prevents infinite loops from hardlink-based
+///   directory cycles or bind mounts.
+/// - Per-branch errors are tolerated: an unreadable subdirectory is skipped,
+///   and an unreadable member is dropped from its group (never a hard error).
+/// - Regular files only; folders (and symlinks) are never candidates. Zero-byte
+///   files are valid candidates and group together via their shared digest.
+/// - The Smart File Manager trash subtree (`trash`) is never scanned, so
+///   trashed copies and their sidecar metadata never appear as candidates.
+/// - ONLY files sharing an exact byte size ever reach the hasher.
+/// - The scan is hard-capped at `max_visited_entries` visited entries,
+///   `max_bytes_hashed` streamed content bytes, and `max_groups` returned
+///   groups. When any cap is hit, remaining work is dropped and `truncated` is
+///   set so the caller can present the prefix honestly.
+/// - Deterministic ordering: groups by shared size, largest first (ties by
+///   first-member path); members by path.
+pub fn find_duplicate_groups(
+    allow_list: &AllowList,
+    trash: &TrashRoot,
+    max_visited_entries: usize,
+    max_groups: usize,
+) -> Result<DuplicateGroupsResult, String> {
+    find_duplicate_groups_budgeted(
+        allow_list,
+        trash,
+        max_visited_entries,
+        max_groups,
+        DUPLICATE_SCAN_MAX_BYTES_HASHED,
+    )
+}
+
+/// [`find_duplicate_groups`] with an explicit byte-hashing budget, so the
+/// truncation behavior can be exercised by tests with tiny budgets without
+/// writing hundreds of MiB of files.
+fn find_duplicate_groups_budgeted(
+    allow_list: &AllowList,
+    trash: &TrashRoot,
+    max_visited_entries: usize,
+    max_groups: usize,
+    max_bytes_hashed: u64,
+) -> Result<DuplicateGroupsResult, String> {
+    // Canonicalize the trash offset so the exclusion matches the canonical walk
+    // paths (e.g. /var -> /private/var on macOS). Fall back to the raw path if
+    // the trash cannot be canonicalized (it does not exist yet — nothing to
+    // exclude anyway).
+    let trash_canonical: PathBuf = trash
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| trash.root().to_path_buf());
+
+    let mut buckets: std::collections::HashMap<u64, Vec<FileEntry>> =
+        std::collections::HashMap::new();
+    let mut truncated = false;
+    let mut visited_entries: usize = 0;
+
+    'roots: for root in allow_list.roots() {
+        ensure_allowed(allow_list, root)?;
+        let mut visited = std::collections::HashSet::new();
+
+        let mut visit = |entry_path: &Path, meta: &fs::Metadata| -> bool {
+            // Traversal budget, checked before visiting this entry — same
+            // convention as the search visitor.
+            if visited_entries >= max_visited_entries {
+                truncated = true;
+                return false;
+            }
+            visited_entries += 1;
+
+            // Only regular files are size-bucket candidates.
+            if !meta.is_file() {
+                return true;
+            }
+            let entry = build_file_entry(entry_path, meta);
+            buckets.entry(entry.size_bytes).or_default().push(entry);
+            true
+        };
+
+        let mut skip_trash = |dir: &Path| -> bool { dir == trash_canonical.as_path() };
+
+        if !walk_recursive_skipping(root, &mut visited, &mut visit, &mut skip_trash) {
+            break 'roots; // the traversal budget was reached
+        }
+    }
+
+    // Candidates for verification: buckets holding 2+ same-size files. Members
+    // are sorted by path, giving every size bucket a deterministic, stable
+    // order that carries into the per-hash sub-groups below.
+    let mut candidates: Vec<(u64, Vec<FileEntry>)> = buckets
+        .into_iter()
+        .filter(|(_, entries)| entries.len() >= 2)
+        .collect();
+    for (_, entries) in candidates.iter_mut() {
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    // Process buckets from largest size to smallest (ties by first-member
+    // path), matching the final display order — so a hashing-budget truncation
+    // always keeps the highest-priority verified groups.
+    candidates.sort_by(|(a_size, a_entries), (b_size, b_entries)| {
+        b_size
+            .cmp(a_size)
+            .then_with(|| a_entries[0].path.cmp(&b_entries[0].path))
+    });
+
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+    let mut bytes_hashed: u64 = 0;
+
+    'verify: for (size_bytes, entries) in candidates {
+        // Only files already matched by exact size reach the hasher.
+        let mut by_hash: std::collections::HashMap<[u8; 32], Vec<FileEntry>> =
+            std::collections::HashMap::new();
+        for entry in entries {
+            match streamed_sha256(Path::new(&entry.path), &mut bytes_hashed, max_bytes_hashed) {
+                HashRead::Done(digest) => by_hash.entry(digest).or_default().push(entry),
+                // Tolerate an unreadable member (permission error, vanished
+                // mid-scan): drop it without poisoning the scan.
+                HashRead::Unreadable => continue,
+                // The global byte budget is exhausted — stop hashing entirely.
+                HashRead::OutOfBudget => {
+                    truncated = true;
+                    break 'verify;
+                }
+            }
+        }
+
+        for (_, mut items) in by_hash {
+            if items.len() < 2 {
+                continue;
+            }
+            items.sort_by(|a, b| a.path.cmp(&b.path));
+            groups.push(DuplicateGroup {
+                id: items[0].path.clone(),
+                size_bytes,
+                size: format_size(size_bytes),
+                items,
+            });
+        }
+    }
+
+    // Deterministic ordering: shared size, largest first; ties break by id.
+    groups.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    // The group budget is applied at emit time (groups only become known after
+    // the verification pass finishes). Extra groups are dropped and honestly
+    // flagged, matching the storage/search "prefix only" convention.
+    if groups.len() > max_groups {
+        groups.truncate(max_groups);
+        truncated = true;
+    }
+
+    Ok(DuplicateGroupsResult { groups, truncated })
+}
+
+/// Outcome of streaming one file through SHA-256.
+enum HashRead {
+    /// The whole file was hashed within budget; carries its 32-byte digest.
+    Done([u8; 32]),
+    /// The file could not be opened/read. Tolerated: the member is dropped.
+    Unreadable,
+    /// The global byte budget ran out before EOF. The caller must stop and
+    /// report `truncated`.
+    OutOfBudget,
+}
+
+/// Stream a file's contents through SHA-256 without ever loading the whole
+/// file into memory, deducting every byte read from `bytes_hashed` against
+/// `bytes_budget`.
+///
+/// A file is only fully verified if EOF is reached WITHIN budget; a file that
+/// consumes the budget exactly cannot be confirmed as fully read and is
+/// treated as [`HashRead::OutOfBudget`]. Zero-byte files hash for free (EOF on
+/// the first read) and produce the canonical empty digest, so exact-size empty
+/// files keep forming duplicates.
+fn streamed_sha256(
+    path: &Path,
+    bytes_hashed: &mut u64,
+    bytes_budget: u64,
+) -> HashRead {
+    use sha2::{Digest, Sha256};
+
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashRead::Unreadable,
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        if *bytes_hashed >= bytes_budget {
+            return HashRead::OutOfBudget;
+        }
+        let want = buf.len().min((bytes_budget - *bytes_hashed) as usize);
+        let n = match io::Read::read(&mut file, &mut buf[..want]) {
+            Ok(n) => n,
+            Err(_) => return HashRead::Unreadable,
+        };
+        if n == 0 {
+            return HashRead::Done(hasher.finalize().into());
+        }
+        hasher.update(&buf[..n]);
+        *bytes_hashed += n as u64;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4714,6 +5009,258 @@ mod tests {
         // exhaustion must degrade to an Err, never a panic.
         let result = super::unique_duplicate_name(parent, "a.txt", 3);
         assert_eq!(result.unwrap_err(), "Unable to allocate a unique duplicate name");
+    }
+
+    // -- duplicate-candidate scan (size bucketing) --------------------------
+
+    fn dup_scan_trash(tmp: &TempDir) -> TrashRoot {
+        TrashRoot { root: tmp.path().join(TRASH_DIR_NAME) }
+    }
+
+    #[test]
+    fn dup_scan_groups_same_size_files() {
+        let tmp = TempDir::new("dup_scan_same");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("a.txt"), "hello!!!!!");
+        write_file(&tmp.child("b.txt"), "hello!!!!!");
+        write_file(&tmp.child("c.txt"), "different length here");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.groups.len(), 1);
+        let group = &result.groups[0];
+        assert_eq!(group.size_bytes, 10);
+        assert_eq!(group.items.len(), 2);
+    }
+
+    #[test]
+    fn dup_scan_ignores_files_with_different_sizes() {
+        let tmp = TempDir::new("dup_scan_diff");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("x.txt"), "1");
+        write_file(&tmp.child("y.txt"), "22");
+        write_file(&tmp.child("z.txt"), "333");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(result.groups.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn dup_scan_zero_byte_files_can_form_a_group() {
+        let tmp = TempDir::new("dup_scan_zero");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("z1.txt"), "");
+        write_file(&tmp.child("z2.txt"), "");
+        write_file(&tmp.child("z3.bin"), "");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].size_bytes, 0);
+        assert_eq!(result.groups[0].items.len(), 3);
+    }
+
+    #[test]
+    fn dup_scan_singletons_are_omitted() {
+        let tmp = TempDir::new("dup_scan_single");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("solo.txt"), "unique content here");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(result.groups.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn dup_scan_traversal_budget_is_honored() {
+        let tmp = TempDir::new("dup_scan_trav");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("p1.txt"), "same sized!");
+        write_file(&tmp.child("p2.txt"), "same sized!");
+
+        // Visiting a single entry busts a traversal budget of one, so only the
+        // first file is seen — its size-twin is never discovered and the scan
+        // honestly reports truncation.
+        let result = super::find_duplicate_groups(&allow, &trash, 1, 100).unwrap();
+        assert!(result.truncated);
+        assert!(result.groups.is_empty());
+    }
+
+    #[test]
+    fn dup_scan_group_budget_is_shared_across_roots() {
+        let tmp1 = TempDir::new("dup_scan_budget_r1");
+        let tmp2 = TempDir::new("dup_scan_budget_r2");
+        let mut allow = AllowList::with_root(&str_of(tmp1.path())).unwrap();
+        allow.register_root(&str_of(tmp2.path())).unwrap();
+        let trash = dup_scan_trash(&tmp1);
+        write_file(&tmp1.child("l1.txt"), "01234567890123456789");
+        write_file(&tmp1.child("l2.txt"), "01234567890123456789");
+        write_file(&tmp2.child("m1.txt"), "abcdefghij");
+        write_file(&tmp2.child("m2.txt"), "abcdefghij");
+
+        // Only one group fits the budget; the larger 20 B pair wins the sort,
+        // the 10 B pair from the second root is dropped — globally.
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 1).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].size_bytes, 20);
+        assert_eq!(result.groups[0].items.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dup_scan_symlinks_are_not_followed() {
+        let tmp = TempDir::new("dup_scan_sym");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("real.txt"), "same size!!");
+        // A symlink whose target shares the real file's size must be skipped:
+        // the walker never follows it, so real.txt stays a singleton.
+        std::os::unix::fs::symlink(&tmp.child("real.txt"), &tmp.child("link.txt")).unwrap();
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(result.groups.is_empty());
+    }
+
+    #[test]
+    fn dup_scan_excludes_trash_subtree() {
+        let tmp = TempDir::new("dup_scan_trash");
+        let allow = allow_for(&tmp);
+        let trash_root = tmp.path().join(TRASH_DIR_NAME);
+        let trash = TrashRoot { root: trash_root.clone() };
+        write_file(&tmp.child("real.txt"), "same thing!");
+        write_file(&tmp.child("real (copy).txt"), "same thing!");
+        // A trashed same-size copy must never become a candidate.
+        fs::create_dir_all(&trash_root).unwrap();
+        write_file(&trash_root.join("trashed copy.txt"), "same thing!");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        let group = &result.groups[0];
+        assert_eq!(group.items.len(), 2);
+        for item in &group.items {
+            assert!(!item.path.contains(TRASH_DIR_NAME));
+        }
+    }
+
+    #[test]
+    fn dup_scan_allowlist_boundaries_enforced() {
+        let root = TempDir::new("dup_scan_al_r");
+        let outside = TempDir::new("dup_scan_al_o");
+        let allow = allow_for(&root);
+        let trash = dup_scan_trash(&root);
+        write_file(&root.child("in1.txt"), "boundary!");
+        write_file(&root.child("in2.txt"), "boundary!");
+        // Identical-size matches OUTSIDE the allowed root never surface.
+        write_file(&outside.child("out1.txt"), "boundary!");
+        write_file(&outside.child("out2.txt"), "boundary!");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        let group = &result.groups[0];
+        assert_eq!(group.items.len(), 2);
+        for item in &group.items {
+            assert!(Path::new(&item.path).starts_with(&allow.roots()[0]));
+        }
+    }
+
+    #[test]
+    fn dup_scan_deterministic_ordering() {
+        let tmp = TempDir::new("dup_scan_order");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        fs::create_dir_all(tmp.child("big")).unwrap();
+        fs::create_dir_all(tmp.child("tinysmall")).unwrap();
+        fs::create_dir_all(tmp.child("zz").join("aaa")).unwrap();
+        write_file(&tmp.child("big").join("data.txt"), "01234567890123456789");
+        write_file(&tmp.child("tinysmall").join("data.txt"), "01234567890123456789");
+        write_file(&tmp.child("b1.txt"), "0123456789");
+        write_file(&tmp.child("zz").join("aaa").join("s.txt"), "0123456789");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.groups.len(), 2);
+        // Groups: largest shared size first.
+        assert_eq!(result.groups[0].size_bytes, 20);
+        assert_eq!(result.groups[1].size_bytes, 10);
+        // Members within each group sorted by path.
+        assert_eq!(result.groups[0].items.len(), 2);
+        assert!(result.groups[0].items[0].path < result.groups[0].items[1].path);
+        assert_eq!(result.groups[1].items.len(), 2);
+        assert!(result.groups[1].items[0].path < result.groups[1].items[1].path);
+    }
+
+    // -- duplicate content verification (streamed SHA-256) -------------------
+
+    #[test]
+    fn dup_scan_identical_contents_form_a_verified_group() {
+        let tmp = TempDir::new("dup_scan_verify_ok");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("one.txt"), "exact bytes!!");
+        write_file(&tmp.child("two.txt"), "exact bytes!!");
+        // Same size as the pair, but different content: must NOT join them.
+        write_file(&tmp.child("three.txt"), "exact bytes!?");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].size_bytes, 13);
+        assert_eq!(result.groups[0].items.len(), 2);
+    }
+
+    #[test]
+    fn dup_scan_same_size_but_different_contents_are_not_duplicates() {
+        let tmp = TempDir::new("dup_scan_verify_mismatch");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("left.txt"), "abcdefghij");
+        write_file(&tmp.child("right.txt"), "klmnopqrst");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(!result.truncated);
+        assert!(result.groups.is_empty());
+    }
+
+    #[test]
+    fn dup_scan_identical_content_different_sizes_are_not_grouped() {
+        let tmp = TempDir::new("dup_scan_verify_sizes");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        // Same content, different sizes: hashing is only ever reached for files
+        // already matched by exact byte size, so these never group.
+        write_file(&tmp.child("short.txt"), "abc");
+        write_file(&tmp.child("long.txt"), "abcabc");
+
+        let result = super::find_duplicate_groups(&allow, &trash, 100, 100).unwrap();
+        assert!(!result.truncated);
+        assert!(result.groups.is_empty());
+    }
+
+    #[test]
+    fn dup_scan_hash_budget_truncation_keeps_verified_prefix() {
+        let tmp = TempDir::new("dup_scan_hash_budget");
+        let allow = allow_for(&tmp);
+        let trash = dup_scan_trash(&tmp);
+        write_file(&tmp.child("big1.txt"), "aaaaaaaaaa");
+        write_file(&tmp.child("big2.txt"), "aaaaaaaaaa");
+        write_file(&tmp.child("small1.txt"), "bbbb");
+        write_file(&tmp.child("small2.txt"), "bbbb");
+
+        // The 21-byte hash budget covers the 10 B bucket (2 x 10) but not the
+        // 4 B bucket: the big pair verifies, the small pair is never hashed
+        // (dropped), and truncation is reported honestly.
+        let result =
+            super::find_duplicate_groups_budgeted(&allow, &trash, 100, 100, 21).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].size_bytes, 10);
+        assert_eq!(result.groups[0].items.len(), 2);
     }
 
     #[test]

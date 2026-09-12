@@ -250,6 +250,26 @@ fn create_file(
     fs_service::create_file(allow_list.inner(), &path)
 }
 
+/// Scan every allowed root for file CANDIDATES that share the exact same byte
+/// size. The scan is hard-capped at
+/// [`fs_service::DUPLICATE_SCAN_MAX_VISITED_ENTRIES`] visited entries and
+/// returns at most [`fs_service::DUPLICATE_SCAN_MAX_GROUPS`] candidate groups,
+/// reporting `truncated`. This is size-bucketing ONLY — contents are not
+/// hashed, so group members are candidates, never confirmed duplicates. The
+/// application-managed trash subtree is excluded from the scan.
+#[tauri::command]
+fn duplicate_groups(
+    allow_list: tauri::State<fs_service::AllowList>,
+    trash: tauri::State<fs_service::TrashRoot>,
+) -> Result<fs_service::DuplicateGroupsResult, String> {
+    fs_service::find_duplicate_groups(
+        allow_list.inner(),
+        trash.inner(),
+        fs_service::DUPLICATE_SCAN_MAX_VISITED_ENTRIES,
+        fs_service::DUPLICATE_SCAN_MAX_GROUPS,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -316,6 +336,7 @@ pub fn run() {
             resolve_starred_paths,
             duplicate_item,
             create_file,
+            duplicate_groups,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

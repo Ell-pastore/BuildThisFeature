@@ -19,6 +19,8 @@ export type {
   StorageBreakdown,
   StorageCategory,
   StorageCategoryName,
+  DuplicateGroup,
+  DuplicateGroupsResult,
 } from "./provider";
 export { STORAGE_CATEGORY_NAMES } from "./provider";
 

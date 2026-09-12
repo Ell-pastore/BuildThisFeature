@@ -32,3 +32,7 @@ open = "5"
 # total space). It is ALREADY in the dependency tree transitively, so adding
 # it introduces no new crates — and it replaces fabricated storage numbers.
 libc = "0.2"
+# sha2 provides content verification for duplicate detection: files that share
+# an exact size are stream-hashed, and only identical SHA-256 digests form a
+# confirmed duplicate group.
+sha2 = "0.10"

@@ -77,6 +77,30 @@ export interface SearchFilesResult {
   truncated: boolean;
 }
 
+/** A single confirmed duplicate group. Members share the exact same byte size
+ * AND the exact same content digest (verified by the Rust scan). Members are
+ * already shared-model items, sorted by path. */
+export interface DuplicateGroup {
+  /** Canonical path of the first member when sorted by path (stable id). */
+  id: string;
+  /** Exact shared byte size of every member. */
+  sizeBytes: number;
+  /** Human-readable shared size, e.g. "2.4 MB". */
+  size: string;
+  /** Confirmed duplicate members (always 2+, never singletons). */
+  items: FileItem[];
+}
+
+/** Bounded duplicate-verification result. `truncated` is true when the
+ * provider's traversal, hashing, or group budget was reached before the whole
+ * tree was verified, so `groups` is a partial view of the verified prefix. */
+export interface DuplicateGroupsResult {
+  /** Confirmed duplicate groups, deterministically ordered (largest size
+   * first; ties by first-member path; members by path). */
+  groups: DuplicateGroup[];
+  truncated: boolean;
+}
+
 /** The seven extension-derived storage categories, in canonical display order. */
 export const STORAGE_CATEGORY_NAMES = [
   "Documents",
@@ -185,4 +209,9 @@ export interface FilesystemProvider {
 
   /** Duplicate an item into the same parent with a collision-safe name: `name (copy).ext`, then `name (copy 2).ext`, etc. */
   duplicateItem(path: string): Promise<string>;
+
+  /** Scan every allowed root for CONFIRMED duplicate files (same size + same content digest).
+   * Elides the app-managed trash and symlinks; bounded by the provider's traversal, hashing,
+   * and group budgets, with `truncated` reported honestly when a budget was hit. */
+  duplicateGroups(): Promise<DuplicateGroupsResult>;
 }
