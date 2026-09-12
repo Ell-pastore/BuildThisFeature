@@ -21,6 +21,7 @@ const providerMock = vi.hoisted(() => {
     "trashItem",
     "listTrash",
     "restoreItem",
+    "homeDirectory",
     "searchFiles",
     "readFile",
   ];
@@ -85,6 +86,34 @@ function listing(items: FileItem[]) {
     isHome: false,
     items,
   };
+}
+
+function folderItem(name: string, path: string): FileItem {
+  return {
+    id: path,
+    name,
+    type: "folder",
+    size: "—",
+    sizeBytes: 0,
+    modified: "Sep 1, 2026",
+    created: "Aug 1, 2026",
+    createdTs: 1,
+    modifiedTs: 2,
+    location: path.slice(0, Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))),
+    path,
+    starred: false,
+    isFolder: true,
+    itemCount: 0,
+  };
+}
+
+function pathListing(
+  path: string,
+  parentPath: string | null,
+  isHome: boolean,
+  items: FileItem[],
+) {
+  return { path, parentPath, isHome, items };
 }
 
 describe("App move preview synchronization", () => {
@@ -383,5 +412,136 @@ describe("App trash view synchronization", () => {
     // The Trash view re-reads the list after restore, no manual Retry needed.
     expect(providerMock.listTrash.mock.calls.length).toBe(2);
     expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
+  });
+});
+
+describe("App dead-directory recovery", () => {
+  beforeEach(() => {
+    providerMock.homeDirectory.mockResolvedValue("/Users/usr");
+    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
+    providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
+    providerMock.openItem.mockResolvedValue(undefined);
+    providerMock.listDirectory.mockImplementation((path?: string) => {
+      if (path === "/Users/usr/Desktop") {
+        return Promise.resolve(
+          pathListing("/Users/usr/Desktop", "/Users/usr", false, [
+            folderItem("Projects", "/Users/usr/Desktop/Projects"),
+          ]),
+        );
+      }
+      if (path === "/Users/usr/Desktop/Projects") {
+        return Promise.resolve(
+          pathListing("/Users/usr/Desktop/Projects", "/Users/usr/Desktop", false, [
+            { ...fileItem("notes.txt"), path: "/Users/usr/Desktop/Projects/notes.txt", id: "/Users/usr/Desktop/Projects/notes.txt", location: "/Users/usr/Desktop/Projects" },
+          ]),
+        );
+      }
+      return Promise.resolve(
+        pathListing("/Users/usr", null, true, [folderItem("Desktop", "/Users/usr/Desktop")]),
+      );
+    });
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    cleanup();
+  });
+
+  async function openFolderRow(name: string) {
+    // Wait for the Files-view row to appear (skip the Sidebar Smart-Folders
+    // label which can share the same name).
+    await waitFor(() => {
+      const el = screen.getAllByText(name).find((e) => !e.closest("aside"));
+      expect(el).toBeTruthy();
+    });
+    const row = screen.getAllByText(name).find((e) => !e.closest("aside")) as HTMLElement;
+    fireEvent.click(row);
+  }
+
+  it("recovers from a current directory renamed/moved/deleted elsewhere to its nearest valid parent", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    await openFolderRow("Desktop");
+    await openFolderRow("Projects");
+    expect(await screen.findByText("notes.txt")).toBeInTheDocument();
+
+    // The folder being viewed no longer exists; its parent is still there.
+    providerMock.listDirectory.mockImplementation((path?: string) => {
+      if (path === "/Users/usr/Desktop") {
+        return Promise.resolve(
+          pathListing("/Users/usr/Desktop", "/Users/usr", false, [
+            { ...fileItem("budget.pdf"), path: "/Users/usr/Desktop/budget.pdf", id: "/Users/usr/Desktop/budget.pdf" },
+          ]),
+        );
+      }
+      return Promise.reject(
+        new Error("Unable to open this folder: The file or folder no longer exists."),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh folder" }));
+
+    expect(await screen.findByText("budget.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't load this folder")).not.toBeInTheDocument();
+    // Breadcrumbs reflect the recovered parent path, not the dead folder.
+    expect(screen.getByRole("button", { name: "Desktop" })).toBeInTheDocument();
+  });
+
+  it("climbs to the app home directory when intermediate parents are also gone", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    await openFolderRow("Desktop");
+    await openFolderRow("Projects");
+    expect(await screen.findByText("notes.txt")).toBeInTheDocument();
+
+    // Both the folder and its parent are gone; only the app home survives.
+    providerMock.listDirectory.mockImplementation((path?: string) => {
+      if (path === "/Users/usr") {
+        return Promise.resolve(
+          pathListing("/Users/usr", null, true, [folderItem("Library", "/Users/usr/Library")]),
+        );
+      }
+      return Promise.reject(
+        new Error("Unable to open this folder: The file or folder no longer exists."),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh folder" }));
+
+    expect(await screen.findByText("Library")).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't load this folder")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "usr" })).toBeInTheDocument();
+  });
+
+  it("preserves the normal error state for a genuine filesystem error, without recovering", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    await openFolderRow("Desktop");
+    await openFolderRow("Projects");
+    expect(await screen.findByText("notes.txt")).toBeInTheDocument();
+
+    providerMock.listDirectory.mockImplementation((path?: string) => {
+      if (path === "/Users/usr/Desktop") {
+        return Promise.resolve(pathListing("/Users/usr/Desktop", "/Users/usr", false, []));
+      }
+      return Promise.reject(new Error("Unable to open this folder: Permission denied."));
+    });
+
+    // Clear call history from the navigation phase so only refresh-triggered
+    // calls are checked — we want to verify recovery did NOT fire for a
+    // genuine (non-dead) error.
+    providerMock.listDirectory.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh folder" }));
+
+    expect(await screen.findByText("Couldn't load this folder")).toBeInTheDocument();
+    expect(
+      screen.getByText("Unable to open this folder: Permission denied."),
+    ).toBeInTheDocument();
+    // Recovery must not silently jump elsewhere for a genuine error.
+    expect(providerMock.listDirectory).not.toHaveBeenCalledWith("/Users/usr/Desktop");
   });
 });

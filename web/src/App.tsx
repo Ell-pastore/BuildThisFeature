@@ -15,7 +15,7 @@ import Duplicates from "./components/views/Duplicates";
 import SmartFolders from "./components/views/SmartFolders";
 import Storage from "./components/views/Storage";
 import Settings from "./components/views/Settings";
-import { getFilesystemProvider, type DiskUsage, type StorageBreakdown } from "./services/filesystem";
+import { getFilesystemProvider, type DirListing, type DiskUsage, type StorageBreakdown } from "./services/filesystem";
 import { useStars } from "./services/stars";
 import type { FileItem } from "./types";
 
@@ -76,6 +76,69 @@ function renamedItemPreview(item: FileItem, newName: string): FileItem & { path:
   const type = item.isFolder ? "folder" : dot > 0 ? newName.slice(dot + 1).toLowerCase() : "file";
   return { ...item, id: newPath, path: newPath, name: newName, type, location: parent };
 }
+
+/** True when a listing error means the requested path itself no longer exists. */
+function isDeadDirectoryError(msg: string): boolean {
+  return (
+    /no longer exists/i.test(msg) ||
+    /no such file or directory/i.test(msg) ||
+    /ENOENT/i.test(msg)
+  );
+}
+
+/** Parent of an absolute path, or null at a filesystem root. */
+function parentDirOf(p: string): string | null {
+  const idx = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  if (idx < 1) return null;
+  return p.slice(0, idx);
+}
+
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+/** Whether `candidate` equals `home` or lives inside it. */
+function isWithinHome(candidate: string, home: string): boolean {
+  const c = normalizePath(candidate);
+  const h = normalizePath(home);
+  return c === h || c.startsWith(h.endsWith("/") ? h : `${h}/`);
+}
+
+function isHomePath(candidate: string, home: string): boolean {
+  return normalizePath(candidate) === normalizePath(home);
+}
+
+/**
+ * Climb from a dead directory path to the nearest still-listable directory,
+ * never above the app home directory. Falls back to the home directory itself.
+ * Returns null only when nothing in the chain can be listed — the caller then
+ * keeps its normal error state.
+ */
+async function recoverFromDeadPath(path: string): Promise<DirListing | null> {
+  let home: string | undefined;
+  try {
+    home = (await filesystem.homeDirectory()).trim() || undefined;
+  } catch {
+    home = undefined;
+  }
+  const candidates: string[] = [];
+  let candidate = parentDirOf(path);
+  while (candidate) {
+    if (home === undefined || isWithinHome(candidate, home)) candidates.push(candidate);
+    if (home !== undefined && isHomePath(candidate, home)) break;
+    candidate = parentDirOf(candidate);
+  }
+  if (home !== undefined && !candidates.some((c) => isHomePath(c, home))) candidates.push(home);
+  for (const c of candidates) {
+    try {
+      return await filesystem.listDirectory(c);
+    } catch {
+      // That ancestor is gone too; keep climbing toward the nearest valid one.
+    }
+  }
+  return null;
+}
+
 export default function App() {
   const [view, setView] = useState<View>("home");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -222,7 +285,21 @@ export default function App() {
       setFiles(listing.items);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Friendly hint when running in a plain browser rather than Tauri.
+      // A previously valid directory can disappear when its folder is renamed,
+      // moved, or deleted elsewhere. Recover to the nearest valid parent/home
+      // directory instead of parking the Files view on a dead path error with
+      // stale breadcrumbs. Genuine failures (permissions, not-a-folder, unavailable
+      // home, path outside the allowlist) keep their normal error state.
+      if (path && isDeadDirectoryError(msg)) {
+        const recovered = await recoverFromDeadPath(path);
+        if (recovered) {
+          setDirPath(recovered.path);
+          setParentPath(recovered.parentPath);
+          setIsHome(recovered.isHome);
+          setFiles(recovered.items);
+          return;
+        }
+      }
       setError(msg.includes("__TAURI") || /no tauri/i.test(msg)
         ? "Run this app inside the Tauri desktop shell to browse your files."
         : msg);
