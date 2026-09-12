@@ -137,13 +137,20 @@ fn disk_usage(
 
 /// Recursively search for files and directories by name across all allowed
 /// roots. Returns both files and directories whose names contain the
-/// (case-insensitive) query substring.
+/// (case-insensitive) query substring. The search is bounded: it stops after
+/// [`fs_service::SEARCH_MAX_VISITED_ENTRIES`] visited entries and returns at
+/// most [`fs_service::SEARCH_MAX_RESULTS`] results, reporting `truncated`.
 #[tauri::command]
 fn search_files(
     query: String,
     allow_list: tauri::State<fs_service::AllowList>,
-) -> Result<Vec<fs_service::FileEntry>, String> {
-    fs_service::search_files(allow_list.inner(), &query)
+) -> Result<fs_service::SearchFilesResult, String> {
+    fs_service::search_files(
+        allow_list.inner(),
+        &query,
+        fs_service::SEARCH_MAX_VISITED_ENTRIES,
+        fs_service::SEARCH_MAX_RESULTS,
+    )
 }
 
 /// Return the most recently modified files and directories across all allowed

@@ -39,6 +39,9 @@ interface SearchProps {
   searching?: boolean;
   /** Honest error string when the underlying search failed. */
   error?: string | null;
+  /** True when the bounded search hit its safety budget, so results are a
+   * partial view of the filesystem (mirrors Storage's `scanCapped` note). */
+  truncated?: boolean;
 }
 
 export default function Search({
@@ -48,6 +51,7 @@ export default function Search({
   results = [],
   searching = false,
   error = null,
+  truncated = false,
 }: SearchProps) {
   const hasQuery = query.trim().length > 0;
   const [activeFilter, setActiveFilter] = useState("All");
@@ -135,6 +139,11 @@ export default function Search({
           ) : (
             <>
               <div className="text-xs text-muted-foreground mb-3">{filtered.length} results</div>
+              {truncated && filtered.length > 0 && (
+                <div className="mb-3 rounded-lg border border-border bg-card px-4 py-3 text-xs text-muted-foreground">
+                  The search stopped at its safety limit — results may be incomplete.
+                </div>
+              )}
               <div className="space-y-2">
                 {filtered.map((file) => (
                   <button

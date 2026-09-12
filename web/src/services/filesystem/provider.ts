@@ -69,6 +69,14 @@ export interface StarredResolution {
   missing: string[];
 }
 
+/** Bounded recursive filename search result. Entries are already shared-model
+ * items; `truncated` is true when the provider's traversal or result budget was
+ * reached before the whole tree was scanned, so `entries` may be incomplete. */
+export interface SearchFilesResult {
+  entries: FileItem[];
+  truncated: boolean;
+}
+
 /** The seven extension-derived storage categories, in canonical display order. */
 export const STORAGE_CATEGORY_NAMES = [
   "Documents",
@@ -145,8 +153,9 @@ export interface FilesystemProvider {
   diskUsage(path?: string): Promise<DiskUsage>;
 
   /** Recursively search filenames across all allowed roots. Returns both files and directories
-   * whose names contain the (case-insensitive) query. Empty query returns an empty array. */
-  searchFiles(query: string): Promise<FileItem[]>;
+   * whose names contain the (case-insensitive) query. Empty query returns an empty result.
+   * The provider bounds the search (traversal/result budgets) and reports `truncated` honestly. */
+  searchFiles(query: string): Promise<SearchFilesResult>;
 
   /** Return up to `limit` (default 20) most recently modified files and folders across all
    * allowed roots, newest first. The result is hard-capped at `limit` by the provider. */

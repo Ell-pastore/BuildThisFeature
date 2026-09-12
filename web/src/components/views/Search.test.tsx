@@ -47,6 +47,21 @@ describe("Search", () => {
     expect(screen.getByText(/\/Users\/usr\/Desktop · Sep 1, 2026/)).toBeInTheDocument();
   });
 
+  it("honestly notes when the bounded search stopped at its safety limit", () => {
+    render(<Search query="re" results={[file()]} onOpenFile={() => {}} truncated />);
+
+    expect(
+      screen.getByText("The search stopped at its safety limit — results may be incomplete."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("omits the truncation note when the search completed within its budgets", () => {
+    render(<Search query="re" results={[file()]} onOpenFile={() => {}} />);
+
+    expect(screen.queryByText(/stopped at its safety limit/i)).toBeNull();
+  });
+
   it("navigates into a folder result via onOpenFolder instead of opening the preview", () => {
     const folderResult: FileItem = file({
       id: "/Users/usr/Documents/Current Projects",

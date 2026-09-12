@@ -150,6 +150,9 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<FileItem[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  // Honest flag from the bounded search: true when a safety budget stopped the
+  // scan before the whole tree, so results may be a partial view.
+  const [searchTruncated, setSearchTruncated] = useState(false);
 
   // Real filesystem state driven by Tauri/Rust.
   const [dirPath, setDirPath] = useState<string>("");
@@ -352,6 +355,7 @@ export default function App() {
     const q = query.trim();
     if (!q) {
       setSearchResults([]);
+      setSearchTruncated(false);
       setSearching(false);
       setSearchError(null);
       return;
@@ -362,10 +366,12 @@ export default function App() {
       const found = await filesystem.searchFiles(q);
       // Search entries are real provider FileItems; stars are the same
       // localStorage annotation the rest of the app applies.
-      setSearchResults(found.map((f) => ({ ...f, starred: isStarred(f.path ?? f.id) })));
+      setSearchResults(found.entries.map((f) => ({ ...f, starred: isStarred(f.path ?? f.id) })));
+      setSearchTruncated(found.truncated);
     } catch (err) {
       setSearchError(err instanceof Error ? err.message : String(err));
       setSearchResults([]);
+      setSearchTruncated(false);
     } finally {
       setSearching(false);
     }
@@ -585,6 +591,7 @@ export default function App() {
                 onOpenFile={openPreview}
                 onOpenFolder={openFolder}
                 results={searchResults}
+                truncated={searchTruncated}
               />
             )}
             {view === "ai-organization" && <AIOrganization />}

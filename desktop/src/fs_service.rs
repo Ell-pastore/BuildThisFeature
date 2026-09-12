@@ -1143,6 +1143,31 @@ where
     true
 }
 
+/// Result of a bounded recursive filename search. Carries the matched entries
+/// plus an honest `truncated` flag so the UI can say when a safety budget was
+/// reached before the whole tree was scanned.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFilesResult {
+    /// Matching files and directories, sorted by path. At most
+    /// [`SEARCH_MAX_RESULTS`] entries.
+    pub entries: Vec<FileEntry>,
+    /// True when the traversal or result budget was reached before the
+    /// entire tree was scanned, so `entries` is a potentially partial view
+    /// of the filesystem.
+    pub truncated: bool,
+}
+
+/// Safety cap for a recursive filename search: the walk stops after this many
+/// visited entries (files AND directories) across all allowed roots, so a broad
+/// query cannot traverse an unbounded tree.
+pub const SEARCH_MAX_VISITED_ENTRIES: usize = 100_000;
+
+/// Safety cap for a recursive filename search: at most this many matching
+/// entries are returned, so a broad query cannot yield an unbounded result
+/// list. When hit, [`SearchFilesResult::truncated`] is set.
+pub const SEARCH_MAX_RESULTS: usize = 500;
+
 /// Search recursively through every root in the [`AllowList`] for files and
 /// directories whose names contain the (case-insensitive) `query` substring.
 ///
@@ -1161,37 +1186,78 @@ where
 ///   touching the filesystem.
 /// - Results are sorted by path for deterministic output.
 ///
+/// # Budgets
+///
+/// The search is bounded so it cannot run unbounded on a large filesystem:
+/// - **Result budget** (`max_results`): at most this many entries are
+///   collected; more matches are discarded and the result is marked truncated.
+/// - **Traversal budget** (`max_visited_entries`): the walk stops after
+///   visiting this many entries (files and directories) across all roots, so a
+///   broad query cannot scan an arbitrarily deep tree.
+///
+/// When either budget is reached, the corresponding root's walk is aborted
+/// and no further roots are visited. The returned entries are sorted
+/// regardless so the prefix is deterministic.
+///
 /// # Matching
 ///
 /// Filenames are matched using a case-insensitive substring search. Both files
 /// and directories are returned when their name contains the query.
-pub fn search_files(allow_list: &AllowList, query: &str) -> Result<Vec<FileEntry>, String> {
+pub fn search_files(
+    allow_list: &AllowList,
+    query: &str,
+    max_visited_entries: usize,
+    max_results: usize,
+) -> Result<SearchFilesResult, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchFilesResult {
+            entries: Vec::new(),
+            truncated: false,
+        });
     }
 
     let query_lower = trimmed.to_lowercase();
     let mut results: Vec<FileEntry> = Vec::new();
+    let mut truncated = false;
+    let mut visited_entries: usize = 0;
 
-    for root in allow_list.roots() {
+    'roots: for root in allow_list.roots() {
         ensure_allowed(allow_list, root)?;
         let mut visited = std::collections::HashSet::new();
-        walk_recursive(root, &mut visited, &mut |entry_path, meta| {
+
+        let mut visit = |entry_path: &Path, meta: &fs::Metadata| -> bool {
+            // Check both budgets before visiting this entry. If either is
+            // already at its limit, flag the result as truncated and abort
+            // the walk — we cannot guarantee a complete result set.
+            if visited_entries >= max_visited_entries || results.len() >= max_results {
+                truncated = true;
+                return false;
+            }
+            visited_entries += 1;
+
             // Case-insensitive substring match on the entry's final component.
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 if name.to_lowercase().contains(&query_lower) {
                     results.push(build_file_entry(entry_path, meta));
                 }
             }
-            true // search always walks the full tree
-        });
+            true
+        };
+
+        if !walk_recursive(root, &mut visited, &mut visit) {
+            break 'roots; // a budget was reached — do not scan further roots
+        }
     }
 
-    // Deterministic ordering: sort by canonical path.
+    // Deterministic ordering: sort by canonical path (even when truncated, so
+    // the returned prefix is stable).
     results.sort_by(|a, b| a.path.cmp(&b.path));
 
-    Ok(results)
+    Ok(SearchFilesResult {
+        entries: results,
+        truncated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3204,8 +3270,10 @@ mod tests {
         let allow = allow_for(&tmp);
         write_file(&tmp.child("anything.txt"), "data");
 
-        let results = super::search_files(&allow, "").unwrap();
-        assert!(results.is_empty());
+        let result =
+            super::search_files(&allow, "", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS).unwrap();
+        assert!(result.entries.is_empty());
+        assert!(!result.truncated);
     }
 
     #[test]
@@ -3214,8 +3282,11 @@ mod tests {
         let allow = allow_for(&tmp);
         write_file(&tmp.child("anything.txt"), "data");
 
-        let results = super::search_files(&allow, "   \t  ").unwrap();
-        assert!(results.is_empty());
+        let result =
+            super::search_files(&allow, "   \t  ", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(result.entries.is_empty());
+        assert!(!result.truncated);
     }
 
     #[test]
@@ -3225,9 +3296,11 @@ mod tests {
         write_file(&tmp.child("README.TXT"), "hello");
         write_file(&tmp.child("notes.txt"), "world");
 
-        let results = super::search_files(&allow, "readme").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "README.TXT");
+        let results =
+            super::search_files(&allow, "readme", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 1);
+        assert_eq!(results.entries[0].name, "README.TXT");
     }
 
     #[test]
@@ -3238,9 +3311,11 @@ mod tests {
         write_file(&tmp.child("my-report.txt"), "data");
         write_file(&tmp.child("budget.xlsx"), "data");
 
-        let results = super::search_files(&allow, "report").unwrap();
-        assert_eq!(results.len(), 2);
-        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        let results =
+            super::search_files(&allow, "report", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 2);
+        let names: Vec<&str> = results.entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"annual_report.pdf"));
         assert!(names.contains(&"my-report.txt"));
     }
@@ -3251,9 +3326,11 @@ mod tests {
         let allow = allow_for(&tmp);
         write_file(&tmp.child("target.txt"), "data");
 
-        let results = super::search_files(&allow, "target").unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].is_folder);
+        let results =
+            super::search_files(&allow, "target", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 1);
+        assert!(!results.entries[0].is_folder);
     }
 
     #[test]
@@ -3263,8 +3340,10 @@ mod tests {
         fs::create_dir_all(tmp.child("projects")).unwrap();
         write_file(&tmp.child("projects").join("file.txt"), "data");
 
-        let results = super::search_files(&allow, "projects").unwrap();
-        assert!(results.iter().any(|e| e.is_folder && e.name == "projects"));
+        let results =
+            super::search_files(&allow, "projects", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(results.entries.iter().any(|e| e.is_folder && e.name == "projects"));
     }
 
     #[test]
@@ -3280,9 +3359,11 @@ mod tests {
             "data",
         );
 
-        let results = super::search_files(&allow, "found").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "found.txt");
+        let results =
+            super::search_files(&allow, "found", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 1);
+        assert_eq!(results.entries[0].name, "found.txt");
     }
 
     #[test]
@@ -3295,13 +3376,17 @@ mod tests {
         write_file(&tmp1.child("alpha.txt"), "data");
         write_file(&tmp2.child("beta.txt"), "data");
 
-        let results = super::search_files(&allow, "alpha").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "alpha.txt");
+        let results =
+            super::search_files(&allow, "alpha", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 1);
+        assert_eq!(results.entries[0].name, "alpha.txt");
 
-        let results = super::search_files(&allow, "beta").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "beta.txt");
+        let results =
+            super::search_files(&allow, "beta", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 1);
+        assert_eq!(results.entries[0].name, "beta.txt");
     }
 
     #[test]
@@ -3311,12 +3396,14 @@ mod tests {
         fs::create_dir_all(tmp.child("sub")).unwrap();
         write_file(&tmp.child("sub").join("match.txt"), "data");
 
-        let results = super::search_files(&allow, "match").unwrap();
-        assert!(!results.is_empty());
+        let results =
+            super::search_files(&allow, "match", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(!results.entries.is_empty());
         // Use the canonical AllowList root with component-aware Path comparison
         // (not string-prefix matching) to verify containment.
         let root = &allow.roots()[0];
-        for entry in &results {
+        for entry in &results.entries {
             let entry_path = Path::new(&entry.path);
             assert!(entry_path.starts_with(root));
         }
@@ -3329,8 +3416,10 @@ mod tests {
         let allow = allow_for(&root);
         write_file(&outside.child("secret.txt"), "data");
 
-        let results = super::search_files(&allow, "secret").unwrap();
-        assert!(results.is_empty());
+        let results =
+            super::search_files(&allow, "secret", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(results.entries.is_empty());
     }
 
     #[cfg(unix)]
@@ -3344,9 +3433,11 @@ mod tests {
         // Create a symlink inside the allowed root pointing to a file outside.
         std::os::unix::fs::symlink(&outside.child("secret.txt"), &root.child("link.txt")).unwrap();
 
-        let results = super::search_files(&allow, "secret").unwrap();
+        let results =
+            super::search_files(&allow, "secret", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
         // The symlink itself is skipped; the target outside is never reached.
-        assert!(results.is_empty());
+        assert!(results.entries.is_empty());
     }
 
     #[cfg(unix)]
@@ -3360,8 +3451,10 @@ mod tests {
         std::os::unix::fs::symlink(tmp.child("cycle"), tmp.child("cycle").join("loop")).unwrap();
 
         // Should complete without hanging.
-        let results = super::search_files(&allow, "anything").unwrap();
-        assert!(results.is_empty());
+        let results =
+            super::search_files(&allow, "anything", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(results.entries.is_empty());
     }
 
     #[test]
@@ -3372,14 +3465,17 @@ mod tests {
         write_file(&tmp.child("apple.txt"), "data");
         write_file(&tmp.child("mango.txt"), "data");
 
-        let results = super::search_files(&allow, "").unwrap();
-        assert!(results.is_empty());
+        let results =
+            super::search_files(&allow, "", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS).unwrap();
+        assert!(results.entries.is_empty());
 
-        let results = super::search_files(&allow, "txt").unwrap();
-        assert_eq!(results.len(), 3);
+        let results =
+            super::search_files(&allow, "txt", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(results.entries.len(), 3);
         // Results must be sorted by path.
-        for i in 1..results.len() {
-            assert!(results[i - 1].path <= results[i].path);
+        for i in 1..results.entries.len() {
+            assert!(results.entries[i - 1].path <= results.entries[i].path);
         }
     }
 
@@ -3389,8 +3485,76 @@ mod tests {
         let allow = AllowList::empty();
         write_file(&tmp.child("hidden.txt"), "data");
 
-        let results = super::search_files(&allow, "hidden").unwrap();
-        assert!(results.is_empty());
+        let results =
+            super::search_files(&allow, "hidden", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert!(results.entries.is_empty());
+    }
+
+    #[test]
+    fn search_result_budget_is_honored() {
+        let tmp = TempDir::new("search_result_cap");
+        let allow = allow_for(&tmp);
+        // Three matching files; the result budget of two must win out.
+        write_file(&tmp.child("match-a.txt"), "data");
+        write_file(&tmp.child("match-b.txt"), "data");
+        write_file(&tmp.child("match-c.txt"), "data");
+
+        let result = super::search_files(&allow, "match", 100, 2).unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn search_traversal_budget_is_honored() {
+        let tmp = TempDir::new("search_traversal_cap");
+        let allow = allow_for(&tmp);
+        // Five matching entries on disk; visiting a single entry already meets
+        // the traversal budget of one, so the walk must stop without scanning
+        // the rest of the tree.
+        write_file(&tmp.child("a-one.txt"), "data");
+        write_file(&tmp.child("a-two.txt"), "data");
+        write_file(&tmp.child("a-three.txt"), "data");
+        write_file(&tmp.child("a-four.txt"), "data");
+        fs::create_dir_all(tmp.child("a-dir")).unwrap();
+
+        // read_dir order is not guaranteed, but every entry name contains "a",
+        // so whichever one entry was visited is a match — exactly one result.
+        let result = super::search_files(&allow, "a", 1, 100).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn search_within_budgets_is_not_truncated() {
+        let tmp = TempDir::new("search_within");
+        let allow = allow_for(&tmp);
+        write_file(&tmp.child("notes.txt"), "data");
+        write_file(&tmp.child("plan.md"), "data");
+
+        let result =
+            super::search_files(&allow, "notes", SEARCH_MAX_VISITED_ENTRIES, SEARCH_MAX_RESULTS)
+                .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].name, "notes.txt");
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn search_budget_is_shared_across_roots() {
+        let tmp1 = TempDir::new("search_budget_r1");
+        let tmp2 = TempDir::new("search_budget_r2");
+        let mut allow = AllowList::with_root(&str_of(tmp1.path())).unwrap();
+        allow.register_root(&str_of(tmp2.path())).unwrap();
+        write_file(&tmp1.child("match-a.txt"), "data");
+        write_file(&tmp1.child("match-b.txt"), "data");
+        write_file(&tmp2.child("match-c.txt"), "data");
+
+        // The result budget is global across all roots: once the first root
+        // fills it, the second root is never scanned.
+        let result = super::search_files(&allow, "match", 100, 2).unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.truncated);
     }
 
     // -- recent_files -------------------------------------------------------

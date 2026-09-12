@@ -5,6 +5,7 @@ import type {
   DiskUsage,
   FileMetadata,
   FilesystemProvider,
+  SearchFilesResult,
   StarredResolution,
   StorageBreakdown,
   StorageCategory,
@@ -84,6 +85,12 @@ interface RawStorageBreakdown {
   totalBytes: number;
   scannedFileCount: number;
   scanCapped: boolean;
+}
+
+/** Raw `SearchFilesResult` serialized by the Rust `search_files` command. */
+interface RawSearchFilesResult {
+  entries: DirEntryResponse[];
+  truncated: boolean;
 }
 
 /** Map a raw Rust storage category into the shared StorageCategory model. */
@@ -197,10 +204,11 @@ export class DesktopFilesystemProvider implements FilesystemProvider {
     return invoke<DiskUsage>("disk_usage", { path });
   }
 
-  searchFiles(query: string): Promise<FileItem[]> {
-    return invoke<DirEntryResponse[]>("search_files", { query }).then((entries) =>
-      entries.map(mapEntry),
-    );
+  searchFiles(query: string): Promise<SearchFilesResult> {
+    return invoke<RawSearchFilesResult>("search_files", { query }).then((raw) => ({
+      entries: raw.entries.map(mapEntry),
+      truncated: raw.truncated,
+    }));
   }
 
   recentFiles(limit?: number): Promise<FileItem[]> {

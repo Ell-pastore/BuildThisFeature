@@ -567,7 +567,7 @@ describe("App derived-view refresh after mutations", () => {
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
-    providerMock.searchFiles.mockResolvedValue([]);
+    providerMock.searchFiles.mockResolvedValue({ entries: [], truncated: false });
     providerMock.duplicateItem.mockResolvedValue("/Users/usr/Desktop/report (copy).pdf");
     providerMock.copyItem.mockResolvedValue(undefined);
     providerMock.storageByCategory.mockResolvedValue({
