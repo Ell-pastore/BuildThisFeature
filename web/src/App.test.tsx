@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
-import type { FileItem } from "./types";
+import type { FileItem, TrashItem } from "./types";
 
 const providerMock = vi.hoisted(() => {
   const provider: Record<string, ReturnType<typeof vi.fn>> = {};
@@ -19,6 +19,8 @@ const providerMock = vi.hoisted(() => {
     "copyItem",
     "duplicateItem",
     "trashItem",
+    "listTrash",
+    "restoreItem",
     "searchFiles",
     "readFile",
   ];
@@ -51,7 +53,6 @@ vi.mock("./services/stars", () => ({
 vi.mock("./components/AIAssistant", () => ({ default: () => null }));
 vi.mock("./components/views/Recent", () => ({ default: () => null }));
 vi.mock("./components/views/Starred", () => ({ default: () => null }));
-vi.mock("./components/views/Trash", () => ({ default: () => null }));
 vi.mock("./components/views/Search", () => ({ default: () => null }));
 vi.mock("./components/views/AIOrganization", () => ({ default: () => null }));
 vi.mock("./components/views/AIHistoryView", () => ({ default: () => null }));
@@ -290,5 +291,97 @@ describe("App rename preview synchronization", () => {
     await waitFor(() => {
       expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(fetchedBefore);
     });
+  });
+});
+
+function trashedItem(): TrashItem {
+  return {
+    id: "/Users/usr/.trash-smart-file-manager/report.pdf",
+    name: "report.pdf",
+    path: "/Users/usr/.trash-smart-file-manager/report.pdf",
+    isFolder: false,
+    size: "1.2 MB",
+    sizeBytes: 1200000,
+    fileType: "pdf",
+    created: "Aug 1, 2026",
+    modified: "Sep 1, 2026",
+    createdTs: 1,
+    modifiedTs: 2,
+    originalPath: "/Users/usr/Desktop/report.pdf",
+  };
+}
+
+describe("App trash view synchronization", () => {
+  beforeEach(() => {
+    providerMock.listDirectory.mockResolvedValue(
+      listing([
+        {
+          ...fileItem("Documents"),
+          type: "folder",
+          isFolder: true,
+          size: "—",
+          sizeBytes: 0,
+          location: "/Users/usr/Desktop",
+          path: "/Users/usr/Desktop/Documents",
+          id: "/Users/usr/Desktop/Documents",
+        },
+        fileItem("report.pdf"),
+      ]),
+    );
+    providerMock.recentFiles.mockResolvedValue([]);
+    providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
+    providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
+    providerMock.openItem.mockResolvedValue(undefined);
+    providerMock.trashItem.mockResolvedValue(undefined);
+    providerMock.listTrash.mockResolvedValue([]);
+    providerMock.restoreItem.mockResolvedValue("/Users/usr/Desktop/report.pdf");
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    cleanup();
+  });
+
+  it("reloads an already-open Trash view after a previewed file is deleted", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("report.pdf"));
+    expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    await waitFor(() => {
+      expect(providerMock.listTrash.mock.calls.length).toBe(1);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+    });
+    // The Trash view itself re-reads the real trash without a manual Retry.
+    await waitFor(() => {
+      expect(providerMock.listTrash.mock.calls.length).toBe(2);
+    });
+    expect(await screen.findByText("Trash is empty")).toBeInTheDocument();
+
+    confirmSpy.mockRestore();
+  });
+
+  it("refreshes the Trash view after a successful restore", async () => {
+    providerMock.listTrash.mockResolvedValue([trashedItem()]);
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+
+    await waitFor(() => {
+      expect(providerMock.restoreItem).toHaveBeenCalledWith(
+        "/Users/usr/.trash-smart-file-manager/report.pdf",
+      );
+    });
+    // The Trash view re-reads the list after restore, no manual Retry needed.
+    expect(providerMock.listTrash.mock.calls.length).toBe(2);
+    expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
   });
 });

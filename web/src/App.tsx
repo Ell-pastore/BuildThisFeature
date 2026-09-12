@@ -115,6 +115,7 @@ export default function App() {
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState<string | null>(null);
   const [recentReloadKey, setRecentReloadKey] = useState(0);
+  const [trashReloadKey, setTrashReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -409,6 +410,8 @@ export default function App() {
       await loadDir(dirPath);
       // Refresh a visible Recent view without requiring a manual Retry.
       setRecentReloadKey((k) => k + 1);
+      // Refresh an open Trash view: its mount-load re-reads the real trash.
+      setTrashReloadKey((k) => k + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -480,7 +483,7 @@ export default function App() {
                 onRetry={() => setStarredReloadKey((k) => k + 1)}
               />
             )}
-            {view === "trash" && <Trash />}
+            {view === "trash" && <Trash key={trashReloadKey} />}
             {view === "search" && (
               <Search
                 query={searchQuery}
