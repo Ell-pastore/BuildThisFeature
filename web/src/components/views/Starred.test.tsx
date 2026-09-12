@@ -119,4 +119,82 @@ describe("Starred", () => {
     expect(screen.queryByText("gone.txt")).not.toBeInTheDocument();
     expect(screen.getByText(/2 starred items can't be found/)).toBeInTheDocument();
   });
+
+  it("unstars a file through the existing path and removes the row on success", () => {
+    const onOpenFile = vi.fn();
+    const onUnstar = vi.fn();
+
+    const { rerender } = render(
+      <Starred
+        onOpenFile={onOpenFile}
+        onUnstar={onUnstar}
+        items={[
+          starredItem(),
+          starredItem({
+            id: "/Users/usr/Desktop/notes.txt",
+            name: "notes.txt",
+            type: "txt",
+            size: "200 B",
+            location: "/Users/usr/Desktop",
+            path: "/Users/usr/Desktop/notes.txt",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /unstar report\.pdf/i }));
+
+    // The existing star mutation/persistence path is invoked with the row's item.
+    expect(onUnstar).toHaveBeenCalledTimes(1);
+    expect(onUnstar).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "report.pdf",
+        path: "/Users/usr/Desktop/report.pdf",
+      }),
+    );
+    // Unstarring is not the same as opening the preview.
+    expect(onOpenFile).not.toHaveBeenCalled();
+    // The other row is untouched.
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+
+    // On success the parent drops the item from `items`; the row disappears
+    // immediately without a re-scan.
+    rerender(
+      <Starred
+        onOpenFile={onOpenFile}
+        onUnstar={onUnstar}
+        items={[
+          starredItem({
+            id: "/Users/usr/Desktop/notes.txt",
+            name: "notes.txt",
+            type: "txt",
+            size: "200 B",
+            location: "/Users/usr/Desktop",
+            path: "/Users/usr/Desktop/notes.txt",
+          }),
+        ]}
+      />,
+    );
+    expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("keeps the row unchanged when an unstar fails", () => {
+    const onOpenFile = vi.fn();
+    const onUnstar = vi.fn(() => {
+      throw new Error("save failed");
+    });
+
+    render(<Starred onOpenFile={onOpenFile} onUnstar={onUnstar} items={[starredItem()]} />);
+
+    expect(() =>
+      fireEvent.click(screen.getByRole("button", { name: /unstar report\.pdf/i })),
+    ).not.toThrow();
+    expect(onUnstar).toHaveBeenCalledTimes(1);
+    // No fabricated state: the row stays and the preview was not opened.
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
 });

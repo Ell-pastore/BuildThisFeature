@@ -520,6 +520,17 @@ export default function App() {
     toggleStar(item.path ?? item.id);
   }
 
+  // Unstar from the Starred view via the same mutation used everywhere else
+  // (`toggleStar` → persisted by the useStars effect). The path leaves `stars`
+  // so the next resolution drops it, but we also remove the row right away so
+  // the view reflects the unstar immediately instead of waiting on a re-scan.
+  function doUnstar(item: FileItem) {
+    const path = item.path ?? item.id;
+    toggleStar(path);
+    setStarredItems((prev) => prev.filter((f) => (f.path ?? f.id) !== path));
+    setStarredMissing((prev) => prev.filter((p) => p !== path));
+  }
+
   return (
     <div className="h-full flex bg-background overflow-hidden" style={{ fontFamily: "Inter, system-ui, sans-serif" }}>
       <Sidebar
@@ -580,6 +591,7 @@ export default function App() {
                 loading={starredLoading}
                 error={starredError}
                 onRetry={() => setStarredReloadKey((k) => k + 1)}
+                onUnstar={doUnstar}
               />
             )}
             {view === "trash" && <Trash key={trashReloadKey} />}

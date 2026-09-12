@@ -16,6 +16,10 @@ interface StarredProps {
   error?: string | null;
   /** Re-run the resolution (e.g. after a transient error). */
   onRetry?: () => void;
+  /** Unstar an item through the existing star mutation/persistence path. The
+   * parent removes the row on success; a failure is silently tolerated so the
+   * item simply stays. */
+  onUnstar?: (file: FileItem) => void;
 }
 
 export default function Starred({
@@ -26,7 +30,18 @@ export default function Starred({
   loading = false,
   error = null,
   onRetry,
+  onUnstar,
 }: StarredProps) {
+  function handleUnstar(file: FileItem) {
+    if (!onUnstar) return;
+    try {
+      onUnstar(file);
+    } catch {
+      // A failed unstar must never crash the view or fabricate state; the item
+      // stays until the parent confirms the removal.
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-3xl mx-auto px-8 py-8 space-y-6">
@@ -68,26 +83,37 @@ export default function Starred({
           </div>
         ) : (
           <>
-            <div className="bg-card border border-border rounded-xl divide-y divide-border overflow-hidden">
+            <ul className="bg-card border border-border rounded-xl divide-y divide-border overflow-hidden">
               {items.map((file) => (
-                <button
+                <li
                   key={file.id}
-                  onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
-                  className="w-full flex items-center gap-4 px-5 py-3.5 hover:bg-secondary transition-colors text-left"
+                  className="w-full flex items-center gap-4 px-5 py-3.5 hover:bg-secondary transition-colors"
                 >
-                  <FileIcon type={file.type} size="sm" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-mono font-medium text-foreground truncate">{file.name}</div>
-                    <div className="text-xs text-muted-foreground mt-0.5">{file.location}</div>
-                  </div>
-                  <div className="flex items-center gap-4 flex-shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => (file.isFolder ? onOpenFolder?.(file) : onOpenFile(file))}
+                    className="flex flex-1 min-w-0 items-center gap-4 text-left"
+                  >
+                    <FileIcon type={file.type} size="sm" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-mono font-medium text-foreground truncate">{file.name}</div>
+                      <div className="text-xs text-muted-foreground mt-0.5">{file.location}</div>
+                    </div>
                     <span className="text-xs font-mono text-muted-foreground">{file.size}</span>
                     <span className="text-xs font-mono text-muted-foreground">{file.modified}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleUnstar(file)}
+                    title={onUnstar ? `Unstar ${file.name}` : undefined}
+                    aria-label={onUnstar ? `Unstar ${file.name}` : undefined}
+                    className="p-1 rounded-lg text-amber-400 hover:bg-amber-50 transition-colors flex-shrink-0"
+                  >
                     <Star size={14} className="text-amber-400 fill-amber-400" />
-                  </div>
-                </button>
+                  </button>
+                </li>
               ))}
-            </div>
+            </ul>
 
             {missingPaths.length > 0 && (
               <div className="bg-card border border-border rounded-xl px-5 py-3">
