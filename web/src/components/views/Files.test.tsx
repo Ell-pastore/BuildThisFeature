@@ -73,6 +73,7 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       onDuplicate={onDuplicate}
       onToggleStar={() => {}}
       onRefresh={() => {}}
+      onUploaded={() => {}}
     />,
   );
   return { onNewFolder, onNewFile, onRename, onDuplicate, onCopy, onOpenFolder, onOpenPreview };
@@ -147,6 +148,16 @@ describe("Files", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
     expect(onNewFile).toHaveBeenCalledWith("notes.txt");
+  });
+
+  it("opens the upload picker from the toolbar Upload button", () => {
+    const clickSpy = vi.spyOn(HTMLInputElement.prototype, "click");
+    renderFiles();
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
+
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    clickSpy.mockRestore();
   });
 
   it("duplicates every selected item through onDuplicate", async () => {

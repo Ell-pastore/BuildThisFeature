@@ -56,6 +56,8 @@ function renderHome(
       onOpenFile={onOpenFile}
       onOpenFolder={onOpenFolder}
       onNavigate={onNavigate}
+      uploadDir="/Users/usr/Desktop"
+      onUploaded={() => {}}
     />,
   );
   return { onOpenFile, onOpenFolder, onNavigate };
@@ -135,5 +137,15 @@ describe("Home", () => {
     expect(screen.getByText("3")).toBeInTheDocument();
     expect(screen.getByText("1")).toBeInTheDocument();
     expect(screen.getAllByText("in the current folder")).toHaveLength(2);
+  });
+
+  it("opens the upload picker from the Upload Files quick action", () => {
+    const clickSpy = vi.spyOn(HTMLInputElement.prototype, "click");
+    renderHome([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload Files" }));
+
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    clickSpy.mockRestore();
   });
 });

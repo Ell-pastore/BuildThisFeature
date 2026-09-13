@@ -419,6 +419,12 @@ export default function App() {
     }
   }
 
+  /** After a successful upload, refresh the open folder and derived state. */
+  function handleUploaded() {
+    void loadDir(dirPath);
+    refreshDerivedState();
+  }
+
   /**
    * After a successful filesystem mutation, re-read the derived filesystem
    * views (Recent, Storage) and re-run an already-open Search so none of them
@@ -549,7 +555,7 @@ export default function App() {
 
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 flex overflow-hidden">
-            {view === "home" && <Home onOpenFile={openPreview} onOpenFolder={openFolder} onNavigate={navigate} recentFiles={seenFiles} recents={recentItems} recentsLoading={recentLoading} recentsError={recentError} diskUsage={diskUsage} />}
+            {view === "home" && <Home onOpenFile={openPreview} onOpenFolder={openFolder} onNavigate={navigate} recentFiles={seenFiles} recents={recentItems} recentsLoading={recentLoading} recentsError={recentError} diskUsage={diskUsage} uploadDir={dirPath} onUploaded={handleUploaded} />}
             {view === "files" && (
               <Files
                 items={seenFiles}
@@ -570,6 +576,7 @@ export default function App() {
                 onDuplicate={doDuplicate}
                 onToggleStar={doToggleStar}
                 onRefresh={() => void loadDir(dirPath)}
+                onUploaded={handleUploaded}
               />
             )}
             {view === "recent" && (

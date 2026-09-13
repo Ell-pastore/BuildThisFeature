@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { LayoutGrid, List, Clock, HardDrive, Sparkles, Copy, Folder, Upload, FolderPlus, Star } from "../../components/Icons";
 import FileIcon from "../FileIcon";
+import FileUpload from "../FileUpload";
 import type { FileItem } from "../../types";
 import type { DiskUsage } from "../../services/filesystem";
 import { formatBytes } from "../../services/format";
@@ -22,6 +23,10 @@ interface HomeProps {
   onNavigate: (view: string) => void;
   /** Real volume capacity from the Rust backend (null while loading/unsupported). */
   diskUsage?: DiskUsage | null;
+  /** Directory picked files are uploaded into (the currently open folder). */
+  uploadDir: string;
+  /** Called after any picked file was successfully uploaded. */
+  onUploaded: () => void;
 }
 
 /**
@@ -39,6 +44,8 @@ export default function Home({
   onOpenFolder,
   onNavigate,
   diskUsage,
+  uploadDir,
+  onUploaded,
 }: HomeProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const recentsShown = recents.slice(0, 5);
@@ -113,7 +120,6 @@ export default function Home({
           <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-3">Quick Actions</h2>
           <div className="grid grid-cols-4 gap-3">
             {[
-              { icon: Upload, label: "Upload Files", color: "text-blue-500", bg: "bg-blue-50 hover:bg-blue-100" },
               { icon: FolderPlus, label: "New Folder", color: "text-emerald-500", bg: "bg-emerald-50 hover:bg-emerald-100" },
               { icon: Sparkles, label: "Organize with AI", color: "text-ai-text", bg: "bg-ai-bg hover:bg-indigo-100", view: "ai-organization" },
               { icon: Copy, label: "Find Duplicates", color: "text-purple-500", bg: "bg-purple-50 hover:bg-purple-100", view: "duplicates" },
@@ -127,6 +133,20 @@ export default function Home({
                 <span className="text-xs font-medium text-foreground">{label}</span>
               </button>
             ))}
+            <FileUpload
+              destDir={uploadDir}
+              onUploaded={onUploaded}
+              renderTrigger={(openPicker) => (
+                <button
+                  type="button"
+                  onClick={openPicker}
+                  className="flex flex-col items-center gap-2 py-4 rounded-xl border border-border bg-blue-50 hover:bg-blue-100 transition-colors"
+                >
+                  <Upload size={18} className="text-blue-500" />
+                  <span className="text-xs font-medium text-foreground">Upload Files</span>
+                </button>
+              )}
+            />
           </div>
         </div>
         {/* Recent files */}

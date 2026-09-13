@@ -20,6 +20,7 @@ import {
 } from "../../components/Icons";
 import FileIcon from "../FileIcon";
 import MoveFolderDialog from "../MoveFolderDialog";
+import FileUpload from "../FileUpload";
 import type { FileItem } from "../../types";
 
 interface FilesProps {
@@ -41,6 +42,7 @@ interface FilesProps {
   onDuplicate: (item: FileItem) => void;
   onToggleStar: (item: FileItem) => void;
   onRefresh: () => void;
+  onUploaded: () => void;
 }
 
 type SortKey = "name" | "modified" | "size";
@@ -64,6 +66,7 @@ export default function Files({
   onDuplicate,
   onToggleStar,
   onRefresh,
+  onUploaded,
 }: FilesProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -172,10 +175,20 @@ export default function Files({
               <span>New</span>
             </button>
 
-            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-lg text-xs font-medium text-muted-foreground hover:bg-secondary transition-colors">
-              <Upload size={13} />
-              <span>Upload</span>
-            </button>
+            <FileUpload
+              destDir={path}
+              onUploaded={onUploaded}
+              renderTrigger={(openPicker) => (
+                <button
+                  type="button"
+                  onClick={openPicker}
+                  className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-lg text-xs font-medium text-muted-foreground hover:bg-secondary transition-colors"
+                >
+                  <Upload size={13} />
+                  <span>Upload</span>
+                </button>
+              )}
+            />
 
             <button
               onClick={() =>
