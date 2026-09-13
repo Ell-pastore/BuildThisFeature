@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DuplicateGroupsResult, FilesystemProvider } from "../../services/filesystem";
+import type { FileItem } from "../../types";
 
 const getFilesystemProvider = vi.hoisted(() => vi.fn());
 
@@ -48,6 +49,18 @@ function providerReturning(result: DuplicateGroupsResult) {
   const provider = { duplicateGroups: vi.fn().mockResolvedValue(result) };
   getFilesystemProvider.mockReturnValue(provider);
   return provider;
+}
+
+function renderDuplicates(
+  overrides: {
+    onOpen?: (file: FileItem) => void;
+    onReveal?: (file: FileItem) => void;
+  } = {},
+) {
+  const onOpen: (file: FileItem) => void = overrides.onOpen ?? vi.fn();
+  const onReveal: (file: FileItem) => void = overrides.onReveal ?? vi.fn();
+  render(<Duplicates onOpen={onOpen} onReveal={onReveal} />);
+  return { onOpen, onReveal };
 }
 
 describe("Duplicates", () => {
@@ -157,5 +170,92 @@ describe("Duplicates", () => {
     // It is informational, not an error: the real group still renders next to it.
     expect(screen.getByText("z.txt")).toBeInTheDocument();
     expect(screen.queryByText("Couldn't scan for duplicates")).not.toBeInTheDocument();
+  });
+
+  it("opens a duplicate member through the existing open action with the correct path", async () => {
+    providerReturning(groupResult());
+    const { onOpen } = renderDuplicates();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open z.txt" }));
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith(fileItem("z.txt", "/home/docs/z.txt"));
+    expect(onOpen).not.toHaveBeenCalledWith(fileItem("a.txt", "/home/docs/a.txt"));
+  });
+
+  it("reveals a member by navigating to its containing folder", async () => {
+    providerReturning(groupResult());
+    const { onReveal } = renderDuplicates();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Reveal a.txt" }));
+
+    expect(onReveal).toHaveBeenCalledTimes(1);
+    expect(onReveal).toHaveBeenCalledWith(fileItem("a.txt", "/home/docs/a.txt"));
+  });
+
+  it("sends the correct file to Trash through the trashItem flow", async () => {
+    const provider = {
+      duplicateGroups: vi.fn().mockResolvedValue(groupResult()),
+      trashItem: vi.fn().mockResolvedValue(undefined),
+    };
+    getFilesystemProvider.mockReturnValue(provider);
+    renderDuplicates();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete z.txt" }));
+
+    await waitFor(() => {
+      expect(provider.trashItem).toHaveBeenCalledTimes(1);
+    });
+    expect(provider.trashItem).toHaveBeenCalledWith("/home/docs/z.txt");
+  });
+
+  it("re-runs the duplicate scan and updates the UI after a successful delete", async () => {
+    const provider = {
+      duplicateGroups: vi
+        .fn()
+        .mockResolvedValueOnce(groupResult())
+        .mockResolvedValueOnce(
+          groupResult({
+            groups: [
+              {
+                id: "/home/docs/a.txt",
+                sizeBytes: 13,
+                size: "13 B",
+                items: [fileItem("a.txt", "/home/docs/a.txt")],
+              },
+            ],
+          }),
+        ),
+      trashItem: vi.fn().mockResolvedValue(undefined),
+    };
+    getFilesystemProvider.mockReturnValue(provider);
+    renderDuplicates();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete z.txt" }));
+
+    await waitFor(() => {
+      expect(provider.duplicateGroups).toHaveBeenCalledTimes(2);
+    });
+    expect(provider.trashItem).toHaveBeenCalledWith("/home/docs/z.txt");
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    expect(screen.queryByText("z.txt")).toBeNull();
+  });
+
+  it("surfaces a delete failure and keeps the member and group visible", async () => {
+    const provider = {
+      duplicateGroups: vi.fn().mockResolvedValue(groupResult()),
+      trashItem: vi.fn().mockRejectedValue(new Error("cannot remove")),
+    };
+    getFilesystemProvider.mockReturnValue(provider);
+    renderDuplicates();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete z.txt" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("cannot remove");
+    // The member and its group stay visible; no re-scan was attempted.
+    expect(screen.getByText("z.txt")).toBeInTheDocument();
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
+    expect(provider.trashItem).toHaveBeenCalledTimes(1);
+    expect(provider.duplicateGroups).toHaveBeenCalledTimes(1);
   });
 });

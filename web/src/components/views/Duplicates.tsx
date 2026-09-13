@@ -1,8 +1,16 @@
 import { useEffect, useState } from "react";
-import { Copy, RotateCcw } from "../Icons";
+import { Copy, RotateCcw, ExternalLink, FolderOpen, Trash2 } from "../Icons";
 import FileIcon from "../FileIcon";
 import { getFilesystemProvider } from "../../services/filesystem";
 import type { DuplicateGroupsResult } from "../../services/filesystem";
+import type { FileItem } from "../../types";
+
+interface DuplicatesProps {
+  /** Open a member with its default app (wired to the filesystem action). */
+  onOpen?: (file: FileItem) => void;
+  /** Navigate to a member's containing folder in the Files view. */
+  onReveal?: (file: FileItem) => void;
+}
 
 /**
  * Duplicate detection.
@@ -12,11 +20,20 @@ import type { DuplicateGroupsResult } from "../../services/filesystem";
  * from the provider — nothing is invented here. Groups and members are rendered
  * in the exact order the provider returned them, and the honest `truncated`
  * flag from Rust is surfaced as a non-error notice.
+ *
+ * Members support the same core actions as the rest of the app: Open (default
+ * app), Reveal (navigate to the containing folder), and Delete (moves the file
+ * to the app-managed Trash through the existing `trashItem` flow — never a
+ * permanent delete). A successful delete re-runs the real duplicate scan so the
+ * groups reflect the filesystem; a failed delete or re-scan is surfaced
+ * honestly without fabricating results.
  */
-export default function Duplicates() {
+export default function Duplicates({ onOpen, onReveal }: DuplicatesProps) {
   const [result, setResult] = useState<DuplicateGroupsResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [deletingPath, setDeletingPath] = useState<string | null>(null);
 
   async function loadDuplicates() {
     setLoading(true);
@@ -29,6 +46,20 @@ export default function Duplicates() {
       setResult(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function deleteMember(file: FileItem) {
+    const path = file.path ?? file.id;
+    setDeletingPath(path);
+    setActionError(null);
+    try {
+      await getFilesystemProvider().trashItem(path);
+      await loadDuplicates();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingPath(null);
     }
   }
 
@@ -50,6 +81,13 @@ export default function Duplicates() {
           </div>
           <p className="text-sm text-muted-foreground">Files verified as duplicates by size and content.</p>
         </div>
+
+        {/* Member-action error — honest and non-destructive; the list stays. */}
+        {actionError && (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
+            {actionError}
+          </div>
+        )}
 
         {loading && !error ? (
           <div className="bg-card border border-border rounded-xl px-5 py-12 text-center">
@@ -127,6 +165,36 @@ export default function Duplicates() {
                         </div>
                         <div className="text-xs font-mono text-muted-foreground flex-shrink-0">
                           {file.size}
+                        </div>
+                        <div className="flex items-center gap-1 flex-shrink-0 ml-2">
+                          <button
+                            type="button"
+                            onClick={() => onOpen?.(file)}
+                            title={`Open ${file.name}`}
+                            aria-label={`Open ${file.name}`}
+                            className="p-1.5 rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
+                          >
+                            <ExternalLink size={12} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onReveal?.(file)}
+                            title={`Reveal ${file.name}`}
+                            aria-label={`Reveal ${file.name}`}
+                            className="p-1.5 rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
+                          >
+                            <FolderOpen size={12} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteMember(file)}
+                            disabled={deletingPath === (file.path ?? file.id)}
+                            title={`Delete ${file.name}`}
+                            aria-label={`Delete ${file.name}`}
+                            className="p-1.5 rounded-md text-muted-foreground hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-50"
+                          >
+                            <Trash2 size={12} />
+                          </button>
                         </div>
                       </li>
                     ))}

@@ -614,7 +614,12 @@ export default function App() {
               />
             )}
             {view === "ai-organization" && <AIOrganization />}
-            {view === "duplicates" && <Duplicates />}
+            {view === "duplicates" && (
+              <Duplicates
+                onOpen={openOnDisk}
+                onReveal={(file) => navigateToPath(file.location)}
+              />
+            )}
             {view === "smart-folders" && <SmartFolders />}
             {view === "storage" && (
               <Storage
