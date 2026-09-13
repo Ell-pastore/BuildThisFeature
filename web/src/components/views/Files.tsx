@@ -47,6 +47,36 @@ interface FilesProps {
 
 type SortKey = "name" | "modified" | "size";
 
+const LARGE_FILE_BYTES = 100 * 1024 * 1024;
+const DAY_SECONDS = 24 * 60 * 60;
+
+// Same type categories as the Search "More Filters" panel, so the two filters
+// agree on what a PDF / Document / Image / Video is.
+const TYPE_FILTERS: Record<string, Set<string>> = {
+  PDF: new Set(["pdf"]),
+  Documents: new Set([
+    "txt", "rtf", "doc", "docx", "odt", "xls", "xlsx", "csv", "ods", "ppt",
+    "pptx", "odp", "pages", "numbers", "keynote", "md", "tex", "epub", "mobi",
+    "log",
+  ]),
+  Images: new Set([
+    "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "svg", "ico",
+    "heic", "heif", "raw", "psd", "ai", "eps",
+  ]),
+  Videos: new Set([
+    "mp4", "mov", "mkv", "avi", "webm", "flv", "wmv", "m4v", "m2ts", "3gp",
+    "mpg", "mpeg",
+  ]),
+};
+
+function chipClass(active: boolean) {
+  return `px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+    active
+      ? "bg-foreground text-primary-foreground"
+      : "bg-secondary text-muted-foreground hover:bg-border"
+  }`;
+}
+
 export default function Files({
   items,
   loading,
@@ -71,6 +101,15 @@ export default function Files({
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortBy, setSortBy] = useState<SortKey>("modified");
+
+  // Client-side filtering over the already-loaded directory entries. No
+  // filesystem re-query happens when these change.
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [typeFilter, setTypeFilter] = useState("All");
+  const [sizeFilter, setSizeFilter] = useState<"Any" | "Large">("Any");
+  const [modifiedFilter, setModifiedFilter] = useState<
+    "Any" | "Past 7 days" | "Past 30 days"
+  >("Any");
 
   // Local modal/flow state.
   const [newOpen, setNewOpen] = useState(false);
@@ -107,8 +146,34 @@ export default function Files({
     });
   }
 
+  // Filters compose with AND semantics; folders always survive type/size
+  // filtering so browsing directories is never blocked.
+  const filtered = items.filter((item) => {
+    const matchesType =
+      typeFilter === "All" ||
+      item.isFolder ||
+      (TYPE_FILTERS[typeFilter]?.has(item.type.toLowerCase()) ?? false);
+    const matchesSize =
+      sizeFilter === "Any" || item.isFolder || item.sizeBytes >= LARGE_FILE_BYTES;
+    const matchesModified =
+      modifiedFilter === "Any" ||
+      !item.modifiedTs ||
+      item.modifiedTs >=
+        Date.now() / 1000 - (modifiedFilter === "Past 7 days" ? 7 : 30) * DAY_SECONDS;
+    return matchesType && matchesSize && matchesModified;
+  });
+
+  const anyFilterActive =
+    typeFilter !== "All" || sizeFilter !== "Any" || modifiedFilter !== "Any";
+
+  const resetFilters = () => {
+    setTypeFilter("All");
+    setSizeFilter("Any");
+    setModifiedFilter("Any");
+  };
+
   // Sorting uses the raw numeric values, never the formatted size/date strings.
-  const sorted = [...items].sort((a, b) => {
+  const sorted = [...filtered].sort((a, b) => {
     if (sortBy === "name") return a.name.localeCompare(b.name);
     if (sortBy === "size") return b.sizeBytes - a.sizeBytes;
     return (b.modifiedTs ?? 0) - (a.modifiedTs ?? 0);
@@ -202,7 +267,16 @@ export default function Files({
               <span className="capitalize">Sort: {sortBy}</span>
             </button>
 
-            <button className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded-lg text-xs font-medium text-muted-foreground hover:bg-secondary transition-colors">
+            <button
+              onClick={() => setFilterOpen((open) => !open)}
+              aria-expanded={filterOpen}
+              className={
+                "flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-xs font-medium transition-colors " +
+                (filterOpen
+                  ? "bg-secondary text-foreground border-border"
+                  : "text-muted-foreground border-border hover:bg-secondary")
+              }
+            >
               <Filter size={13} />
               <span>Filter</span>
             </button>
@@ -230,6 +304,74 @@ export default function Files({
             </div>
           </div>
           </div>
+
+          {/* Client-side filter panel */}
+          {filterOpen && (
+            <div className="bg-card border border-border rounded-xl p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+                  Filters
+                </span>
+                {anyFilterActive && (
+                  <button
+                    onClick={resetFilters}
+                    className="text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    Reset filters
+                  </button>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-x-8 gap-y-4">
+                <div role="group" aria-label="Type" className="space-y-2">
+                  <div className="text-xs text-muted-foreground">Type</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(["All", "PDF", "Documents", "Images", "Videos"] as const).map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => setTypeFilter(t)}
+                        className={chipClass(typeFilter === t)}
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div role="group" aria-label="Size" className="space-y-2">
+                  <div className="text-xs text-muted-foreground">Size</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(["Any", "Large"] as const).map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => setSizeFilter(s)}
+                        className={chipClass(sizeFilter === s)}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    Large ≥ 100 MB
+                  </div>
+                </div>
+
+                <div role="group" aria-label="Modified" className="space-y-2">
+                  <div className="text-xs text-muted-foreground">Modified</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(["Any", "Past 7 days", "Past 30 days"] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => setModifiedFilter(m)}
+                        className={chipClass(modifiedFilter === m)}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Selection toolbar */}
         {selected.size > 0 && (
@@ -345,7 +487,7 @@ export default function Files({
               </button>
             </div>
           </div>
-        ) : sorted.length === 0 ? (
+        ) : items.length === 0 ? (
           <div className="bg-card border border-border rounded-xl min-h-[400px] flex flex-col items-center justify-center text-center">
 
             <div className="w-14 h-14 rounded-2xl bg-secondary flex items-center justify-center mb-4">
@@ -358,6 +500,22 @@ export default function Files({
 
             <p className="text-sm text-muted-foreground mt-1 max-w-sm">
               Create a new folder or file, or navigate to another directory.
+            </p>
+
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="bg-card border border-border rounded-xl min-h-[400px] flex flex-col items-center justify-center text-center">
+
+            <div className="w-14 h-14 rounded-2xl bg-secondary flex items-center justify-center mb-4">
+              <Filter size={16} className="text-muted-foreground" />
+            </div>
+
+            <h2 className="text-base font-semibold text-foreground">
+              No matching results
+            </h2>
+
+            <p className="text-sm text-muted-foreground mt-1 max-w-sm">
+              Nothing in this folder matches the current filters. If any filters are active, you can reset them.
             </p>
 
           </div>

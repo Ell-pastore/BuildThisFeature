@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import Files from "./Files";
 import type { FileItem } from "../../types";
 
@@ -251,5 +251,198 @@ describe("Files", () => {
 
     expect(onRename).not.toHaveBeenCalled();
     expect(screen.getAllByRole("button", { name: "Rename" }).length).toBe(2);
+  });
+
+  it("opens and closes the filter panel from the Filter button", () => {
+    renderFiles();
+
+    expect(screen.queryByRole("group", { name: "Type" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    expect(screen.getByRole("group", { name: "Type" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Size" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Modified" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    expect(screen.queryByRole("group", { name: "Type" })).not.toBeInTheDocument();
+  });
+
+  it("filters the listing by file type", () => {
+    const png = {
+      ...fileItem("photo.png"),
+      name: "photo.png",
+      id: "/Users/usr/Desktop/photo.png",
+      type: "png",
+    };
+    renderFiles([fileItem("report.pdf"), png, folder("Projects")]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "PDF" }),
+    );
+
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("photo.png")).not.toBeInTheDocument();
+  });
+
+  it("filters the listing by large size (≥ 100 MB)", () => {
+    const big = {
+      ...fileItem("big.mov"),
+      name: "big.mov",
+      id: "/Users/usr/Desktop/big.mov",
+      type: "mov",
+      size: "150 MB",
+      sizeBytes: 150 * 1024 * 1024,
+    };
+    renderFiles([fileItem("report.pdf"), big]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+
+    expect(screen.getByText("big.mov")).toBeInTheDocument();
+    expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
+  });
+
+  it("filters the listing by recent modified date", () => {
+    const now = Date.now() / 1000;
+    const recent = {
+      ...fileItem("notes.txt"),
+      name: "notes.txt",
+      id: "/Users/usr/Desktop/notes.txt",
+      type: "txt",
+      modifiedTs: now - 2 * 24 * 60 * 60,
+    };
+    const old = {
+      ...fileItem("old.pdf"),
+      name: "old.pdf",
+      id: "/Users/usr/Desktop/old.pdf",
+      modifiedTs: now - 60 * 24 * 60 * 60,
+    };
+    renderFiles([recent, old]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Modified" })).getByRole("button", {
+        name: "Past 7 days",
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    expect(screen.queryByText("old.pdf")).not.toBeInTheDocument();
+  });
+
+  it("keeps folders visible while file-type filtering is active", () => {
+    const png = {
+      ...fileItem("photo.png"),
+      name: "photo.png",
+      id: "/Users/usr/Desktop/photo.png",
+      type: "png",
+    };
+    renderFiles([folder("Projects"), png, fileItem("report.pdf")]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "Images" }),
+    );
+
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.getByText("photo.png")).toBeInTheDocument();
+    expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
+  });
+
+  it("composes type, size, and modified filters with AND semantics", () => {
+    const now = Date.now() / 1000;
+    const bigRecentPdf = {
+      ...fileItem("matching.pdf"),
+      name: "matching.pdf",
+      id: "/Users/usr/Desktop/matching.pdf",
+      sizeBytes: 150 * 1024 * 1024,
+      modifiedTs: now - 2 * 24 * 60 * 60,
+    };
+    const smallRecentPdf = {
+      ...fileItem("small.pdf"),
+      name: "small.pdf",
+      id: "/Users/usr/Desktop/small.pdf",
+      modifiedTs: now - 2 * 24 * 60 * 60,
+    };
+    const oldBigPdf = {
+      ...fileItem("old.pdf"),
+      name: "old.pdf",
+      id: "/Users/usr/Desktop/old.pdf",
+      sizeBytes: 150 * 1024 * 1024,
+      modifiedTs: now - 60 * 24 * 60 * 60,
+    };
+    renderFiles([
+      bigRecentPdf,
+      smallRecentPdf,
+      oldBigPdf,
+      { ...folder("Projects"), modifiedTs: now - 2 * 24 * 60 * 60 },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "PDF" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Modified" })).getByRole("button", {
+        name: "Past 7 days",
+      }),
+    );
+
+    expect(screen.getByText("matching.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("small.pdf")).not.toBeInTheDocument();
+    expect(screen.queryByText("old.pdf")).not.toBeInTheDocument();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+  });
+
+  it("resets all filters and restores the full listing", () => {
+    const now = Date.now() / 1000;
+    const bigOldPdf = {
+      ...fileItem("big.pdf"),
+      name: "big.pdf",
+      id: "/Users/usr/Desktop/big.pdf",
+      sizeBytes: 150 * 1024 * 1024,
+      modifiedTs: now - 60 * 24 * 60 * 60,
+    };
+    renderFiles([fileItem("report.pdf"), bigOldPdf, folder("Projects")]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "PDF" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Size" })).getByRole("button", { name: "Large" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Modified" })).getByRole("button", {
+        name: "Past 7 days",
+      }),
+    );
+
+    expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
+    expect(screen.queryByText("big.pdf")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
+
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(screen.getByText("big.pdf")).toBeInTheDocument();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+  });
+
+  it("shows an honest no-match state when nothing meets the active filters", () => {
+    renderFiles([fileItem("report.pdf")]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "Videos" }),
+    );
+
+    expect(screen.getByText("No matching results")).toBeInTheDocument();
+    expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
   });
 });
