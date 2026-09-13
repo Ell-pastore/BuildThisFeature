@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Sidebar from "./components/Sidebar";
 import TopBar, { type Crumb } from "./components/TopBar";
 import AIAssistant from "./components/AIAssistant";
@@ -146,6 +146,93 @@ export default function App() {
   const [aiOpen, setAiOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
+
+  // Shortcut layer state: the search input to focus, a signal to reopen the
+  // Files "New" modal, and the current Files selection for Space-preview.
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [newFolderSignal, setNewFolderSignal] = useState(0);
+  const [filesSelection, setFilesSelection] = useState<FileItem[]>([]);
+
+  // Report the Files selection back without causing render churn: keep the
+  // previous reference when the selection is unchanged.
+  const handleFilesSelection = useCallback((items: FileItem[]) => {
+    setFilesSelection((prev) => {
+      const same =
+        prev.length === items.length &&
+        prev.every((f, i) => (f.path ?? f.id) === (items[i]?.path ?? items[i]?.id));
+      return same ? prev : items;
+    });
+  }, []);
+
+  // ONE global keydown listener for the implemented shortcuts. Command
+  // shortcuts use Cmd on macOS and Ctrl elsewhere; Space is unmodified. Every
+  // shortcut is suppressed while typing in an editable field, and each one
+  // calls an existing in-app action rather than duplicating logic. Shortcuts
+  // with no safe existing action (⌘U upload, ⌘⌫ trash, ⌘Z undo) are intentionally
+  // not wired; they stay listed in Settings as "not implemented".
+  useEffect(() => {
+    const isMac = /Mac|iPhone|iPad/.test(navigator.platform ?? "");
+
+    function isCommand(e: KeyboardEvent) {
+      return isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    }
+
+    function editingTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return target.isContentEditable || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (editingTarget(e.target)) return;
+      const key = e.key.toLowerCase();
+      const cmd = isCommand(e);
+
+      // ⌘K — focus the existing Search input.
+      if (cmd && !e.shiftKey && !e.altKey && key === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+
+      // ⌘N — open the existing New folder/file modal (Files view only).
+      if (cmd && !e.shiftKey && !e.altKey && key === "n") {
+        if (view === "files" && !loading) {
+          e.preventDefault();
+          setNewFolderSignal((s) => s + 1);
+        }
+        return;
+      }
+
+      // ⌘D — open the existing Duplicates view.
+      if (cmd && !e.shiftKey && !e.altKey && key === "d") {
+        e.preventDefault();
+        navigate("duplicates");
+        return;
+      }
+
+      // ⌘⇧O — open the existing AI Organization view.
+      if (cmd && e.shiftKey && !e.altKey && key === "o") {
+        e.preventDefault();
+        navigate("ai-organization");
+        return;
+      }
+
+      // Space — preview the selected item through the existing preview flow.
+      const isSpace = e.key === " " || e.code === "Space";
+      if (isSpace && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+        const active = filesSelection[0];
+        if (active) {
+          e.preventDefault();
+          setPreviewFile(active);
+        }
+        return;
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
 
   // Real recursive desktop search state (search_files via the provider).
   const [searchResults, setSearchResults] = useState<FileItem[]>([]);
@@ -553,6 +640,7 @@ export default function App() {
           breadcrumb={breadcrumbs}
           onSearch={handleSearch}
           onOpenAI={() => setAiOpen((v) => !v)}
+          searchInputRef={searchInputRef}
         />
 
         <div className="flex flex-1 overflow-hidden">
@@ -582,6 +670,8 @@ export default function App() {
                 defaultViewMode={settings.defaultView === "Grid" ? "grid" : "list"}
                 defaultSort={settings.sortFilesBy.toLowerCase() as "name" | "modified" | "size"}
                 confirmDelete={settings.confirmDelete}
+                newFolderSignal={newFolderSignal}
+                onSelectionChange={handleFilesSelection}
               />
             )}
             {view === "recent" && (

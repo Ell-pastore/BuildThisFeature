@@ -229,18 +229,28 @@ export default function Settings({ settings, onChange }: SettingsProps) {
             {activeSection === "Keyboard Shortcuts" && (
               <div className="py-2">
                 {[
-                  ["⌘K", "Open search"],
-                  ["⌘N", "New folder"],
-                  ["⌘U", "Upload files"],
-                  ["⌘D", "Detect duplicates"],
-                  ["⌘⇧O", "Open AI Organization"],
-                  ["Space", "Preview selected file"],
-                  ["⌘⌫", "Move to Trash"],
-                  ["⌘Z", "Undo"],
-                ].map(([key, label]) => (
-                  <div key={label} className="flex items-center justify-between py-3 border-b border-border last:border-none">
+                  { key: "⌘K", label: "Open search", implemented: true },
+                  { key: "⌘N", label: "New folder", implemented: true },
+                  { key: "⌘U", label: "Upload files", implemented: false },
+                  { key: "⌘D", label: "Detect duplicates", implemented: true },
+                  { key: "⌘⇧O", label: "Open AI Organization", implemented: true },
+                  { key: "Space", label: "Preview selected file", implemented: true },
+                  { key: "⌘⌫", label: "Move to Trash", implemented: false },
+                  { key: "⌘Z", label: "Undo", implemented: false },
+                ].map(({ key, label, implemented }) => (
+                  <div
+                    key={label}
+                    className={`flex items-center justify-between py-3 border-b border-border last:border-none ${implemented ? "" : "opacity-50"}`}
+                  >
                     <span className="text-sm text-foreground">{label}</span>
-                    <kbd className="font-mono text-xs bg-secondary border border-border px-2.5 py-1 rounded-md text-muted-foreground">{key}</kbd>
+                    <div className="flex items-center gap-2">
+                      {!implemented && (
+                        <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                          Not implemented
+                        </span>
+                      )}
+                      <kbd className="font-mono text-xs bg-secondary border border-border px-2.5 py-1 rounded-md text-muted-foreground">{key}</kbd>
+                    </div>
                   </div>
                 ))}
               </div>

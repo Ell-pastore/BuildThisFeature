@@ -11,9 +11,11 @@ interface TopBarProps {
   breadcrumb: Crumb[];
   onSearch: (q: string) => void;
   onOpenAI: () => void;
+  /** Ref to the search <input>, used by the ⌘K shortcut to focus it. */
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
 }
 
-export default function TopBar({ breadcrumb, onSearch, onOpenAI }: TopBarProps) {
+export default function TopBar({ breadcrumb, onSearch, onOpenAI, searchInputRef }: TopBarProps) {
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
 
@@ -56,6 +58,7 @@ export default function TopBar({ breadcrumb, onSearch, onOpenAI }: TopBarProps) 
         >
           <Search size={14} className="absolute left-3 text-muted-foreground" />
           <input
+            ref={searchInputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onFocus={() => setFocused(true)}

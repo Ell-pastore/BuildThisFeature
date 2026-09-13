@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   LayoutGrid,
   List,
@@ -49,6 +49,10 @@ interface FilesProps {
   defaultSort?: SortKey;
   /** Persisted "Confirm before deleting" setting; defaults to asking. */
   confirmDelete?: boolean;
+  /** Bump to reopen the New folder/file modal (the ⌘N shortcut). */
+  newFolderSignal?: number;
+  /** Reports the currently selected items so App shortcuts can act on them. */
+  onSelectionChange?: (items: FileItem[]) => void;
 }
 
 type SortKey = "name" | "modified" | "size";
@@ -106,6 +110,8 @@ export default function Files({
   defaultViewMode = "list",
   defaultSort = "modified",
   confirmDelete = true,
+  newFolderSignal = 0,
+  onSelectionChange,
 }: FilesProps) {
   const [viewMode, setViewMode] = useState<"list" | "grid">(defaultViewMode);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -119,6 +125,15 @@ export default function Files({
   useEffect(() => {
     setSortBy(defaultSort);
   }, [defaultSort]);
+
+  // Reopen the New modal on a ⌘N signal from the app-level shortcut handler.
+  useEffect(() => {
+    if (newFolderSignal > 0) {
+      setNewOpen(true);
+      setNewKind("folder");
+      setNewName("");
+    }
+  }, [newFolderSignal]);
 
   // Client-side filtering over the already-loaded directory entries. No
   // filesystem re-query happens when these change.
@@ -209,7 +224,16 @@ export default function Files({
     return (b.modifiedTs ?? 0) - (a.modifiedTs ?? 0);
   });
 
-  const selectedItems = items.filter((i) => selected.has(i.id));
+  const selectedItems = useMemo(
+    () => items.filter((i) => selected.has(i.id)),
+    [items, selected],
+  );
+
+  // Keep the app's shortcut layer informed of the current selection so Space
+  // can preview the actively selected item.
+  useEffect(() => {
+    onSelectionChange?.(selectedItems);
+  }, [selectedItems, onSelectionChange]);
 
   // Breadcrumb built from the real filesystem path.
   const crumbs = path

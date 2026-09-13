@@ -80,4 +80,23 @@ describe("Settings", () => {
     expect(screen.queryByRole("button", { name: /Clear AI learning data/ })).toBeNull();
     expect(screen.queryByText("Clear AI learning data")).toBeNull();
   });
+
+  it("labels unimplemented shortcuts honestly in the shortcut list", () => {
+    renderSettings();
+    openSection("Keyboard Shortcuts");
+
+    for (const label of ["Upload files", "Move to Trash", "Undo"]) {
+      const row = screen.getByText(label).closest("div");
+      expect(row?.textContent).toContain("Not implemented");
+    }
+    for (const label of [
+      "Open search",
+      "New folder",
+      "Detect duplicates",
+      "Open AI Organization",
+      "Preview selected file",
+    ]) {
+      expect(screen.getByText(label).closest("div")?.textContent).not.toContain("Not implemented");
+    }
+  });
 });
