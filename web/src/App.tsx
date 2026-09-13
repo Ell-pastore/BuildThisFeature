@@ -17,6 +17,7 @@ import Storage from "./components/views/Storage";
 import Settings from "./components/views/Settings";
 import { getFilesystemProvider, type DirListing, type DiskUsage, type StorageBreakdown } from "./services/filesystem";
 import { useStars } from "./services/stars";
+import { useSettings } from "./services/settings";
 import type { FileItem } from "./types";
 
 /**
@@ -163,6 +164,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const { stars, isStarred, toggleStar, updateStarPath, removeStarPath } = useStars();
+  const { settings, updateSettings } = useSettings();
 
   // Starred view state: ALL persisted starred paths resolved against the real
   // filesystem (source of truth = the persisted star store), so stars outside
@@ -577,6 +579,9 @@ export default function App() {
                 onToggleStar={doToggleStar}
                 onRefresh={() => void loadDir(dirPath)}
                 onUploaded={handleUploaded}
+                defaultViewMode={settings.defaultView === "Grid" ? "grid" : "list"}
+                defaultSort={settings.sortFilesBy.toLowerCase() as "name" | "modified" | "size"}
+                confirmDelete={settings.confirmDelete}
               />
             )}
             {view === "recent" && (
@@ -630,7 +635,7 @@ export default function App() {
                 onRetry={() => setStorageReloadKey((k) => k + 1)}
               />
             )}
-            {view === "settings" && <Settings />}
+            {view === "settings" && <Settings settings={settings} onChange={updateSettings} />}
             {view === "ai-assistant" && <AIHistoryView />}
           </div>
 
@@ -656,6 +661,7 @@ export default function App() {
           onMove={(dest) => void doMove(previewFile, dest)}
           onCopy={(dest) => void doCopy([previewFile], dest)}
           onDuplicate={() => void doDuplicate(previewFile)}
+          confirmDelete={settings.confirmDelete}
         />
       )}
     </div>

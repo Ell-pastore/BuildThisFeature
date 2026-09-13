@@ -40,7 +40,7 @@ interface PreviewActions {
   onCopy?: (dest: string) => void;
 }
 
-function renderPreview(overrides: Partial<FileItem> = {}, actions: PreviewActions = {}) {
+function renderPreview(overrides: Partial<FileItem> = {}, actions: PreviewActions = {}, confirmDelete?: boolean) {
   return render(
     <FilePreview
       file={file(overrides)}
@@ -52,6 +52,7 @@ function renderPreview(overrides: Partial<FileItem> = {}, actions: PreviewAction
       onMove={actions.onMove ?? (() => {})}
       onDuplicate={actions.onDuplicate ?? (() => {})}
       onCopy={actions.onCopy ?? (() => {})}
+      confirmDelete={confirmDelete}
     />,
   );
 }
@@ -245,5 +246,33 @@ describe("FilePreview", () => {
 
     expect(onRename).not.toHaveBeenCalled();
     expect(screen.getAllByRole("button", { name: "Rename" }).length).toBe(2);
+  });
+
+  it("honors confirm-before-delete: asks before deleting when enabled", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const onDelete = vi.fn();
+
+    renderPreview({}, { onDelete }, true);
+    await screen.findByRole("img");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors confirm-before-delete: deletes directly without asking when disabled", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const onDelete = vi.fn();
+
+    renderPreview({}, { onDelete }, false);
+    await screen.findByRole("img");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(onDelete).toHaveBeenCalledTimes(1);
   });
 });

@@ -45,12 +45,20 @@ function fileItem(name: string): FileItem {
   };
 }
 
-function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.pdf")]) {
+function renderFiles(
+  items: FileItem[] = [folder("Projects"), fileItem("report.pdf")],
+  overrides: {
+    defaultViewMode?: "list" | "grid";
+    defaultSort?: "name" | "modified" | "size";
+    confirmDelete?: boolean;
+  } = {},
+) {
   const onNewFolder = vi.fn();
   const onNewFile = vi.fn();
   const onRename = vi.fn();
   const onDuplicate = vi.fn();
   const onCopy = vi.fn();
+  const onDelete = vi.fn();
   const onOpenFolder = vi.fn();
   const onOpenPreview = vi.fn();
   render(
@@ -67,16 +75,17 @@ function renderFiles(items: FileItem[] = [folder("Projects"), fileItem("report.p
       onNewFolder={onNewFolder}
       onNewFile={onNewFile}
       onRename={onRename}
-      onDelete={() => {}}
+      onDelete={onDelete}
       onMove={() => {}}
       onCopy={onCopy}
       onDuplicate={onDuplicate}
       onToggleStar={() => {}}
       onRefresh={() => {}}
       onUploaded={() => {}}
+      {...overrides}
     />,
   );
-  return { onNewFolder, onNewFile, onRename, onDuplicate, onCopy, onOpenFolder, onOpenPreview };
+  return { onNewFolder, onNewFile, onRename, onDuplicate, onCopy, onOpenFolder, onOpenPreview, onDelete };
 }
 
 describe("Files", () => {
@@ -444,5 +453,51 @@ describe("Files", () => {
 
     expect(screen.getByText("No matching results")).toBeInTheDocument();
     expect(screen.queryByText("report.pdf")).not.toBeInTheDocument();
+  });
+
+  it("opens the listing in the persisted default view", () => {
+    renderFiles([fileItem("report.pdf")], { defaultViewMode: "grid" });
+
+    // Grid mode renders no "Name" column header, unlike list mode.
+    expect(screen.queryByText("Name")).not.toBeInTheDocument();
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+  });
+
+  it("sorts the listing by the persisted default sort key", () => {
+    renderFiles([fileItem("z.pdf"), fileItem("a.pdf")], { defaultSort: "name" });
+
+    const before = (a: Element, b: Element) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(
+      before(screen.getByText("a.pdf"), screen.getByText("z.pdf")),
+    ).toBe(true);
+  });
+
+  it("asks for confirmation before deleting when confirm-before-delete is on", async () => {
+    const { onDelete } = renderFiles([fileItem("report.pdf")], { confirmDelete: true });
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    await screen.findByText("1 selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByText("Move report.pdf to Trash?")).toBeInTheDocument();
+    expect(onDelete).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith(fileItem("report.pdf"));
+  });
+
+  it("deletes immediately without confirmation when confirm-before-delete is off", async () => {
+    const { onDelete } = renderFiles([fileItem("report.pdf")], { confirmDelete: false });
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    await screen.findByText("1 selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(screen.queryByText("Move report.pdf to Trash?")).not.toBeInTheDocument();
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith(fileItem("report.pdf"));
   });
 });

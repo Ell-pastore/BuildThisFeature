@@ -1,46 +1,101 @@
 import { useEffect, useState } from "react";
 import { Settings as SettingsIcon } from "../../components/Icons";
 import { API_BASE_URL, fetchHealth } from "../../services/api";
+import type { AppSettings, DefaultView, SortFilesBy } from "../../services/settings";
 
 type Section = "General" | "Appearance" | "Storage" | "AI" | "Privacy" | "Notifications" | "Keyboard Shortcuts";
 
 const sections: Section[] = ["General", "Appearance", "Storage", "AI", "Privacy", "Notifications", "Keyboard Shortcuts"];
 
-function Toggle({ label, description, defaultOn = false }: { label: string; description?: string; defaultOn?: boolean }) {
-  const [on, setOn] = useState(defaultOn);
+function Toggle({
+  label,
+  description,
+  checked = false,
+  disabled = false,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  checked?: boolean;
+  disabled?: boolean;
+  onChange?: (next: boolean) => void;
+}) {
   return (
     <div className="flex items-start justify-between py-4 border-b border-border last:border-none">
       <div className="flex-1 pr-8">
         <div className="text-sm font-medium text-foreground">{label}</div>
         {description && <div className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{description}</div>}
+        {disabled && (
+          <div className="mt-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+            Not available
+          </div>
+        )}
       </div>
       <button
-        onClick={() => setOn((v) => !v)}
-        className={`relative w-10 h-6 rounded-full transition-colors flex-shrink-0 mt-0.5 ${on ? "bg-accent" : "bg-border"}`}
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        disabled={disabled}
+        onClick={() => onChange && !disabled && onChange(!checked)}
+        className={`relative w-10 h-6 rounded-full transition-colors flex-shrink-0 mt-0.5 ${
+          disabled
+            ? "bg-border opacity-40 cursor-not-allowed"
+            : checked
+              ? "bg-accent"
+              : "bg-border"
+        }`}
       >
-        <span className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow-sm transition-all ${on ? "left-5" : "left-1"}`} />
+        <span className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow-sm transition-all ${checked ? "left-5" : "left-1"}`} />
       </button>
     </div>
   );
 }
 
-function Select({ label, options, defaultValue }: { label: string; options: string[]; defaultValue: string }) {
-  const [val, setVal] = useState(defaultValue);
+function Select({
+  label,
+  options,
+  value,
+  disabled = false,
+  onChange,
+}: {
+  label: string;
+  options: string[];
+  value: string;
+  disabled?: boolean;
+  onChange?: (next: string) => void;
+}) {
   return (
     <div className="flex items-center justify-between py-4 border-b border-border last:border-none">
       <div className="text-sm font-medium text-foreground">{label}</div>
-      <select
-        value={val}
-        onChange={(e) => setVal(e.target.value)}
-        className="text-sm border border-border rounded-lg px-3 py-1.5 bg-card text-foreground outline-none focus:border-accent transition-colors"
-      >
-        {options.map((o) => <option key={o}>{o}</option>)}
-      </select>
+      <div className="flex items-center gap-3">
+        {disabled && (
+          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+            Not available
+          </span>
+        )}
+        <select
+          aria-label={label}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange && !disabled && onChange(e.target.value)}
+          className="text-sm border border-border rounded-lg px-3 py-1.5 bg-card text-foreground outline-none focus:border-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {options.map((o) => (
+            <option key={o}>{o}</option>
+          ))}
+        </select>
+      </div>
     </div>
   );
 }
 
-export default function Settings() {
+interface SettingsProps {
+  settings: AppSettings;
+  onChange: (patch: Partial<AppSettings>) => void;
+}
+
+export default function Settings({ settings, onChange }: SettingsProps) {
   const [activeSection, setActiveSection] = useState<Section>("General");
   const [backend, setBackend] = useState<{ status: "checking" | "ok" | "error"; time: string | null }>({ status: "checking", time: null });
 
@@ -85,11 +140,26 @@ export default function Settings() {
           <div className="flex-1 bg-card border border-border rounded-xl px-6 py-2">
             {activeSection === "General" && (
               <div>
-                <Select label="Default view" options={["List", "Grid"]} defaultValue="List" />
-                <Select label="Sort files by" options={["Name", "Modified", "Size", "Type"]} defaultValue="Modified" />
-                <Toggle label="Show hidden files" defaultOn={false} />
-                <Toggle label="Confirm before deleting" defaultOn={true} description="Show a confirmation dialog before moving files to Trash." />
-                <Toggle label="Open files on single click" defaultOn={false} />
+                <Select
+                  label="Default view"
+                  options={["List", "Grid"]}
+                  value={settings.defaultView}
+                  onChange={(v) => onChange({ defaultView: v as DefaultView })}
+                />
+                <Select
+                  label="Sort files by"
+                  options={["Name", "Modified", "Size"]}
+                  value={settings.sortFilesBy}
+                  onChange={(v) => onChange({ sortFilesBy: v as SortFilesBy })}
+                />
+                <Toggle label="Show hidden files" disabled />
+                <Toggle
+                  label="Confirm before deleting"
+                  checked={settings.confirmDelete}
+                  onChange={(on) => onChange({ confirmDelete: on })}
+                  description="Show a confirmation dialog before moving files to Trash."
+                />
+                <Toggle label="Open files on single click" disabled />
                 <div className="py-4 border-b border-border last:border-none">
                   <div className="text-sm font-medium text-foreground">Backend API</div>
                   <div className="flex items-center gap-2 mt-1">
@@ -113,20 +183,20 @@ export default function Settings() {
             )}
             {activeSection === "Appearance" && (
               <div>
-                <Select label="Theme" options={["Light", "System"]} defaultValue="Light" />
-                <Select label="Density" options={["Comfortable", "Compact"]} defaultValue="Comfortable" />
-                <Toggle label="Show file extensions" defaultOn={true} />
-                <Toggle label="Show file previews in grid" defaultOn={true} />
+                <Select label="Theme" options={["Light", "System"]} value="Light" disabled />
+                <Select label="Density" options={["Comfortable", "Compact"]} value="Comfortable" disabled />
+                <Toggle label="Show file extensions" disabled />
+                <Toggle label="Show file previews in grid" disabled />
               </div>
             )}
             {activeSection === "AI" && (
               <div>
-                <Toggle label="Enable AI suggestions" defaultOn={true} description="Let SmartFile analyze your files and surface intelligent recommendations." />
-                <Toggle label="Enable natural-language search" defaultOn={true} description="Search using natural language queries like 'Find my internship documents'." />
-                <Toggle label="Enable automatic duplicate detection" defaultOn={true} description="Automatically scan for duplicate files in the background." />
-                <Toggle label="Ask before moving files" defaultOn={true} description="Always require confirmation before AI moves any files." />
-                <Toggle label="Ask before deleting files" defaultOn={true} description="Never allow AI to permanently delete files without explicit confirmation." />
-                <Toggle label="Show AI confidence scores" defaultOn={false} />
+                <Toggle label="Enable AI suggestions" disabled description="SmartFile analysis is not implemented yet." />
+                <Toggle label="Enable natural-language search" disabled description="Natural-language search is not implemented yet." />
+                <Toggle label="Enable automatic duplicate detection" disabled description="Duplicate detection is manual in the Duplicates view." />
+                <Toggle label="Ask before moving files" disabled description="AI file actions are not implemented yet." />
+                <Toggle label="Ask before deleting files" disabled description="AI file actions are not implemented yet." />
+                <Toggle label="Show AI confidence scores" disabled />
               </div>
             )}
             {activeSection === "Privacy" && (
@@ -137,28 +207,23 @@ export default function Settings() {
                     SmartFile analyzes your file names, sizes, types, and metadata to provide AI-powered organization suggestions. File contents are processed locally and are never sent to external servers without your explicit permission.
                   </p>
                 </div>
-                <Toggle label="Allow local AI analysis" defaultOn={true} description="Enables all AI features. File content is processed on-device." />
-                <Toggle label="Usage analytics" defaultOn={false} description="Help improve SmartFile by sharing anonymous usage data." />
-                <div className="py-4">
-                  <button className="px-4 py-2 text-sm text-red-600 border border-red-200 rounded-lg hover:bg-red-50 transition-colors">
-                    Clear AI learning data
-                  </button>
-                </div>
+                <Toggle label="Allow local AI analysis" disabled description="Local AI analysis is not implemented yet." />
+                <Toggle label="Usage analytics" disabled />
               </div>
             )}
             {activeSection === "Notifications" && (
               <div>
-                <Toggle label="Organization suggestions" defaultOn={true} />
-                <Toggle label="Duplicate detection alerts" defaultOn={true} />
-                <Toggle label="Storage warnings" defaultOn={true} />
-                <Toggle label="AI analysis complete" defaultOn={false} />
+                <Toggle label="Organization suggestions" disabled />
+                <Toggle label="Duplicate detection alerts" disabled />
+                <Toggle label="Storage warnings" disabled />
+                <Toggle label="AI analysis complete" disabled />
               </div>
             )}
             {activeSection === "Storage" && (
               <div>
-                <Select label="Warning threshold" options={["75%", "80%", "90%"]} defaultValue="80%" />
-                <Toggle label="Auto-detect large files" defaultOn={true} description="Notify when files over 500 MB are added." />
-                <Toggle label="Weekly storage report" defaultOn={false} />
+                <Select label="Warning threshold" options={["75%", "80%", "90%"]} value="80%" disabled />
+                <Toggle label="Auto-detect large files" disabled />
+                <Toggle label="Weekly storage report" disabled />
               </div>
             )}
             {activeSection === "Keyboard Shortcuts" && (

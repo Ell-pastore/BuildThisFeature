@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   LayoutGrid,
   List,
@@ -43,6 +43,12 @@ interface FilesProps {
   onToggleStar: (item: FileItem) => void;
   onRefresh: () => void;
   onUploaded: () => void;
+  /** Persisted "Default view" setting; falls back to list. */
+  defaultViewMode?: "list" | "grid";
+  /** Persisted "Sort files by" setting; falls back to modified. */
+  defaultSort?: SortKey;
+  /** Persisted "Confirm before deleting" setting; defaults to asking. */
+  confirmDelete?: boolean;
 }
 
 type SortKey = "name" | "modified" | "size";
@@ -97,10 +103,22 @@ export default function Files({
   onToggleStar,
   onRefresh,
   onUploaded,
+  defaultViewMode = "list",
+  defaultSort = "modified",
+  confirmDelete = true,
 }: FilesProps) {
-  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
+  const [viewMode, setViewMode] = useState<"list" | "grid">(defaultViewMode);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [sortBy, setSortBy] = useState<SortKey>("modified");
+  const [sortBy, setSortBy] = useState<SortKey>(defaultSort);
+
+  // Follow the persisted settings when they change (e.g. after editing them in
+  // Settings). In-app toggles still work until a setting is edited.
+  useEffect(() => {
+    setViewMode(defaultViewMode);
+  }, [defaultViewMode]);
+  useEffect(() => {
+    setSortBy(defaultSort);
+  }, [defaultSort]);
 
   // Client-side filtering over the already-loaded directory entries. No
   // filesystem re-query happens when these change.
@@ -171,6 +189,18 @@ export default function Files({
     setSizeFilter("Any");
     setModifiedFilter("Any");
   };
+
+  // Delete honors the "Confirm before deleting" setting: when disabled the
+  // item goes straight to Trash; otherwise the in-app confirmation shows.
+  function startDelete(item: FileItem | null) {
+    if (!item) return;
+    if (confirmDelete) {
+      setDeleteItem(item);
+      return;
+    }
+    onDelete(item);
+    setSelected(new Set());
+  }
 
   // Sorting uses the raw numeric values, never the formatted size/date strings.
   const sorted = [...filtered].sort((a, b) => {
@@ -448,7 +478,7 @@ export default function Files({
             </button>
 
             <button
-              onClick={() => setDeleteItem(selectedItems[0] ?? null)}
+              onClick={() => startDelete(selectedItems[0] ?? null)}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-red-300 hover:bg-red-500/20 transition-colors ml-auto"
             >
               <Trash2 size={12} />

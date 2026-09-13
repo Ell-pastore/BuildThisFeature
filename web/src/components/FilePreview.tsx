@@ -15,6 +15,8 @@ interface FilePreviewProps {
   onMove?: (destDir: string) => void;
   onDuplicate?: () => void;
   onCopy?: (destDir: string) => void;
+  /** Persisted "Confirm before deleting" setting; defaults to asking. */
+  confirmDelete?: boolean;
 }
 
 /** MIME type for a previewable extension, or undefined when unsupported. */
@@ -156,6 +158,7 @@ export default function FilePreview({
   onMove,
   onDuplicate,
   onCopy,
+  confirmDelete = true,
 }: FilePreviewProps) {
   const [moveOpen, setMoveOpen] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
@@ -259,7 +262,12 @@ export default function FilePreview({
               </button>
               <button
                 onClick={() => {
-                  if (onDelete && window.confirm(`Move "${file.name}" to Trash? You can restore it from the Trash view.`)) onDelete();
+                  if (!onDelete) return;
+                  if (confirmDelete === false) {
+                    onDelete();
+                    return;
+                  }
+                  if (window.confirm(`Move "${file.name}" to Trash? You can restore it from the Trash view.`)) onDelete();
                 }}
                 className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-red-600 hover:bg-red-50 transition-colors"
               >
