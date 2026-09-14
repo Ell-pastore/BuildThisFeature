@@ -23,14 +23,6 @@ const navItems = [
   { id: "trash" as View, label: "Trash", icon: Trash2 },
 ];
 
-const smartFolderItems = [
-  { id: "university", label: "University" },
-  { id: "projects", label: "Projects" },
-  { id: "documents", label: "Documents" },
-  { id: "images", label: "Images" },
-  { id: "videos", label: "Videos" },
-];
-
 const aiItems = [
   { id: "ai-organization" as View, label: "AI Organization", icon: Sparkles },
   { id: "duplicates" as View, label: "Duplicates", icon: Copy },
@@ -109,18 +101,15 @@ export default function Sidebar({ currentView, onNavigate, collapsed, onToggleCo
             <div className="pt-4 pb-1 px-2.5">
               <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Smart Folders</span>
             </div>
-            {smartFolderItems.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => onNavigate("smart-folders")}
-                className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-sm transition-colors
-                  ${currentView === "smart-folders" ? "text-foreground" : "text-muted-foreground hover:text-foreground hover:bg-secondary"}
-                `}
-              >
-                <span className="w-4 h-4 rounded bg-indigo-100 flex-shrink-0" />
-                <span className="truncate">{item.label}</span>
-              </button>
-            ))}
+            <button
+              onClick={() => onNavigate("smart-folders")}
+              className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-sm transition-colors
+                ${currentView === "smart-folders" ? "text-foreground" : "text-muted-foreground hover:text-foreground hover:bg-secondary"}
+              `}
+            >
+              <span className="w-4 h-4 rounded bg-indigo-100 flex-shrink-0" />
+              <span className="truncate">Smart Folders</span>
+            </button>
           </>
         )}
 

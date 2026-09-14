@@ -1,4 +1,4 @@
-import { Sparkles, Plus } from "../../components/Icons";
+import { Sparkles } from "../../components/Icons";
 
 /**
  * Smart Folders. AI/rule-based dynamic folders aren't implemented yet, so this
@@ -16,10 +16,6 @@ export default function SmartFolders() {
             </div>
             <p className="text-sm text-muted-foreground">Dynamic folders that automatically update based on rules or AI understanding.</p>
           </div>
-          <button className="flex items-center gap-1.5 px-3 py-1.5 bg-foreground text-primary-foreground rounded-lg text-xs font-medium hover:opacity-90 transition-opacity">
-            <Plus size={13} />
-            New smart folder
-          </button>
         </div>
 
         <div className="flex flex-col items-center justify-center py-24 text-center">
