@@ -71,7 +71,8 @@ function usePreviewUrl(file: FileItem) {
       .readFile(file.path)
       .then((bytes) => {
         if (cancelled) return;
-        const blob = new Blob([bytes as unknown as BlobPart], { type: kind.mime });
+        const bytesArray = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as unknown as ArrayLike<number>);
+        const blob = new Blob([bytesArray as unknown as BlobPart], { type: kind.mime });
         createdUrl = URL.createObjectURL(blob);
         setUrl(createdUrl);
       })

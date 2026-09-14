@@ -96,6 +96,19 @@ describe("FilePreview", () => {
     expect(screen.getByRole("img")).toHaveAttribute("alt", "photo.png");
   });
 
+  it("normalizes the REAL Tauri number[] byte payload into true image bytes for the Blob", async () => {
+    readFileMock.mockResolvedValue([137, 80, 78, 71]);
+
+    renderPreview({ name: "photo.png", type: "png", path: "/Users/usr/Desktop/photo.png" });
+
+    await screen.findByRole("img");
+    const blob = createObjectURLMock.mock.calls[0][0] as Blob;
+    expect(blob.size).toBe(4);
+    expect(await blob.arrayBuffer() as ArrayBuffer).toEqual(
+      new Uint8Array([137, 80, 78, 71]).buffer,
+    );
+  });
+
   it("renders a <video controls> preview for a supported video", async () => {
     readFileMock.mockResolvedValue(new Uint8Array([0, 0, 0, 18]));
 
