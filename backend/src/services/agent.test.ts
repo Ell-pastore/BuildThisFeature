@@ -134,9 +134,17 @@ describe("runAgentRequest — valid agent request", () => {
     expect(result.results[0]).toEqual({
       ok: true,
       callId: "call-1",
+      toolName: "list_directory",
+      toolInput: { path: "/home" },
       data: { path: "/home", parentPath: null, isHome: false, items: [] },
     });
-    expect(result.results[1]).toEqual({ ok: true, callId: "call-2", data: [] });
+    expect(result.results[1]).toEqual({
+      ok: true,
+      callId: "call-2",
+      toolName: "search_files",
+      toolInput: { query: "report" },
+      data: [],
+    });
 
     // Both intents really ran through the executor, in request order.
     expect(filesystem.calls).toEqual(["listDirectory:/home", "searchFiles"]);
@@ -353,6 +361,8 @@ describe("runAgentRequest — authenticated routing", () => {
     expect(result.results[0]).toEqual({
       ok: false,
       callId: "unknown",
+      toolName: "not_a_tool",
+      toolInput: {},
       error: expect.objectContaining({ category: "unknown_tool" }),
     });
     const validOutcome = result.results[1];

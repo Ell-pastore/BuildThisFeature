@@ -667,7 +667,13 @@ describe("instruction flow — resuming an approved approval", () => {
     // gated list_directory + search_files only) plus the executed result.
     expect(requests[0].tools.map((tool) => tool.name)).toEqual(["list_directory", "search_files"]);
     expect(requests[0].toolResults).toEqual([
-      { ok: true, callId: approvalId, data: homeListing("/home/docs") },
+      {
+        ok: true,
+        callId: approvalId,
+        toolName: "list_directory",
+        toolInput: { path: "/home/docs" },
+        data: homeListing("/home/docs"),
+      },
     ]);
 
     // Stable response: one round, safe tool-result synopsis, no new approvals.
@@ -1021,12 +1027,75 @@ describe("instruction flow — approved host write (move_file) defers to the hos
       {
         ok: true,
         callId: approvalId,
+        toolName: "move_file",
+        toolInput: MOVED_ARGS,
         data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
       },
     ]);
     expect(response.turn.finalText).toBe("Moved.");
     expect(response.turn.pendingExecutions).toEqual([]);
     // The approval was consumed ONLY AFTER successful sealing.
+    expect(approvalRepo.rows[0]?.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("SEALS the execution AND consumes the approval when resuming with the DESKTOP DRIVER payload (conversationId + resumeExecutions)", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const filesystem = makeFilesystem();
+    const { generate, requests } = scriptedProvider([{ text: "Moved." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }, { filesystem }));
+
+    // 1. The approved move pauses as a pending execution (real flow).
+    const paused = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+    const executionId = paused.turn.pendingExecutions[0]!.executionId;
+    expect(hostStore.rows).toHaveLength(1);
+    expect(hostStore.rows[0]?.status).toBe("pending");
+    // The execution stays bound to the approval AND its conversation.
+    expect(hostStore.rows[0]?.approvalId).toBe(approvalId);
+    expect(hostStore.rows[0]?.conversationId).toBe(CONVERSATION_ID);
+
+    // 2. The desktop driver submits the host's result using its EXACT payload
+    //    shape: `{ conversationId, instruction, resumeExecutions }`.
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      conversationId: CONVERSATION_ID,
+      instruction: "Continue after the requested operations have been executed.",
+      resumeExecutions: [
+        {
+          executionId,
+          ok: true,
+          result: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+        },
+      ],
+    });
+
+    // The pending execution was resumed: sealed exactly once and its result
+    // seeded into the loop as provider context.
+    expect(hostStore.rows).toHaveLength(1);
+    expect(hostStore.rows[0]?.status).toBe("executed");
+    expect(hostStore.rows[0]?.executedAt).not.toBeNull();
+    expect(hostStore.rows[0]?.approvalId).toBe(approvalId);
+    expect(hostStore.rows[0]?.conversationId).toBe(CONVERSATION_ID);
+    expect(requests[0]?.toolResults).toEqual([
+      {
+        ok: true,
+        callId: approvalId,
+        toolName: "move_file",
+        toolInput: MOVED_ARGS,
+        data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+      },
+    ]);
+
+    // The turn produced the expected final result.
+    expect(response.conversationId).toBe(CONVERSATION_ID);
+    expect(response.turn.finalText).toBe("Moved.");
+    expect(response.turn.pendingExecutions).toEqual([]);
+    expect(response.turn.pendingApprovals).toEqual([]);
+
+    // The approval was consumed/sealed ONLY AFTER the execution sealed —
+    // it is no longer usable (its decision window is closed).
+    expect(approvalRepo.rows[0]?.status).toBe("approved");
     expect(approvalRepo.rows[0]?.expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 

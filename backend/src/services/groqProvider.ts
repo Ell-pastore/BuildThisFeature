@@ -226,8 +226,8 @@ function toGroqMessages(request: AgentProviderRequest): GroqMessage[] {
         id: result.callId,
         type: "function",
         function: {
-          name: "unknown",
-          arguments: "{}",
+          name: result.toolName ?? "unknown",
+          arguments: JSON.stringify(result.toolInput ?? {}),
         },
       })),
     };

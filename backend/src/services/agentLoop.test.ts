@@ -251,11 +251,11 @@ describe("runAgentLoop — tool rounds", () => {
     expect(requests[1]).toEqual({
       message: "list /home",
       tools: readToolDefinitions,
-      toolResults: [{ ok: true, callId: "a", data: homeListing() }],
+      toolResults: [{ ok: true, callId: "a", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }],
     });
     expect(output).toEqual({
       text: "/home is listed.",
-      results: [{ ok: true, callId: "a", data: homeListing() }],
+      results: [{ ok: true, callId: "a", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }],
       toolRounds: 1,
       pendingApprovals: [],
       pendingExecutions: [],
@@ -281,21 +281,21 @@ describe("runAgentLoop — tool rounds", () => {
     expect(requests[1]).toEqual({
       message: "find notes then list /tmp",
       tools: readToolDefinitions,
-      toolResults: [{ ok: true, callId: "s", data: [] }],
+      toolResults: [{ ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] }],
     });
     expect(requests[2]).toEqual({
       message: "find notes then list /tmp",
       tools: readToolDefinitions,
       toolResults: [
-        { ok: true, callId: "s", data: [] },
-        { ok: true, callId: "t", data: homeListing("/tmp") },
+        { ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] },
+        { ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/tmp" }, data: homeListing("/tmp") },
       ],
     });
     expect(output).toEqual({
       text: "All done.",
       results: [
-        { ok: true, callId: "s", data: [] },
-        { ok: true, callId: "t", data: homeListing("/tmp") },
+        { ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] },
+        { ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/tmp" }, data: homeListing("/tmp") },
       ],
       toolRounds: 2,
       pendingApprovals: [],
@@ -325,8 +325,8 @@ describe("runAgentLoop — tool rounds", () => {
     expect(output.toolRounds).toBe(1);
     const first = output.results[0];
     const second = output.results[1];
-    expect(first).toEqual({ ok: true, callId: "s", data: [] });
-    expect(second).toEqual({ ok: true, callId: "t", data: homeListing() });
+    expect(first).toEqual({ ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] });
+    expect(second).toEqual({ ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() });
     expect(filesystem.calls).toEqual(["searchFiles", "listDirectory:/home"]);
   });
 
@@ -348,13 +348,13 @@ describe("runAgentLoop — tool rounds", () => {
       {
         text: undefined,
         toolCalls: [call("s", "search_files", { query: "notes" })],
-        results: [{ ok: true, callId: "s", data: [] }],
+        results: [{ ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] }],
         toolRounds: 1,
       },
       {
         text: undefined,
         toolCalls: [call("t", "list_directory", { path: "/tmp" })],
-        results: [{ ok: true, callId: "t", data: homeListing("/tmp") }],
+        results: [{ ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/tmp" }, data: homeListing("/tmp") }],
         toolRounds: 2,
       },
     ]);

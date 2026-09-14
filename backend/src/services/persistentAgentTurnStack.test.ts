@@ -518,7 +518,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
     });
 
     expect(result.state.toolRounds).toBe(1);
-    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", data: homeListing() }]);
+    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }]);
     expect(result.state.finalText).toBe("Everything listed.");
 
     // Round 1: grok tried and failed (cooling). Round 2: grok skipped (cooldown),
@@ -526,7 +526,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
     expect(counters.grokCalls).toBe(1);
     expect(counters.geminiCalls).toBe(2);
     expect(geminiRequests[0]!.message).toBe(INSTRUCTION);
-    expect(geminiRequests[1]!.toolResults).toEqual([{ ok: true, callId: "c1", data: homeListing() }]);
+    expect(geminiRequests[1]!.toolResults).toEqual([{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }]);
 
     expect(builds).toEqual([
       { provider: ProviderId.Grok, credentialValue: "grok-key-1" },
@@ -542,7 +542,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
         rounds: [
           {
             messageId: "msg-r1",
-            toolResults: [{ ok: true, callId: "c1", data: homeListing() }],
+            toolResults: [{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }],
           },
         ],
         finalText: "Everything listed.",
@@ -582,7 +582,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
 
     expect(result.conversationId).toBe("conv-exec");
     expect(result.state.toolRounds).toBe(1);
-    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", data: homeListing() }]);
+    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }]);
     expect(result.state.finalText).toBe("Everything listed.");
 
     // The tool round was EAGERLY begun (real persisted ids), then completed
@@ -594,7 +594,7 @@ describe("runPersistentTurn — provider switching preserves tool continuation",
         rounds: [
           {
             messageId: "msg-r1",
-            toolResults: [{ ok: true, callId: "c1", data: homeListing() }],
+            toolResults: [{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }],
           },
         ],
         finalText: "Everything listed.",

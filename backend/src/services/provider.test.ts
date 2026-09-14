@@ -203,6 +203,8 @@ describe("AgentProvider — tool-call routing", () => {
       {
         ok: true,
         callId: "a",
+        toolName: "list_directory",
+        toolInput: { path: "/home" },
         data: { path: "/home", parentPath: null, isHome: false, items: [] },
       },
     ]);

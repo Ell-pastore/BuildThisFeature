@@ -350,11 +350,17 @@ async function runApprovalGate(
   // destination is free, both paths stay within permitted scope). Failing here
   // means NO approval is created and NOTHING executes — an approval can never
   // encode arguments that are provably invalid or unsafe at creation time.
-  const preflightError = await runToolPreflight(
-    toolName,
-    input,
-    options.filesystem,
-  );
+  // When the request is HOST-DELEGATED (Phase 10.39), the executor cannot
+  // answer the preflight's metadata reads in this process — every method
+  // throws `HostExecutionDeferredError`. The deep filesystem validation
+  // therefore stays at EXECUTION time (the controlled executor / Rust /
+  // AllowList path after the approval is approved), and CREATE just records a
+  // schema-valid pending approval; the schema/argument validation still runs
+  // inside `createAiToolApproval` below.
+  const preflightError =
+    isHostDelegatedFilesystemExecutor(options.filesystem)
+      ? null
+      : await runToolPreflight(toolName, input, options.filesystem);
   if (preflightError !== null) {
     return { ok: false, error: preflightError };
   }

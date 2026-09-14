@@ -240,7 +240,7 @@ describe("runPersistentTurn — create", () => {
     expect(result.state.instruction).toBe("List my files.");
     expect(result.state.finalText).toBe("Everything listed.");
     expect(result.state.toolRounds).toBe(1);
-    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", data: homeListing() }]);
+    expect(result.state.toolResults).toEqual([{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }]);
 
     // The provider saw only REGISTERED tool metadata.
     expect(requests[0]).toEqual({ message: "List my files.", tools: readToolDefinitions });
@@ -265,7 +265,7 @@ describe("runPersistentTurn — create", () => {
       rounds: [
         {
           messageId: "msg-r1",
-          toolResults: [{ ok: true, callId: "c1", data: homeListing() }],
+          toolResults: [{ ok: true, callId: "c1", toolName: "list_directory", toolInput: { path: "/home" }, data: homeListing() }],
         },
       ],
       finalText: "Everything listed.",
@@ -431,8 +431,8 @@ describe("runPersistentTurn — loop outcomes", () => {
 
     expect(result.state.toolRounds).toBe(2);
     expect(result.state.toolResults).toEqual([
-      { ok: true, callId: "s", data: [] },
-      { ok: true, callId: "t", data: homeListing("/tmp") },
+      { ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] },
+      { ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/tmp" }, data: homeListing("/tmp") },
     ]);
     expect(result.state.messages).toHaveLength(3);
 
@@ -453,11 +453,11 @@ describe("runPersistentTurn — loop outcomes", () => {
         rounds: [
           {
             messageId: "msg-r1",
-            toolResults: [{ ok: true, callId: "s", data: [] }],
+            toolResults: [{ ok: true, callId: "s", toolName: "search_files", toolInput: { query: "notes" }, data: [] }],
           },
           {
             messageId: "msg-r2",
-            toolResults: [{ ok: true, callId: "t", data: homeListing("/tmp") }],
+            toolResults: [{ ok: true, callId: "t", toolName: "list_directory", toolInput: { path: "/tmp" }, data: homeListing("/tmp") }],
           },
         ],
         finalText: "Search and listing done.",
@@ -829,9 +829,16 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
       record.id,
       expect.any(Date),
     );
-    // The seeded result was shown to the provider as already-executed context.
+    // The seeded result was shown to the provider as already-executed context
+    // WITH the real tool name and arguments (not unknown({})).
     expect(requests[0]?.toolResults).toEqual([
-      { ok: true, callId: "c1", data: homeListing() },
+      {
+        ok: true,
+        callId: "c1",
+        toolName: "list_directory",
+        toolInput: { path: "/home" },
+        data: homeListing(),
+      },
     ]);
     // Conversation (and its 3-round bound) resolved FROM the execution; the
     // text-only completed turn persisted against that conversation.
@@ -848,5 +855,71 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
     expect(mocks.beginAgentTurn).not.toHaveBeenCalled();
     expect(mocks.completeAgentTurn).not.toHaveBeenCalled();
     expect(mocks.cancelAgentTurn).not.toHaveBeenCalled();
+  });
+
+  it("REGRESSION: resumes list_directory with TRUTHFUL toolName + arguments so the model can CONTINUE to another tool call (not unknown({}))", async () => {
+    let previous = createConversationState({ instruction: "First turn", maxToolRounds: 3 });
+    previous = finalizeConversation(previous, "First reply.");
+    mocks.loadAgentConversationState.mockResolvedValue(previous);
+
+    const record = pendingRecord({ conversationId: "conv-9" });
+    hostMocks.getAiHostExecution.mockResolvedValue(record);
+
+    // On resume, the model sees the truthful listing and makes a SECOND
+    // list_directory call → host-delegated → new pending execution.
+    const secondRecord = pendingRecord({
+      id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      conversationId: "conv-9",
+      callId: "c2",
+      toolName: "list_directory",
+      arguments: { path: "/tmp" },
+      round: 2,
+    });
+    hostMocks.createAiHostExecution.mockResolvedValue(secondRecord);
+
+    const { generate, requests } = scriptedProvider([
+      { toolCalls: [call("c2", "list_directory", { path: "/tmp" })] },
+    ]);
+
+    const submission: HostExecutionSubmission = {
+      executionId: record.id,
+      ok: true,
+      result: homeListing(),
+    };
+
+    const result = await runPersistentTurn(
+      sessionContext(ACTIVE_USER),
+      { instruction: "List my files.", resumeHostExecutions: [submission] },
+      makeOptions({ generate }, {
+        maxToolRounds: 3,
+        filesystem: hostDelegatedFilesystemExecutor(),
+      }),
+    );
+
+    // THE KEY REGRESSION: the seed carries the TRUE tool name + arguments
+    // (not unknown({})) so the model can correlate the listing with its
+    // original list_directory call and CONTINUE to another call.
+    expect(requests[0]?.toolResults).toEqual([
+      {
+        ok: true,
+        callId: "c1",
+        toolName: "list_directory",
+        toolInput: { path: "/home" },
+        data: homeListing(),
+      },
+    ]);
+
+    // The model CONTINUED: a second list_directory call was delegated to the
+    // host (proving the model could correlate the listing, instead of the
+    // old bug where unknown({}) caused it to ask clarifying questions).
+    expect(result.pendingExecutions).toHaveLength(1);
+    expect(result.pendingExecutions[0]).toMatchObject({
+      executionId: secondRecord.id,
+      toolName: "list_directory",
+      arguments: { path: "/tmp" },
+    });
+
+    // The first execution was sealed.
+    expect(hostMocks.submitHostExecution).toHaveBeenCalledWith(USER_ID, record.id, expect.any(Date));
   });
 });

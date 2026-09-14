@@ -272,8 +272,8 @@ function toOllamaMessages(request: AgentProviderRequest): OllamaMessage[] {
         type: "function",
         function: {
           index,
-          name: "unknown",
-          arguments: {},
+          name: result.toolName ?? "unknown",
+          arguments: result.toolInput ?? {},
         },
       })),
     });

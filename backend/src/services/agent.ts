@@ -69,8 +69,8 @@ export interface AgentRequest {
  * 9.4 `ToolExecutionResult` contract and adds the `callId` correlation.
  */
 export type AgentToolResult<T = unknown> =
-  | { ok: true; callId: string; data: T }
-  | { ok: false; callId: string; error: ToolError };
+  | { ok: true; callId: string; data: T; toolName?: string; toolInput?: Record<string, unknown> }
+  | { ok: false; callId: string; error: ToolError; toolName?: string; toolInput?: Record<string, unknown> };
 
 /** Typed result contract for an agent request. */
 export interface AgentResult<T = unknown> {
@@ -187,8 +187,20 @@ export async function runAgentRequest(
     }
     results.push(
       result.ok
-        ? { ok: true, callId: call.id, data: result.data }
-        : { ok: false, callId: call.id, error: result.error },
+        ? {
+            ok: true,
+            callId: call.id,
+            toolName: call.toolName,
+            toolInput: call.input,
+            data: result.data,
+          }
+        : {
+            ok: false,
+            callId: call.id,
+            toolName: call.toolName,
+            toolInput: call.input,
+            error: result.error,
+          },
     );
   }
   return { requestId: request.id, results, pendingApprovals, pendingExecutions };

@@ -208,6 +208,8 @@ describe("orchestrateTurn — response processing", () => {
     expect(result.results[0]).toEqual({
       ok: true,
       callId: "a",
+      toolName: "list_directory",
+      toolInput: { path: "/home" },
       data: { path: "/home", parentPath: null, isHome: false, items: [] },
     });
     expect(filesystem.calls).toEqual(["listDirectory:/home"]);

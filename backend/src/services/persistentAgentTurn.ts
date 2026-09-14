@@ -349,6 +349,8 @@ async function resolveHostExecutionsResume(
       return {
         ok: false,
         callId: record.callId,
+        toolName: record.toolName,
+        toolInput: record.arguments as Record<string, unknown>,
         error: new ToolError(
           (submission.error?.category ?? "internal") as ToolErrorCategory,
           submission.error?.code ?? "tools/host-execution-required",
@@ -356,7 +358,13 @@ async function resolveHostExecutionsResume(
         ),
       };
     }
-    return { ok: true, callId: record.callId, data: submission.result };
+    return {
+      ok: true,
+      callId: record.callId,
+      toolName: record.toolName,
+      toolInput: record.arguments as Record<string, unknown>,
+      data: submission.result,
+    };
   });
   const initialRounds = resolved.reduce(
     (highest, s) => Math.max(highest, s.record.round),
@@ -456,18 +464,15 @@ export async function runPersistentTurn(
     }
     bound = resumedConversation.maxToolRounds;
     resumeRecord = record;
-  } else if (input.conversationId !== undefined) {
-    const loaded = await loadAgentConversationState(userId, input.conversationId);
-    if (loaded === null) {
-      throw new AgentConversationNotFoundError();
-    }
-    bound = loaded.maxToolRounds;
   } else if (input.resumeHostExecutions !== undefined && input.resumeHostExecutions.length > 0) {
     // Phase 10.39: resume the PAUSED turn. Every submitted execution is
     // asserted executable + SEALED (once) before anything else runs. A
     // failure here throws and leaves every record unsealed. The executions
     // must share one conversation (matching an optional supplied id), whose
-    // persisted round bound becomes this turn's bound.
+    // persisted round bound becomes this turn's bound. This branch runs
+    // BEFORE the generic `conversationId` resume so the desktop driver's
+    // payload (which always includes `conversationId` alongside
+    // `resumeExecutions`) reaches the seal path.
     const resolved = await resolveHostExecutionsResume(
       userId,
       input.resumeHostExecutions,
@@ -485,6 +490,12 @@ export async function runPersistentTurn(
     // The executions' own conversation is authoritative for the resumed
     // turn — the caller need not repeat it (but may, and it must match).
     input.conversationId = resolved.conversationId;
+  } else if (input.conversationId !== undefined) {
+    const loaded = await loadAgentConversationState(userId, input.conversationId);
+    if (loaded === null) {
+      throw new AgentConversationNotFoundError();
+    }
+    bound = loaded.maxToolRounds;
   }
   const maxToolRounds = bound ?? options.maxToolRounds ?? 1;
 
@@ -606,8 +617,20 @@ export async function runPersistentTurn(
         },
       );
       const toolResult: AgentToolResult = executed.ok
-        ? { ok: true, callId: resumeRecord.id, data: executed.data }
-        : { ok: false, callId: resumeRecord.id, error: executed.error };
+        ? {
+            ok: true,
+            callId: resumeRecord.id,
+            toolName: resumeRecord.toolName,
+            toolInput: resumeRecord.arguments as Record<string, unknown>,
+            data: executed.data,
+          }
+        : {
+            ok: false,
+            callId: resumeRecord.id,
+            toolName: resumeRecord.toolName,
+            toolInput: resumeRecord.arguments as Record<string, unknown>,
+            error: executed.error,
+          };
       const approvedCall: AgentToolCall = {
         id: resumeRecord.id,
         toolName: resumeRecord.toolName,

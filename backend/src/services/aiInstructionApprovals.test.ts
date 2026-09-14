@@ -37,8 +37,10 @@ import { ToolRegistry } from "../tools/registry.js";
 import { ToolPermission } from "../tools/types.js";
 import { ToolErrorCode } from "../tools/errors.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
+import { hostDelegatedFilesystemExecutor } from "../tools/executor.js";
 import type { DirectoryListing } from "../tools/tauriShapes.js";
 import { readToolDefinitions } from "../tools/definitions/readTools.js";
+import { registerWriteTools } from "../tools/definitions/writeTools.js";
 import type { AgentToolCall } from "./agent.js";
 import type { AgentProvider, AgentProviderRequest, AgentResponse } from "./provider.js";
 import { approveAiToolApproval } from "./aiToolApprovals.js";
@@ -354,6 +356,53 @@ function makeGatedRegistry(): ToolRegistry {
     permission: ToolPermission.Read,
   });
   return registry;
+}
+
+/**
+ * A registry with the REAL approval-gated `move_file` write tool (and the
+ * ordinary read tools), used to exercise host-delegated approval CREATE.
+ */
+function makeMoveFileRegistry(): ToolRegistry {
+  const registry = new ToolRegistry();
+  registerWriteTools(registry);
+  return registry;
+}
+
+/**
+ * A `hostDelegatedFilesystemExecutor()` that records every method call while
+ * keeping the `kind: "host-delegated"` discriminator the invocation gate
+ * reads. Proves CREATE never touches the delegated executor.
+ */
+function makeSpiedDelegatedExecutor(): FilesystemExecutor & {
+  kind: "host-delegated";
+  calls: string[];
+} {
+  const base = hostDelegatedFilesystemExecutor();
+  const calls: string[] = [];
+  return {
+    kind: "host-delegated",
+    calls,
+    listDirectory(path: string) {
+      calls.push(`listDirectory:${path}`);
+      return base.listDirectory(path);
+    },
+    searchFiles(query: string) {
+      calls.push(`searchFiles:${query}`);
+      return base.searchFiles(query);
+    },
+    getFileMetadata(path: string) {
+      calls.push(`getFileMetadata:${path}`);
+      return base.getFileMetadata(path);
+    },
+    readFile(path: string) {
+      calls.push(`readFile:${path}`);
+      return base.readFile(path);
+    },
+    moveFile(source: string, destinationPath: string) {
+      calls.push(`moveFile:${source}->${destinationPath}`);
+      return base.moveFile(source, destinationPath);
+    },
+  };
 }
 
 /** The ungated baseline registry (regression coverage). */
@@ -764,5 +813,106 @@ describe("instruction flow — ownership is the authenticated user", () => {
     if (result.ok) return;
     expect(result.error.code).toBe(ToolErrorCode.ApprovalNotFound);
     expect(filesystem.calls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Host-delegated CREATE — a `move_file` approval is created WITHOUT touching
+//    the host-delegated executor (Phase 10.39 / audit regression).
+// ---------------------------------------------------------------------------
+
+describe("approval CREATE — host-delegated move_file returns approval_required without touching the executor", () => {
+  it("creates a pending move_file approval via schema-only validation and leaves the delegated executor untouched", async () => {
+    const filesystem = makeSpiedDelegatedExecutor();
+    const calls = filesystem.calls;
+    const registry = makeMoveFileRegistry();
+    const validArgs = {
+      sourcePath: "/home/receipt.pdf",
+      destinationPath: "/home/docs/receipt.pdf",
+    };
+
+    const result = await invokeTool(
+      sessionContext(ALICE),
+      "move_file",
+      validArgs,
+      makeInvokeOptions({
+        registry,
+        filesystem,
+        turnContext: { conversationId: CONVERSATION_ID, messageId: MESSAGE_ID },
+      }),
+    );
+
+    // The approval was created successfully — the model can surface the pending
+    // approval to the user instead of seeing an internal tool error.
+    expect(isToolApprovalRequiredResult(result)).toBe(true);
+    if (!isToolApprovalRequiredResult(result)) return;
+    expect(result.approval.toolName).toBe("move_file");
+    expect(result.approval.arguments).toEqual(validArgs);
+    expect(result.approval.expiresAt.getTime()).toBeGreaterThan(Date.now());
+
+    // Exactly ONE pending row was written, owned by the authenticated user and
+    // bound to the turn's conversation/message.
+    expect(approvalRepo.rows).toHaveLength(1);
+    expect(approvalRepo.rows[0]).toMatchObject({
+      id: result.approval.approvalId,
+      userId: USER_ID,
+      conversationId: CONVERSATION_ID,
+      messageId: MESSAGE_ID,
+      toolName: "move_file",
+      arguments: validArgs,
+      status: "pending",
+    });
+
+    // The delegated executor was never called during CREATE — all deep
+    // filesystem validation is deferred to execution time (the controlled
+    // executor / Rust / AllowList path on the desktop host).
+    expect(calls).toEqual([]);
+  });
+
+  it("works end-to-end through the instruction flow: the model's move_file intent surfaces a pending approval", async () => {
+    const filesystem = makeSpiedDelegatedExecutor();
+    const calls = filesystem.calls;
+    const registry = makeMoveFileRegistry();
+    const { generate } = scriptedProvider([
+      {
+        toolCalls: [
+          call("c1", "move_file", {
+            sourcePath: "/home/receipt.pdf",
+            destinationPath: "/home/docs/receipt.pdf",
+          }),
+        ],
+      },
+      { text: "Move pending." },
+    ]);
+    const runtime = makeInstructionRuntime(
+      makeRuntimeOptions({ generate }, { registry, filesystem }),
+    );
+
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Move my receipt into docs.",
+    });
+
+    // The turn surfaces exactly one pending move_file approval.
+    expect(response.turn.pendingApprovals).toHaveLength(1);
+    const surfaced = response.turn.pendingApprovals[0]!;
+    expect(surfaced.toolName).toBe("move_file");
+    expect(surfaced.arguments).toEqual({
+      sourcePath: "/home/receipt.pdf",
+      destinationPath: "/home/docs/receipt.pdf",
+    });
+
+    // One pending row persisted, bound to the authenticated user.
+    expect(approvalRepo.rows).toHaveLength(1);
+    expect(approvalRepo.rows[0]).toMatchObject({
+      toolName: "move_file",
+      userId: USER_ID,
+      status: "pending",
+    });
+
+    // Provider received the calibrated approval_required feedback.
+    expect(response.turn.toolResults).toEqual([{ callId: "c1", ok: false }]);
+
+    // Delegated executor untouched during the CREATE round.
+    expect(calls).toEqual([]);
   });
 });
