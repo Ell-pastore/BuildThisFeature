@@ -120,8 +120,65 @@ describe("FilePreview", () => {
     expect(readFileMock).toHaveBeenCalledWith("/Users/usr/Desktop/clip.mp4");
   });
 
+  it("renders an <audio controls> preview for a supported audio file", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([0, 0, 0, 18]));
+
+    renderPreview({ name: "song.mp3", type: "mp3", path: "/Users/usr/Desktop/song.mp3" });
+
+    const audio = await screen.findByTestId("preview-audio");
+    expect(audio).toHaveAttribute("src", "blob:mock-url");
+    expect(audio).toHaveAttribute("controls");
+    expect(readFileMock).toHaveBeenCalledWith("/Users/usr/Desktop/song.mp3");
+  });
+
+  it("decodes the already-read bytes into a <pre> preview for a text file", async () => {
+    readFileMock.mockResolvedValue(new TextEncoder().encode("hello from disk"));
+
+    renderPreview({ name: "notes.txt", type: "txt", path: "/Users/usr/Desktop/notes.txt" });
+
+    const pre = await screen.findByTestId("preview-text");
+    expect(pre.textContent).toBe("hello from disk");
+    expect(readFileMock).toHaveBeenCalledTimes(1);
+    expect(readFileMock).toHaveBeenCalledWith("/Users/usr/Desktop/notes.txt");
+    expect(createObjectURLMock).not.toHaveBeenCalled();
+  });
+
+  it("normalizes the REAL Tauri number[] byte payload for text decoding too", async () => {
+    readFileMock.mockResolvedValue(Array.from(new TextEncoder().encode("hi")));
+
+    renderPreview({ name: "notes.txt", type: "txt", path: "/Users/usr/Desktop/notes.txt" });
+
+    const pre = await screen.findByTestId("preview-text");
+    expect(pre.textContent).toBe("hi");
+    expect(createObjectURLMock).not.toHaveBeenCalled();
+  });
+
+  it("decodes JSON bytes into a <pre> preview without a second filesystem read", async () => {
+    readFileMock.mockResolvedValue(new TextEncoder().encode('{"a":1,"b":[2,3]}'));
+
+    renderPreview({ name: "data.json", type: "json", path: "/Users/usr/Desktop/data.json" });
+
+    const pre = await screen.findByTestId("preview-text");
+    expect(pre.textContent).toBe('{"a":1,"b":[2,3]}');
+    expect(readFileMock).toHaveBeenCalledTimes(1);
+    expect(createObjectURLMock).not.toHaveBeenCalled();
+  });
+
+  it("renders a PDF <iframe> preview from a blob object URL", async () => {
+    readFileMock.mockResolvedValue(new Uint8Array([37, 80, 68, 70, 45, 49]));
+
+    renderPreview({ name: "doc.pdf", type: "pdf", path: "/Users/usr/Desktop/doc.pdf" });
+
+    const iframe = await screen.findByTestId("preview-pdf");
+    expect(iframe).toHaveAttribute("src", "blob:mock-url");
+    expect(iframe).toHaveAttribute("title", "doc.pdf");
+    expect(readFileMock).toHaveBeenCalledTimes(1);
+    expect(readFileMock).toHaveBeenCalledWith("/Users/usr/Desktop/doc.pdf");
+    expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps unsupported types as an honest unavailable state and never reads them", () => {
-    renderPreview({ name: "report.pdf", type: "pdf", path: "/Users/usr/Desktop/report.pdf" });
+    renderPreview({ name: "archive.zip", type: "zip", path: "/Users/usr/Desktop/archive.zip" });
 
     expect(screen.getByText("Preview unavailable")).toBeInTheDocument();
     expect(readFileMock).not.toHaveBeenCalled();

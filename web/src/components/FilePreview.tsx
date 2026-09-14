@@ -19,8 +19,8 @@ interface FilePreviewProps {
   confirmDelete?: boolean;
 }
 
-/** MIME type for a previewable extension, or undefined when unsupported. */
-function previewMime(type: string): { kind: "image" | "video"; mime: string } | null {
+/** MIME type for a previewable extension, or null when unsupported. */
+function previewMime(type: string): { kind: "image" | "video" | "audio" | "pdf" | "text"; mime: string } | null {
   switch (type.toLowerCase()) {
     case "png": return { kind: "image", mime: "image/png" };
     case "jpg":
@@ -33,6 +33,19 @@ function previewMime(type: string): { kind: "image" | "video"; mime: string } | 
     case "webm": return { kind: "video", mime: "video/webm" };
     case "ogv": return { kind: "video", mime: "video/ogg" };
     case "mov": return { kind: "video", mime: "video/quicktime" };
+    case "mp3": return { kind: "audio", mime: "audio/mpeg" };
+    case "m4a": return { kind: "audio", mime: "audio/mp4" };
+    case "wav": return { kind: "audio", mime: "audio/wav" };
+    case "ogg":
+    case "oga": return { kind: "audio", mime: "audio/ogg" };
+    case "flac": return { kind: "audio", mime: "audio/flac" };
+    case "aac": return { kind: "audio", mime: "audio/aac" };
+    case "txt":
+    case "log": return { kind: "text", mime: "text/plain" };
+    case "md": return { kind: "text", mime: "text/markdown" };
+    case "csv": return { kind: "text", mime: "text/csv" };
+    case "json": return { kind: "text", mime: "application/json" };
+    case "pdf": return { kind: "pdf", mime: "application/pdf" };
     default: return null;
   }
 }
@@ -43,6 +56,7 @@ function previewMime(type: string): { kind: "image" | "video"; mime: string } | 
  */
 function usePreviewUrl(file: FileItem) {
   const [url, setUrl] = useState<string | null>(null);
+  const [text, setText] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -72,6 +86,10 @@ function usePreviewUrl(file: FileItem) {
       .then((bytes) => {
         if (cancelled) return;
         const bytesArray = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as unknown as ArrayLike<number>);
+        if (kind.kind === "text") {
+          setText(new TextDecoder().decode(bytesArray));
+          return;
+        }
         const blob = new Blob([bytesArray as unknown as BlobPart], { type: kind.mime });
         createdUrl = URL.createObjectURL(blob);
         setUrl(createdUrl);
@@ -90,11 +108,11 @@ function usePreviewUrl(file: FileItem) {
     };
   }, [file]);
 
-  return { url, loading, error, kind: previewMime(file.type) };
+  return { url, loading, error, text, kind: previewMime(file.type) };
 }
 
 function PreviewArea({ file }: { file: FileItem }) {
-  const { url, loading, error, kind } = usePreviewUrl(file);
+  const { url, loading, error, kind, text } = usePreviewUrl(file);
 
   if (kind === null) {
     return (
@@ -119,7 +137,7 @@ function PreviewArea({ file }: { file: FileItem }) {
     );
   }
 
-  if (error !== null || url === null) {
+  if (error !== null || (url === null && text === null)) {
     return (
       <div className="flex-1 bg-secondary rounded-xl flex items-center justify-center">
         <div className="text-center">
@@ -131,11 +149,13 @@ function PreviewArea({ file }: { file: FileItem }) {
     );
   }
 
+  const src = url ?? undefined;
+
   if (kind.kind === "image") {
     return (
       <div className="flex-1 bg-zinc-900 flex items-center justify-center rounded-xl overflow-hidden">
         <img
-          src={url}
+          src={src}
           alt={file.name}
           className="max-h-full max-w-full object-contain"
         />
@@ -143,9 +163,40 @@ function PreviewArea({ file }: { file: FileItem }) {
     );
   }
 
+  if (kind.kind === "audio") {
+    return (
+      <div className="flex-1 bg-zinc-950 flex items-center justify-center rounded-xl overflow-hidden p-6">
+        <audio src={src} controls data-testid="preview-audio" className="w-full max-w-md" />
+      </div>
+    );
+  }
+
+  if (kind.kind === "text") {
+    return (
+      <div className="flex-1 bg-card rounded-xl overflow-hidden">
+        <pre data-testid="preview-text" className="h-full w-full overflow-auto p-5 text-sm font-mono whitespace-pre-wrap break-words text-foreground">
+          {text}
+        </pre>
+      </div>
+    );
+  }
+
+  if (kind.kind === "pdf") {
+    return (
+      <div className="flex-1 rounded-xl overflow-hidden">
+        <iframe
+          src={src}
+          title={file.name}
+          data-testid="preview-pdf"
+          className="h-full w-full bg-white"
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="flex-1 bg-zinc-950 flex items-center justify-center rounded-xl overflow-hidden">
-      <video src={url} controls data-testid="preview-video" className="max-h-full max-w-full" />
+      <video src={src} controls data-testid="preview-video" className="max-h-full max-w-full" />
     </div>
   );
 }

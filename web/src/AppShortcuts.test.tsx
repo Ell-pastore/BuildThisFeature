@@ -71,7 +71,7 @@ function fileItem(name: string): FileItem {
   return {
     id: `/Users/usr/Desktop/${name}`,
     name,
-    type: "pdf",
+    type: "zip",
     size: "1.2 MB",
     sizeBytes: 1200000,
     createdTs: 1,
@@ -94,7 +94,7 @@ function listing(items: FileItem[]) {
 }
 
 function fileListing() {
-  return listing([fileItem("report.pdf")]);
+  return listing([fileItem("report.zip")]);
 }
 
 function navigateToFiles() {
@@ -118,7 +118,7 @@ describe("App keyboard shortcuts", () => {
     });
     providerMock.homeDirectory.mockResolvedValue("/Users/usr/Desktop");
     providerMock.listDirectory.mockResolvedValue(fileListing());
-    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.zip")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.storageByCategory.mockResolvedValue([]);
@@ -137,7 +137,7 @@ describe("App keyboard shortcuts", () => {
 
   it("⌘K focuses the existing Search input from any view", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "k", metaKey: true });
     await waitFor(() =>
       expect(document.activeElement).toBe(
@@ -148,23 +148,23 @@ describe("App keyboard shortcuts", () => {
 
   it("⌘N opens the existing New folder modal in the Files view", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     navigateToFiles();
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "n", metaKey: true });
     expect(await screen.findByText("New folder")).toBeInTheDocument();
   });
 
   it("Ctrl+N does nothing outside the Files view", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "n", ctrlKey: true });
     expect(screen.queryByRole("dialog", { name: "New folder" })).not.toBeInTheDocument();
   });
 
   it("⌘D opens the existing Duplicates view", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "d", metaKey: true });
     expect(
       await screen.findByRole("heading", { name: "Duplicate Detection" }),
@@ -173,7 +173,7 @@ describe("App keyboard shortcuts", () => {
 
   it("⌘⇧O opens the existing AI Organization view", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "o", metaKey: true, shiftKey: true });
     expect(
       await screen.findByRole("heading", { name: "AI Organization" }),
@@ -182,23 +182,23 @@ describe("App keyboard shortcuts", () => {
 
   it("Space opens the existing preview for the selected item", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     navigateToFiles();
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     fireEvent.keyDown(document, { key: " ", code: "Space" });
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
   });
 
   it("Space does nothing with no selection", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: " ", code: "Space" });
     expect(screen.queryByText("Preview unavailable")).not.toBeInTheDocument();
   });
 
   it("ignores shortcuts while typing in an editable field", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "k", metaKey: true });
     const input = screen.getByPlaceholderText("Search files, folders, or ask anything…");
     fireEvent.keyDown(input, { key: "d", metaKey: true });
@@ -209,7 +209,7 @@ describe("App keyboard shortcuts", () => {
 
   it("uses Cmd on macOS and ignores bare Ctrl there", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "d", ctrlKey: true });
     expect(
       screen.queryByRole("heading", { name: "Duplicate Detection" }),
@@ -218,7 +218,7 @@ describe("App keyboard shortcuts", () => {
 
   it("does nothing for unimplemented advertised shortcuts", async () => {
     render(<App />);
-    await screen.findByText("report.pdf");
+    await screen.findByText("report.zip");
     fireEvent.keyDown(document, { key: "z", metaKey: true });
     fireEvent.keyDown(document, { key: "u", metaKey: true });
     fireEvent.keyDown(document, { key: "o", metaKey: true });

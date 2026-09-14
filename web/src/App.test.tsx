@@ -66,7 +66,7 @@ function fileItem(name: string): FileItem {
   return {
     id: `/Users/usr/Desktop/${name}`,
     name,
-    type: "pdf",
+    type: "zip",
     size: "1.2 MB",
     sizeBytes: 1200000,
     modified: "Sep 1, 2026",
@@ -130,10 +130,10 @@ describe("App move preview synchronization", () => {
           path: "/Users/usr/Desktop/Documents",
           id: "/Users/usr/Desktop/Documents",
         },
-        fileItem("report.pdf"),
+        fileItem("report.zip"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.zip")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
@@ -148,7 +148,7 @@ describe("App move preview synchronization", () => {
   it("updates the open preview after a move so later actions target the new path", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
     const recentFetchedBefore = providerMock.recentFiles.mock.calls.length;
 
@@ -166,15 +166,15 @@ describe("App move preview synchronization", () => {
 
     await waitFor(() => {
       expect(providerMock.moveItem).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/report.pdf",
+        "/Users/usr/Desktop/report.zip",
         "/Users/usr/Desktop/Documents",
       );
     });
     expect(screen.getAllByText("/Users/usr/Desktop/Documents").length).toBeGreaterThan(0);
     await waitFor(() => {
       expect(starsHook.updateStarPath).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/report.pdf",
-        "/Users/usr/Desktop/Documents/report.pdf",
+        "/Users/usr/Desktop/report.zip",
+        "/Users/usr/Desktop/Documents/report.zip",
       );
     });
     await waitFor(() => {
@@ -184,7 +184,7 @@ describe("App move preview synchronization", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     await waitFor(() => {
       expect(providerMock.openItem).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/Documents/report.pdf",
+        "/Users/usr/Desktop/Documents/report.zip",
       );
     });
   });
@@ -193,17 +193,17 @@ describe("App move preview synchronization", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
     const recentFetchedBefore = providerMock.recentFiles.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
-      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     await waitFor(() => {
-      expect(starsHook.removeStarPath).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(starsHook.removeStarPath).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     await waitFor(() => {
       expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentFetchedBefore);
@@ -215,8 +215,8 @@ describe("App move preview synchronization", () => {
 
 describe("App rename preview synchronization", () => {
   beforeEach(() => {
-    providerMock.listDirectory.mockResolvedValue(listing([fileItem("report.pdf")]));
-    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
+    providerMock.listDirectory.mockResolvedValue(listing([fileItem("report.zip")]));
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.zip")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
@@ -231,28 +231,28 @@ describe("App rename preview synchronization", () => {
   it("updates the open preview after a successful rename so later actions target the new path", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
-    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
-      target: { value: "renamed.pdf" },
+    fireEvent.change(screen.getByDisplayValue("report.zip"), {
+      target: { value: "renamed.zip" },
     });
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     fireEvent.click(renameButtons[renameButtons.length - 1]);
 
     await waitFor(() => {
       expect(providerMock.renameItem).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/report.pdf",
-        "renamed.pdf",
+        "/Users/usr/Desktop/report.zip",
+        "renamed.zip",
       );
     });
-    expect((await screen.findAllByText("renamed.pdf")).length).toBeGreaterThan(0);
-    expect(screen.queryByDisplayValue("renamed.pdf")).not.toBeInTheDocument();
+    expect((await screen.findAllByText("renamed.zip")).length).toBeGreaterThan(0);
+    expect(screen.queryByDisplayValue("renamed.zip")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     await waitFor(() => {
-      expect(providerMock.openItem).toHaveBeenCalledWith("/Users/usr/Desktop/renamed.pdf");
+      expect(providerMock.openItem).toHaveBeenCalledWith("/Users/usr/Desktop/renamed.zip");
     });
   });
 
@@ -262,12 +262,12 @@ describe("App rename preview synchronization", () => {
     );
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
-    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
-      target: { value: "renamed.pdf" },
+    fireEvent.change(screen.getByDisplayValue("report.zip"), {
+      target: { value: "renamed.zip" },
     });
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     fireEvent.click(renameButtons[renameButtons.length - 1]);
@@ -275,32 +275,32 @@ describe("App rename preview synchronization", () => {
     expect(
       await screen.findByText("A file or folder with that name already exists."),
     ).toBeInTheDocument();
-    expect(screen.getByDisplayValue("renamed.pdf")).toBeInTheDocument();
-    expect(screen.getAllByText("report.pdf").length).toBeGreaterThan(0);
+    expect(screen.getByDisplayValue("renamed.zip")).toBeInTheDocument();
+    expect(screen.getAllByText("report.zip").length).toBeGreaterThan(0);
     expect(providerMock.openItem).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Files" }));
-    expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("report.zip")).length).toBeGreaterThan(0);
     expect(screen.queryByText("Couldn't load this folder")).not.toBeInTheDocument();
   });
 
   it("keeps a starred file starred after a rename by migrating the stored path", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
-    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
-      target: { value: "renamed.pdf" },
+    fireEvent.change(screen.getByDisplayValue("report.zip"), {
+      target: { value: "renamed.zip" },
     });
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     fireEvent.click(renameButtons[renameButtons.length - 1]);
 
     await waitFor(() => {
       expect(starsHook.updateStarPath).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/report.pdf",
-        "/Users/usr/Desktop/renamed.pdf",
+        "/Users/usr/Desktop/report.zip",
+        "/Users/usr/Desktop/renamed.zip",
       );
     });
   });
@@ -309,10 +309,10 @@ describe("App rename preview synchronization", () => {
     render(<App />);
     const fetchedBefore = providerMock.recentFiles.mock.calls.length;
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
-    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
-      target: { value: "renamed.pdf" },
+    fireEvent.change(screen.getByDisplayValue("report.zip"), {
+      target: { value: "renamed.zip" },
     });
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     fireEvent.click(renameButtons[renameButtons.length - 1]);
@@ -325,18 +325,18 @@ describe("App rename preview synchronization", () => {
 
 function trashedItem(): TrashItem {
   return {
-    id: "/Users/usr/.trash-smart-file-manager/report.pdf",
-    name: "report.pdf",
-    path: "/Users/usr/.trash-smart-file-manager/report.pdf",
+    id: "/Users/usr/.trash-smart-file-manager/report.zip",
+    name: "report.zip",
+    path: "/Users/usr/.trash-smart-file-manager/report.zip",
     isFolder: false,
     size: "1.2 MB",
     sizeBytes: 1200000,
-    fileType: "pdf",
+    fileType: "zip",
     created: "Aug 1, 2026",
     modified: "Sep 1, 2026",
     createdTs: 1,
     modifiedTs: 2,
-    originalPath: "/Users/usr/Desktop/report.pdf",
+    originalPath: "/Users/usr/Desktop/report.zip",
   };
 }
 
@@ -354,16 +354,16 @@ describe("App trash view synchronization", () => {
           path: "/Users/usr/Desktop/Documents",
           id: "/Users/usr/Desktop/Documents",
         },
-        fileItem("report.pdf"),
+        fileItem("report.zip"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.zip")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
     providerMock.trashItem.mockResolvedValue(undefined);
     providerMock.listTrash.mockResolvedValue([]);
-    providerMock.restoreItem.mockResolvedValue("/Users/usr/Desktop/report.pdf");
+    providerMock.restoreItem.mockResolvedValue("/Users/usr/Desktop/report.zip");
   });
 
   afterEach(() => {
@@ -375,7 +375,7 @@ describe("App trash view synchronization", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Trash" }));
@@ -386,7 +386,7 @@ describe("App trash view synchronization", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
-      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     // The Trash view itself re-reads the real trash without a manual Retry.
     await waitFor(() => {
@@ -406,12 +406,12 @@ describe("App trash view synchronization", () => {
 
     await waitFor(() => {
       expect(providerMock.restoreItem).toHaveBeenCalledWith(
-        "/Users/usr/.trash-smart-file-manager/report.pdf",
+        "/Users/usr/.trash-smart-file-manager/report.zip",
       );
     });
     // The Trash view re-reads the list after restore, no manual Retry needed.
     expect(providerMock.listTrash.mock.calls.length).toBe(2);
-    expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("report.zip")).length).toBeGreaterThan(0);
   });
 });
 
@@ -472,7 +472,7 @@ describe("App dead-directory recovery", () => {
       if (path === "/Users/usr/Desktop") {
         return Promise.resolve(
           pathListing("/Users/usr/Desktop", "/Users/usr", false, [
-            { ...fileItem("budget.pdf"), path: "/Users/usr/Desktop/budget.pdf", id: "/Users/usr/Desktop/budget.pdf" },
+            { ...fileItem("budget.zip"), path: "/Users/usr/Desktop/budget.zip", id: "/Users/usr/Desktop/budget.zip" },
           ]),
         );
       }
@@ -483,7 +483,7 @@ describe("App dead-directory recovery", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh folder" }));
 
-    expect(await screen.findByText("budget.pdf")).toBeInTheDocument();
+    expect(await screen.findByText("budget.zip")).toBeInTheDocument();
     expect(screen.queryByText("Couldn't load this folder")).not.toBeInTheDocument();
     // Breadcrumbs reflect the recovered parent path, not the dead folder.
     expect(screen.getByRole("button", { name: "Desktop" })).toBeInTheDocument();
@@ -560,15 +560,15 @@ describe("App derived-view refresh after mutations", () => {
           path: "/Users/usr/Desktop/Documents",
           id: "/Users/usr/Desktop/Documents",
         },
-        fileItem("report.pdf"),
+        fileItem("report.zip"),
       ]),
     );
-    providerMock.recentFiles.mockResolvedValue([fileItem("report.pdf")]);
+    providerMock.recentFiles.mockResolvedValue([fileItem("report.zip")]);
     providerMock.resolveStarredPaths.mockResolvedValue({ items: [], missing: [] });
     providerMock.diskUsage.mockResolvedValue({ totalBytes: 1000, freeBytes: 400 });
     providerMock.openItem.mockResolvedValue(undefined);
     providerMock.searchFiles.mockResolvedValue({ entries: [], truncated: false });
-    providerMock.duplicateItem.mockResolvedValue("/Users/usr/Desktop/report (copy).pdf");
+    providerMock.duplicateItem.mockResolvedValue("/Users/usr/Desktop/report (copy).zip");
     providerMock.copyItem.mockResolvedValue(undefined);
     providerMock.storageByCategory.mockResolvedValue({
       categories: [],
@@ -587,14 +587,14 @@ describe("App derived-view refresh after mutations", () => {
   it("re-reads Recent after duplicating a previewed file", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
     const recentBefore = providerMock.recentFiles.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
 
     await waitFor(() => {
-      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     await waitFor(() => {
       expect(providerMock.recentFiles.mock.calls.length).toBeGreaterThan(recentBefore);
@@ -624,7 +624,7 @@ describe("App derived-view refresh after mutations", () => {
   it("re-runs an open Search after a rename so results stay live", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     const searchBox = screen.getByPlaceholderText("Search files, folders, or ask anything…");
@@ -636,16 +636,16 @@ describe("App derived-view refresh after mutations", () => {
     const searchBefore = providerMock.searchFiles.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
-    fireEvent.change(screen.getByDisplayValue("report.pdf"), {
-      target: { value: "renamed.pdf" },
+    fireEvent.change(screen.getByDisplayValue("report.zip"), {
+      target: { value: "renamed.zip" },
     });
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     fireEvent.click(renameButtons[renameButtons.length - 1]);
 
     await waitFor(() => {
       expect(providerMock.renameItem).toHaveBeenCalledWith(
-        "/Users/usr/Desktop/report.pdf",
-        "renamed.pdf",
+        "/Users/usr/Desktop/report.zip",
+        "renamed.zip",
       );
     });
     // The already-open Search view re-queried the real filesystem.
@@ -659,7 +659,7 @@ describe("App derived-view refresh after mutations", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Storage" }));
@@ -671,7 +671,7 @@ describe("App derived-view refresh after mutations", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
-      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(providerMock.trashItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     await waitFor(() => {
       expect(providerMock.storageByCategory.mock.calls.length).toBeGreaterThan(storageBefore);
@@ -683,12 +683,12 @@ describe("App derived-view refresh after mutations", () => {
   it("does not rescan Storage when the Storage view is not open", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("report.pdf"));
+    fireEvent.click(await screen.findByText("report.zip"));
     expect(await screen.findByText("Preview unavailable")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
     await waitFor(() => {
-      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.pdf");
+      expect(providerMock.duplicateItem).toHaveBeenCalledWith("/Users/usr/Desktop/report.zip");
     });
     expect(providerMock.storageByCategory).not.toHaveBeenCalled();
   });
