@@ -15,11 +15,14 @@ import { useEffect, useState } from "react";
 
 export type DefaultView = "List" | "Grid";
 export type SortFilesBy = "Name" | "Modified" | "Size";
+export type AiQuality = "Low" | "Medium" | "High";
 
 export interface AppSettings {
   defaultView: DefaultView;
   sortFilesBy: SortFilesBy;
   confirmDelete: boolean;
+  /** How many tool rounds new AI conversations get: Low 3, Medium 5, High 8. */
+  aiQuality: AiQuality;
 }
 
 const STORAGE_KEY = "smartfile.settings";
@@ -28,6 +31,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultView: "List",
   sortFilesBy: "Modified",
   confirmDelete: true,
+  aiQuality: "Low",
 };
 
 function isDefaultView(v: unknown): v is DefaultView {
@@ -36,6 +40,10 @@ function isDefaultView(v: unknown): v is DefaultView {
 
 function isSortFilesBy(v: unknown): v is SortFilesBy {
   return v === "Name" || v === "Modified" || v === "Size";
+}
+
+function isAiQuality(v: unknown): v is AiQuality {
+  return v === "Low" || v === "Medium" || v === "High";
 }
 
 /** Read persisted settings, falling back to defaults on any corrupt value. */
@@ -57,6 +65,9 @@ export function readSettings(): AppSettings {
         typeof p.confirmDelete === "boolean"
           ? p.confirmDelete
           : DEFAULT_SETTINGS.confirmDelete,
+      aiQuality: isAiQuality(p.aiQuality)
+        ? p.aiQuality
+        : DEFAULT_SETTINGS.aiQuality,
     };
   } catch {
     return DEFAULT_SETTINGS;

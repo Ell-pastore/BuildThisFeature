@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Settings as SettingsIcon } from "../../components/Icons";
 import { API_BASE_URL, fetchHealth } from "../../services/api";
-import type { AppSettings, DefaultView, SortFilesBy } from "../../services/settings";
+import type { AiQuality, AppSettings, DefaultView, SortFilesBy } from "../../services/settings";
 
 type Section = "General" | "Appearance" | "Storage" | "AI" | "Privacy" | "Notifications" | "Keyboard Shortcuts";
 
@@ -191,6 +191,12 @@ export default function Settings({ settings, onChange }: SettingsProps) {
             )}
             {activeSection === "AI" && (
               <div>
+                <Select
+                  label="AI Quality"
+                  options={["Low", "Medium", "High"]}
+                  value={settings.aiQuality}
+                  onChange={(v) => onChange({ aiQuality: v as AiQuality })}
+                />
                 <Toggle label="Enable AI suggestions" disabled description="SmartFile analysis is not implemented yet." />
                 <Toggle label="Enable natural-language search" disabled description="Natural-language search is not implemented yet." />
                 <Toggle label="Enable automatic duplicate detection" disabled description="Duplicate detection is manual in the Duplicates view." />

@@ -161,7 +161,18 @@ type GeminiCandidateWire = {
 
 const SYSTEM_INSTRUCTION =
   "You are an assistant that helps the user manage files. You may " +
-  "call the provided tools when they help with the task.";
+  "call the provided tools when they help with the task.\n\n" +
+  "Before asking the user anything, use the information already " +
+  "present in this conversation — earlier instructions and the results " +
+  "of tools you have already run — to understand the request. Resolve " +
+  "references the user makes (such as files or folders named earlier, " +
+  "or common named locations like the user's home or Desktop) by " +
+  "discovering the actual paths with the provided tools — " +
+  "list_directory, search_files, or get_file_metadata — rather than " +
+  "assuming or guessing. Never invent paths, file names, or directory " +
+  "structures that were not returned by a tool. Only ask the user for " +
+  "clarification when a reference is genuinely ambiguous or cannot be " +
+  "safely discovered.";
 
 /** Generate the `:generateContent` REST path suffix for a model name. */
 function generateContentUrl(baseUrl: string, model: string): string {

@@ -35,6 +35,14 @@ export interface AppVariables {
      * executor. Never set directly from provider or untrusted request data.
      */
     desktopHost?: boolean;
+    /**
+     * Set by the AI routes from the `x-ai-quality` request header (Phase
+     * 10.40), after whitelist validation. Only the lowercase tier value
+     * (`low` | `medium` | `high`) is ever stored; absent/invalid values leave
+     * it unset so the per-request round-bound resolver fails closed. Never set
+     * directly from untrusted request data.
+     */
+    aiQuality?: "low" | "medium" | "high";
   };
 }
 

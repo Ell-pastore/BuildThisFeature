@@ -216,6 +216,21 @@ export interface PersistentTurnOptions extends InvokeToolOptions {
   resolveFilesystem?: (
     c: { get: (key: string) => unknown },
   ) => FilesystemExecutor | undefined;
+  /**
+   * Per-request tool-round bound resolution (Phase 10.40). When set, it is
+   * consulted for EACH turn with the authenticated request context (which
+   * carries the `aiQuality` header tier) and its return value — when not
+   * `undefined` — REPLACES `maxToolRounds` for that turn, BEFORE the
+   * `bound ?? options.maxToolRounds ?? 1` precedence in `runPersistentTurn`.
+   * A returned bound therefore applies only to NEW conversations: a resumed
+   * conversation still keeps its persisted bound. The production resolver
+   * maps the request's AI Quality tier (Low 3 / Medium 5 / High 8) and
+   * returns `undefined` on absent/invalid values so the default bound stays
+   * in effect. Absent for non-production callers — behavior is unchanged.
+   */
+  resolveMaxToolRounds?: (
+    c: { get: (key: string) => unknown },
+  ) => number | undefined;
 }
 
 export interface PersistentTurnResult {
@@ -963,7 +978,20 @@ export function createPersistentTurnRuntime(
       // recorded for the desktop instead of failing against the Tauri bridge
       // this Node process cannot reach.
       const filesystem = options.resolveFilesystem?.(c) ?? options.filesystem;
-      return runPersistentTurn(c, input, { ...options, stack, filesystem });
+
+      // Phase 10.40: consult the per-request tool-round-bound resolver (when
+      // present). A non-undefined return replaces the base `maxToolRounds`
+      // for THIS turn only, so NEW conversations are persisted with the
+      // user's chosen AI Quality bound (Low 3 / Medium 5 / High 8). Resumed
+      // conversations always keep their persisted bound, so the override
+      // cannot raise an existing conversation's bound.
+      const resolvedMaxToolRounds = options.resolveMaxToolRounds?.(c);
+      return runPersistentTurn(c, input, {
+        ...options,
+        stack,
+        filesystem,
+        ...(resolvedMaxToolRounds !== undefined ? { maxToolRounds: resolvedMaxToolRounds } : {}),
+      });
     },
   };
 }

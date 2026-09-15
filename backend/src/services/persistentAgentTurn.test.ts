@@ -44,7 +44,15 @@ import {
   createConversationState,
   finalizeConversation,
 } from "./conversation.js";
-import { runPersistentTurn, type PersistentTurnOptions, type HostExecutionSubmission } from "./persistentAgentTurn.js";
+import {
+  runPersistentTurn,
+  createPersistentTurnRuntime,
+  type PersistentTurnOptions,
+  type PersistentTurnStackOptions,
+  type HostExecutionSubmission,
+} from "./persistentAgentTurn.js";
+import { composeProviderStack, type ComposedProviderStack } from "./providerComposition.js";
+import { ProviderId } from "./providerSelection.js";
 import {
   HostExecutionStatus,
   type HostExecutionRecord,
@@ -924,5 +932,141 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
 
     // The first execution was sealed.
     expect(hostMocks.submitHostExecution).toHaveBeenCalledWith(USER_ID, record.id, expect.any(Date));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createPersistentTurnRuntime — per-request tool-round bound (Phase 10.40)
+// ---------------------------------------------------------------------------
+
+/** A scripted, credential-free composed stack (no env keys needed). */
+function makeComposedStack(generate: AgentProvider["generate"]): ComposedProviderStack {
+  return composeProviderStack({
+    chain: [ProviderId.Ollama],
+    settings: {
+      [ProviderId.Ollama]: {
+        model: "qwen3",
+        baseUrl: "http://localhost:11434/api",
+        timeoutMs: 5_000,
+      },
+    },
+    credentials: {},
+    adapterFactory: () => ({ generate }),
+  });
+}
+
+function makeTurnRuntimeOptions(
+  stack: ComposedProviderStack,
+  override?: {
+    maxToolRounds?: number;
+    resolveMaxToolRounds?: PersistentTurnStackOptions["resolveMaxToolRounds"];
+  },
+): PersistentTurnStackOptions {
+  return {
+    stack,
+    tools: readToolDefinitions,
+    registry: makeRegistry(),
+    filesystem: makeFilesystem(),
+    maxToolRounds: override?.maxToolRounds,
+    ...(override?.resolveMaxToolRounds !== undefined
+      ? { resolveMaxToolRounds: override.resolveMaxToolRounds }
+      : {}),
+  };
+}
+
+function turnContext(
+  user: unknown,
+  extras: Record<string, unknown> = {},
+): { get: (key: string) => unknown } {
+  return {
+    get: (key) =>
+      key === "user" ? user : key in extras ? extras[key] : undefined,
+  };
+}
+
+describe("createPersistentTurnRuntime — per-request tool-round bound (Phase 10.40)", () => {
+  beforeEach(() => {
+    resetPersistenceMocks();
+  });
+
+  it("overrides the base bound for a NEW conversation from the per-request resolver", async () => {
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("c1", "list_directory", { path: "/home" })] },
+      { text: "Everything listed." },
+    ]);
+    const runtime = createPersistentTurnRuntime(
+      makeTurnRuntimeOptions(makeComposedStack(generate), {
+        maxToolRounds: 3,
+        resolveMaxToolRounds: (c) => c.get("aiQuality") as number,
+      }),
+    );
+
+    const result = await runtime.run(
+      turnContext(ACTIVE_USER, { aiQuality: 8 }),
+      { instruction: "List my files." },
+    );
+
+    // The resolver's bound replaced the base 3 and was EAGERLY persisted.
+    expect(result.created).toBe(true);
+    expect(result.state.maxToolRounds).toBe(8);
+    expect(mocks.beginAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ maxToolRounds: 8 }),
+    );
+  });
+
+  it("never raises a resumed conversation's persisted bound, even when the resolver returns a higher bound", async () => {
+    let previous = createConversationState({ instruction: "First turn", maxToolRounds: 3 });
+    previous = finalizeConversation(previous, "First reply.");
+    mocks.loadAgentConversationState.mockResolvedValue(previous);
+    mocks.beginAgentTurn.mockResolvedValue({
+      conversationId: "conv-9",
+      created: false,
+      instructionMessageId: "inst-9",
+      messageId: "msg-r1",
+    });
+
+    const { generate } = scriptedProvider([
+      { toolCalls: [call("c1", "list_directory", { path: "/home" })] },
+      { text: "Done." },
+    ]);
+    const runtime = createPersistentTurnRuntime(
+      makeTurnRuntimeOptions(makeComposedStack(generate), {
+        maxToolRounds: 8,
+        resolveMaxToolRounds: (c) => c.get("aiQuality") as number,
+      }),
+    );
+
+    const result = await runtime.run(
+      turnContext(ACTIVE_USER, { aiQuality: 8 }),
+      { conversationId: "conv-9", instruction: "Second turn." },
+    );
+
+    // The persisted bound (3) wins over the resolver override (8), so an
+    // existing conversation's round bound is never raised mid-conversation.
+    expect(result.created).toBe(false);
+    expect(result.state.maxToolRounds).toBe(3);
+    expect(mocks.beginAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: "conv-9", maxToolRounds: 3 }),
+    );
+  });
+
+  it("leaves the base bound untouched when the resolver returns undefined", async () => {
+    const { generate } = scriptedProvider([{ text: "Done." }]);
+    const runtime = createPersistentTurnRuntime(
+      makeTurnRuntimeOptions(makeComposedStack(generate), {
+        maxToolRounds: 4,
+        resolveMaxToolRounds: () => undefined,
+      }),
+    );
+
+    const result = await runtime.run(
+      turnContext(ACTIVE_USER),
+      { instruction: "List my files." },
+    );
+
+    expect(result.state.maxToolRounds).toBe(4);
+    expect(mocks.persistAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ maxToolRounds: 4 }),
+    );
   });
 });

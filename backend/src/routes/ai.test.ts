@@ -505,6 +505,82 @@ describe("POST /api/ai/instructions — authenticated", () => {
     expect(body.turn.created).toBe(false);
   });
 
+  it("surfaces a whitelisted x-ai-quality header on the request context", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiInstruction.mockImplementationOnce(
+      async (c: { get: (key: string) => unknown }, raw: unknown) => {
+        // The route whitelists the tier and the production resolver consumes
+        // it (Low 3 / Medium 5 / High 8).
+        expect(c.get("aiQuality")).toBe("high");
+        const input = parseAiInstructionInput(raw);
+        return {
+          conversationId: "22222222-2222-2222-2222-222222222222",
+          turn: {
+            created: true,
+            instruction: input.instruction,
+            messages: [],
+            toolRounds: 0,
+            maxToolRounds: 8,
+            toolResults: [],
+            pendingApprovals: [],
+          },
+        };
+      },
+    );
+
+    const res = await makeApp().request("/api/ai/instructions", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(),
+        "content-type": "application/json",
+        "x-ai-quality": "high",
+      },
+      body: JSON.stringify({ instruction: "List my home directory." }),
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("leaves aiQuality unset for an unknown or absent x-ai-quality value", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiInstruction.mockImplementation(
+      async (c: { get: (key: string) => unknown }, raw: unknown) => {
+        expect(c.get("aiQuality")).toBeUndefined();
+        const input = parseAiInstructionInput(raw);
+        return {
+          conversationId: "22222222-2222-2222-2222-222222222222",
+          turn: {
+            created: true,
+            instruction: input.instruction,
+            messages: [],
+            toolRounds: 0,
+            maxToolRounds: 3,
+            toolResults: [],
+            pendingApprovals: [],
+          },
+        };
+      },
+    );
+
+    const unknown = await makeApp().request("/api/ai/instructions", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(),
+        "content-type": "application/json",
+        "x-ai-quality": "super",
+      },
+      body: JSON.stringify({ instruction: "List my home directory." }),
+    });
+    expect(unknown.status).toBe(200);
+
+    const absent = await makeApp().request("/api/ai/instructions", {
+      method: "POST",
+      headers: { ...authorizedHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "List my home directory." }),
+    });
+    expect(absent.status).toBe(200);
+  });
+
   it("rejects a body that tries to supply its own identity (400 common/bad-request)", async () => {
     mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
 

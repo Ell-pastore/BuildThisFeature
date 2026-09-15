@@ -30,6 +30,7 @@ import {
 import {
   bindProductionAiInstructionRuntime,
   composeProductionAiRuntime,
+  PRODUCTION_AI_MAX_TOOL_ROUNDS,
 } from "./productionAiRuntime.js";
 import { ProviderId } from "./providerSelection.js";
 import {
@@ -58,6 +59,31 @@ vi.mock("./providerComposition.js", async (importOriginal) => {
     composeDefaultProviderStack: compositionFailures.composeDefaultProviderStack,
   };
 });
+
+// ---------------------------------------------------------------------------
+// Repository seam for the phase 10.40 wire-through tests (the production
+// resolver is exercised through the REAL persistent-agent-turn pipeline).
+// ---------------------------------------------------------------------------
+
+const repoMocks = vi.hoisted(() => ({
+  loadAgentConversationState: vi.fn(),
+  loadAgentConversationMessages: vi.fn(),
+  persistAgentTurn: vi.fn(),
+  beginAgentTurn: vi.fn(),
+  appendAgentTurnRoundMessage: vi.fn(),
+  completeAgentTurn: vi.fn(),
+  cancelAgentTurn: vi.fn(),
+}));
+
+vi.mock("../database/repositories/agentConversations.js", () => ({
+  loadAgentConversationState: repoMocks.loadAgentConversationState,
+  loadAgentConversationMessages: repoMocks.loadAgentConversationMessages,
+  persistAgentTurn: repoMocks.persistAgentTurn,
+  beginAgentTurn: repoMocks.beginAgentTurn,
+  appendAgentTurnRoundMessage: repoMocks.appendAgentTurnRoundMessage,
+  completeAgentTurn: repoMocks.completeAgentTurn,
+  cancelAgentTurn: repoMocks.cancelAgentTurn,
+}));
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -228,5 +254,68 @@ describe("createApp startup binding (Phase 10.38)", () => {
 
     expect(app).toBeDefined();
     expect(typeof app.request).toBe("function");
+  });
+});
+
+describe("production runtime — per-request AI Quality bound (Phase 10.40)", () => {
+  beforeEach(() => {
+    bindAiInstructionRuntime(undefined);
+    bindAiInstructionFilesystem(undefined);
+    repoMocks.loadAgentConversationState.mockReset();
+    repoMocks.loadAgentConversationMessages.mockReset();
+    repoMocks.persistAgentTurn.mockReset().mockResolvedValue({ id: "conv-1", created: true });
+    repoMocks.beginAgentTurn.mockReset().mockResolvedValue({
+      conversationId: "conv-1",
+      created: true,
+      instructionMessageId: "inst-1",
+      messageId: "msg-r1",
+    });
+    repoMocks.appendAgentTurnRoundMessage.mockReset().mockResolvedValue({ messageId: "msg-r2" });
+    repoMocks.completeAgentTurn.mockReset().mockResolvedValue(undefined);
+    repoMocks.cancelAgentTurn.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("maps the request's AI Quality tier to the bound of a NEW conversation", async () => {
+    const generate = vi
+      .fn<AgentProvider["generate"]>()
+      .mockResolvedValueOnce({ text: "Everything listed." });
+    const runtime = composeProductionAiRuntime({
+      stack: makeStack(generate),
+      filesystem: makeFilesystem(),
+    });
+
+    const result = await runtime.run(
+      {
+        get: (key) =>
+          key === "aiQuality" ? "high" : key === "user" ? ACTIVE_USER : undefined,
+      },
+      { instruction: VALID_INSTRUCTION },
+    );
+
+    expect(result.state.maxToolRounds).toBe(8);
+    expect(repoMocks.persistAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ maxToolRounds: 8 }),
+    );
+  });
+
+  it("fails closed to the default bound when no tier is present on the request", async () => {
+    const generate = vi
+      .fn<AgentProvider["generate"]>()
+      .mockResolvedValueOnce({ text: "Everything listed." });
+    const runtime = composeProductionAiRuntime({
+      stack: makeStack(generate),
+      filesystem: makeFilesystem(),
+    });
+
+    const result = await runtime.run(sessionContext(ACTIVE_USER), {
+      instruction: VALID_INSTRUCTION,
+    });
+
+    expect(result.state.maxToolRounds).toBe(PRODUCTION_AI_MAX_TOOL_ROUNDS);
+    expect(repoMocks.persistAgentTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxToolRounds: PRODUCTION_AI_MAX_TOOL_ROUNDS,
+      }),
+    );
   });
 });

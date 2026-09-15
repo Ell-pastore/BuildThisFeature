@@ -71,6 +71,7 @@ import type { AppVariables } from "../core/auth.js";
 import { AppError } from "../core/errors.js";
 import { getAiRuntimeStatus } from "../services/aiStatus.js";
 import { runAiInstruction } from "../services/aiInstructions.js";
+import { isAiQuality } from "../services/aiQuality.js";
 import {
   archiveAiConversation,
   deleteAiConversation,
@@ -131,6 +132,16 @@ export const aiRoutes = new Hono<AppVariables>()
     // bridge this Node process cannot reach. Absence means "not the desktop
     // host", never something trusted — the resolver still fail-closes.
     c.set("desktopHost", c.req.header("x-desktop-host") === "1");
+
+    // Phase 10.40: the web/desktop host identifies its AI Quality preference
+    // (`x-ai-quality`) so the production per-request resolver can bound NEW
+    // conversations' tool rounds (Low 3 / Medium 5 / High 8). Whitelisted
+    // here and RE-validated by the resolver; an absent/invalid value is left
+    // unset so the runtime's fail-closed default bound always applies.
+    const aiQuality = c.req.header("x-ai-quality");
+    if (aiQuality !== undefined && isAiQuality(aiQuality)) {
+      c.set("aiQuality", aiQuality);
+    }
 
     let raw: unknown;
     try {

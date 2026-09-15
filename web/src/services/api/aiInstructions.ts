@@ -17,6 +17,7 @@
 import { apiRequest } from "./client";
 import { requireSessionToken } from "../session";
 import { isTauriEnv } from "../desktopEnv";
+import { readSettings } from "../settings";
 import type {
   AiHostExecutionSubmission,
   AiInstructionResponse,
@@ -54,6 +55,13 @@ export interface SubmitAiInstructionInput {
  * calls as host executions instead of failing against a Tauri bridge this
  * Node process cannot reach. Plain browsers never send it — the backend stays
  * fail-closed there.
+ *
+ * The user's AI Quality preference is sent as the `x-ai-quality` header so the
+ * backend can bound NEW conversations' tool rounds (Low 3 / Medium 5 / High
+ * 8). It is a preference for new conversations only: the backend still honors
+ * a resumed conversation's persisted bound, and validates/maps the value
+ * server-side (unknown values fail closed to its default). The header is
+ * always sent, so the backend never has to guess the current preference.
  */
 export async function submitAiInstruction(
   input: SubmitAiInstructionInput,
@@ -63,6 +71,9 @@ export async function submitAiInstruction(
     method: "POST",
     body: input,
     token,
-    ...(isTauriEnv() ? { headers: { "x-desktop-host": "1" } } : {}),
+    headers: {
+      "x-ai-quality": readSettings().aiQuality.toLowerCase(),
+      ...(isTauriEnv() ? { "x-desktop-host": "1" } : {}),
+    },
   });
 }

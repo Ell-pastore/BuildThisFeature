@@ -48,6 +48,7 @@ import {
   composeDefaultProviderStack,
   type ComposedProviderStack,
 } from "./providerComposition.js";
+import { aiQualityToToolRounds } from "./aiQuality.js";
 import {
   createPersistentTurnRuntime,
   type PersistentAgentTurnRuntime,
@@ -99,6 +100,17 @@ export interface ProductionAiRuntimeOptions {
   resolveFilesystem?: (
     c: { get: (key: string) => unknown },
   ) => FilesystemExecutor | undefined;
+  /**
+   * Per-request tool-round-bound resolution (Phase 10.40). Defaults to the
+   * production resolver: the request's AI Quality tier (surfaced on the Hono
+   * context as `aiQuality`, validated in the route) is mapped to its NEW-
+   * conversation tool-round bound (Low 3 / Medium 5 / High 8); absent or
+   * unknown values return `undefined` so the default `maxToolRounds` bound
+   * stays in effect (fail closed). Injectable for tests.
+   */
+  resolveMaxToolRounds?: (
+    c: { get: (key: string) => unknown },
+  ) => number | undefined;
 }
 
 /**
@@ -166,6 +178,20 @@ function productionResolveFilesystem(c: {
 }
 
 /**
+ * The production per-request tool-round-bound resolver (Phase 10.40): maps the
+ * request's AI Quality tier (`x-ai-quality`, surfaced on the Hono context by
+ * the route as `aiQuality`) to its NEW-conversation bound — Low 3 / Medium 5 /
+ * High 8. Unknown/missing values return `undefined`, so `maxToolRounds`
+ * (default `PRODUCTION_AI_MAX_TOOL_ROUNDS`) stays in effect — the bound is
+ * never client-authoritative and an unbounded loop is impossible.
+ */
+function productionResolveMaxToolRounds(c: {
+  get: (key: string) => unknown;
+}): number | undefined {
+  return aiQualityToToolRounds(c.get("aiQuality"));
+}
+
+/**
  * Assemble the production persistent agent-turn runtime (Phase 10.20) from the
  * configured provider stack, the registered tool surface, and the filesystem
  * executor.
@@ -190,6 +216,9 @@ export function composeProductionAiRuntime(
     registry,
     filesystem,
     resolveFilesystem: options.resolveFilesystem ?? productionResolveFilesystem,
+    resolveMaxToolRounds:
+      options.resolveMaxToolRounds ??
+      productionResolveMaxToolRounds,
     maxToolRounds: options.maxToolRounds ?? PRODUCTION_AI_MAX_TOOL_ROUNDS,
   });
 }

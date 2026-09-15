@@ -18,7 +18,7 @@ describe("Settings", () => {
   });
 
   it("shows the persisted values in the General controls", () => {
-    renderSettings({ defaultView: "Grid", sortFilesBy: "Size", confirmDelete: false });
+    renderSettings({ defaultView: "Grid", sortFilesBy: "Size", confirmDelete: false, aiQuality: "Medium" });
 
     const view = screen.getByLabelText("Default view") as HTMLSelectElement;
     const sort = screen.getByLabelText("Sort files by") as HTMLSelectElement;
@@ -39,6 +39,19 @@ describe("Settings", () => {
 
     fireEvent.click(screen.getByRole("switch", { name: /Confirm before deleting/ }));
     expect(onChange).toHaveBeenCalledWith({ confirmDelete: false });
+  });
+
+  it("lets the user choose an AI Quality preference in the AI section", () => {
+    const onChange = vi.fn();
+    renderSettings({ ...DEFAULT_SETTINGS, aiQuality: "Medium" }, onChange);
+    openSection("AI");
+
+    const quality = screen.getByLabelText("AI Quality") as HTMLSelectElement;
+    expect(quality.value).toBe("Medium");
+    expect(quality).not.toBeDisabled();
+
+    fireEvent.change(quality, { target: { value: "High" } });
+    expect(onChange).toHaveBeenCalledWith({ aiQuality: "High" });
   });
 
   it("keeps unsupported settings clearly non-functional instead of pretending", () => {

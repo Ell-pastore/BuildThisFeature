@@ -27,6 +27,7 @@ describe("aiInstructions api client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     desktopEnvMock.isTauriEnv.mockReturnValue(false);
+    localStorage.clear();
   });
 
   it("fails fast without an active session — no unauthenticated request is issued", async () => {
@@ -65,6 +66,7 @@ describe("aiInstructions api client", () => {
       method: "POST",
       body: { conversationId: "conv-1", instruction: "Move receipts." },
       token: "session-token",
+      headers: { "x-ai-quality": "low" },
     });
     expect(result).toEqual(response);
   });
@@ -90,6 +92,7 @@ describe("aiInstructions api client", () => {
       method: "POST",
       body: { instruction: "Tidy my downloads." },
       token: "session-token",
+      headers: { "x-ai-quality": "low" },
     });
   });
 
@@ -108,6 +111,36 @@ describe("aiInstructions api client", () => {
     ).rejects.toMatchObject({ status: 503, code: "ai/provider-unavailable" });
   });
 
+  it("attaches the persisted AI Quality preference as a header", async () => {
+    requireTokenMock.mockReturnValue("session-token");
+    apiRequestMock.mockResolvedValue({
+      conversationId: "conv-1",
+      turn: {
+        created: true,
+        instruction: "Tidy my downloads.",
+        messages: [],
+        toolRounds: 0,
+        maxToolRounds: 8,
+        toolResults: [],
+        pendingApprovals: [],
+      },
+    });
+
+    localStorage.setItem(
+      "smartfile.settings",
+      JSON.stringify({ aiQuality: "High" }),
+    );
+
+    await submitAiInstruction({ instruction: "Tidy my downloads." });
+
+    expect(apiRequestMock).toHaveBeenCalledWith("/api/ai/instructions", {
+      method: "POST",
+      body: { instruction: "Tidy my downloads." },
+      token: "session-token",
+      headers: { "x-ai-quality": "high" },
+    });
+  });
+
   it("sends the x-desktop-host header ONLY inside the Tauri desktop webview", async () => {
     requireTokenMock.mockReturnValue("session-token");
     apiRequestMock.mockResolvedValue({
@@ -124,16 +157,17 @@ describe("aiInstructions api client", () => {
       },
     });
 
-    // Plain browser: no header.
+    // Plain browser: no Tauri header; AI quality header always present.
     desktopEnvMock.isTauriEnv.mockReturnValue(false);
     await submitAiInstruction({ instruction: "List my files." });
     expect(apiRequestMock).toHaveBeenLastCalledWith("/api/ai/instructions", {
       method: "POST",
       body: { instruction: "List my files." },
       token: "session-token",
+      headers: { "x-ai-quality": "low" },
     });
 
-    // Tauri desktop webview: header present so the backend swaps the
+    // Tauri desktop webview: both headers present so the backend swaps the
     // host-delegated executor in for THIS request.
     desktopEnvMock.isTauriEnv.mockReturnValue(true);
     await submitAiInstruction({ instruction: "List my files." });
@@ -141,7 +175,7 @@ describe("aiInstructions api client", () => {
       method: "POST",
       body: { instruction: "List my files." },
       token: "session-token",
-      headers: { "x-desktop-host": "1" },
+      headers: { "x-ai-quality": "low", "x-desktop-host": "1" },
     });
   });
 
@@ -183,6 +217,7 @@ describe("aiInstructions api client", () => {
     expect(apiRequestMock).toHaveBeenCalledWith("/api/ai/instructions", {
       method: "POST",
       token: "session-token",
+      headers: { "x-ai-quality": "low" },
       body: {
         conversationId: "conv-1",
         instruction: "Continue after the requested operations have been executed.",

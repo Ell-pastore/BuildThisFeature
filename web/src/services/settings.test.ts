@@ -21,7 +21,12 @@ describe("settings persistence", () => {
 
     const stored = localStorage.getItem("smartfile.settings");
     expect(stored).toBe(
-      JSON.stringify({ defaultView: "Grid", sortFilesBy: "Size", confirmDelete: true }),
+      JSON.stringify({
+        defaultView: "Grid",
+        sortFilesBy: "Size",
+        confirmDelete: true,
+        aiQuality: "Low",
+      }),
     );
   });
 
@@ -36,6 +41,7 @@ describe("settings persistence", () => {
       defaultView: "Grid",
       sortFilesBy: "Name",
       confirmDelete: false,
+      aiQuality: "Low",
     });
 
     const { result, unmount } = renderHook(() => useSettings());
@@ -43,6 +49,7 @@ describe("settings persistence", () => {
       defaultView: "Grid",
       sortFilesBy: "Name",
       confirmDelete: false,
+      aiQuality: "Low",
     });
 
     // Unmounting and mounting again (view navigation remounts) keeps values.
@@ -52,6 +59,7 @@ describe("settings persistence", () => {
       defaultView: "Grid",
       sortFilesBy: "Name",
       confirmDelete: false,
+      aiQuality: "Low",
     });
   });
 
@@ -61,6 +69,22 @@ describe("settings persistence", () => {
 
     localStorage.setItem("smartfile.settings", JSON.stringify({ defaultView: "Bogus" }));
     expect(readSettings().defaultView).toBe("List");
+  });
+
+  it("reads a persisted AI Quality preference", () => {
+    localStorage.setItem(
+      "smartfile.settings",
+      JSON.stringify({ aiQuality: "High" }),
+    );
+    expect(readSettings().aiQuality).toBe("High");
+  });
+
+  it("falls back to the default AI Quality on an unknown stored value", () => {
+    localStorage.setItem(
+      "smartfile.settings",
+      JSON.stringify({ aiQuality: "Bogus" }),
+    );
+    expect(readSettings().aiQuality).toBe("Low");
   });
 });
 
@@ -98,10 +122,16 @@ describe("useSettings", () => {
     expect(result.current.settings.defaultView).toBe("Grid");
     expect(result.current.settings.sortFilesBy).toBe("Name");
 
+    act(() => {
+      result.current.updateSettings({ aiQuality: "High" });
+    });
+    expect(result.current.settings.aiQuality).toBe("High");
+
     expect(JSON.parse(localStorage.getItem("smartfile.settings") ?? "{}")).toEqual({
       defaultView: "Grid",
       sortFilesBy: "Name",
       confirmDelete: true,
+      aiQuality: "High",
     });
   });
 });
