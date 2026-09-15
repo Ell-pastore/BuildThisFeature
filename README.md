@@ -51,27 +51,244 @@ The AI **never** receives arbitrary shell or filesystem access. It operates excl
 ```
 BuildThisFeature/
 │
-├── README.md          ← you are here (project orientation)
+├── README.md          ← you are here (project orientation + local setup)
 ├── AGENTS.md          ← AI agent development guidance
-├── CLAUDE.md          ← tooling / environment notes
+├── CLAUDE.md          ← tooling / environment notes (@AGENTS.md)
+├── .mise.toml         ← pinned toolchain: Node 22 + pnpm 10.34.3
 │
-├── web/               ← React web application
-│
-├── desktop/           ← Tauri desktop application
+├── web/               ← React + Vite + Tailwind web app (own package.json + pnpm-lock.yaml)
 │   └── src/
-│       ├── lib.rs            ← Tauri command wrappers
-│       └── fs_service.rs     ← Rust filesystem service (security-sensitive)
+│       ├── App.tsx             ← primary application component
+│       ├── components/         ← UI views, dialogs, conversation components
+│       └── services/           ← backend API client, filesystem providers, session, settings
 │
-├── backend/           ← Hono / Node / TypeScript backend API
+├── desktop/           ← Tauri v2 desktop shell wrapping the web app (Rust + tauri.conf.json)
 │   └── src/
-│       ├── auth/            ← authentication, sessions
-│       ├── db/              ← Prisma schema, migrations
-│       └── routes/          ← API endpoints
+│       ├── lib.rs              ← Tauri command wrappers
+│       └── fs_service.rs       ← Rust filesystem service (security-sensitive AllowList)
 │
-└── mobile/           ← mobile application (mobile team owns this)
+└── backend/           ← Hono / Node / TypeScript API (own package.json + pnpm-lock.yaml)
+    ├── prisma/                 ← Prisma schema + migrations
+    └── src/
+        ├── app.ts / index.ts   ← app factory + server bootstrap
+        ├── config.ts           ← typed, env-driven configuration
+        ├── core/               ← auth middleware, single JSON error envelope
+        ├── routes/             ← one module per feature (auth, ai, health)
+        ├── services/           ← auth, AI providers/agent, conversations, approvals
+        ├── tools/              ← AI tool registry, policy, executors
+        └── database/           ← Prisma client + repositories (the ONLY layer that touches the DB)
 ```
 
-**Mobile collaborators** own `mobile/` and must not modify anything else without explicit approval.
+> **There is no root `package.json` or workspace.** `web/`, `backend/`, and `desktop/` are
+> three independent pnpm projects with their own dependencies and lockfiles. Install and run
+> them separately.
+
+**Mobile collaborators** own `mobile/` (a planned surface, not present in this repository yet)
+and must not modify anything else without explicit approval.
+
+---
+
+## Getting Started (Local Setup)
+
+This section is written for someone who has never seen the code. It lists **everything you need**
+and the **exact order** to run it, so the project actually starts.
+
+### 0. What runs where
+
+| Surface | Folder | Technology | Talks to |
+|---|---|---|---|
+| Web app | `web/` | React 19 + Vite + Tailwind CSS v4 | Backend API over HTTP; Tauri when run inside the desktop shell |
+| Backend API | `backend/` | Node 22 + Hono + Prisma 7 + PostgreSQL | PostgreSQL; AI providers over HTTPS |
+| Desktop app | `desktop/` | Tauri v2 (Rust) wrapping the web app | Local OS filesystem; backend API |
+
+The **backend is the piece everything else depends on**. Start it first.
+
+### 1. Prerequisites
+
+**Required to run the backend + web app:**
+
+| Requirement | Version | Why |
+|---|---|---|
+| Node.js | 22 (`.mise.toml`) | Runs the backend and the Vite dev server |
+| pnpm | 10.x (pinned `10.34.3`) | Package manager for all three projects |
+| PostgreSQL | 14+ | The backend's database (Prisma) |
+| One AI provider | — | The backend **refuses to start without one** (see step 4) |
+
+**Required only to run the desktop app:**
+
+| Requirement | Version | Why |
+|---|---|---|
+| Rust + Cargo | >= 1.77.2 (`desktop/Cargo.toml`) | Compiles the Tauri shell |
+| Tauri OS prerequisites | — | macOS: Xcode Command Line Tools · Linux: WebKitGTK/`libwebkit2gtk` · Windows: WebView2 |
+
+**Optional:**
+
+- [Ollama](https://ollama.com) installed locally — the only AI provider that needs **no API key**.
+
+**Install the pinned toolchain** (recommended). With [mise](https://mise.jdx.dev):
+
+```sh
+mise install          # installs Node 22 + pnpm 10.34.3 from .mise.toml
+```
+
+If you do not use mise, install Node 22 and pnpm manually and confirm `node -v` and `pnpm -v`.
+
+### 2. Backend (do this first)
+
+```sh
+cd backend
+pnpm install
+cp .env.example .env      # then edit .env — see the environment table below
+```
+
+Create the database, generate the Prisma client, and apply migrations:
+
+```sh
+createdb smart_file_manager        # or: psql -c 'CREATE DATABASE smart_file_manager;'
+pnpm db:generate                   # generates the Prisma client (REQUIRED, git-ignored)
+pnpm db:migrate                    # applies prisma/migrations/* to your database
+pnpm dev                           # tsx watch → http://127.0.0.1:4000
+```
+
+> **Important:** `pnpm db:generate` must run at least once **before** `pnpm dev`,
+> `pnpm typecheck`, or `pnpm build`. The generated Prisma client
+> (`backend/src/database/generated/`) is not committed to Git.
+
+**Verify it is up:**
+
+```sh
+curl http://127.0.0.1:4000/api/health
+```
+
+### 3. Web app
+
+```sh
+cd web
+pnpm install
+cp .env.example .env
+pnpm dev            # Vite → http://localhost:5173
+```
+
+`VITE_API_BASE_URL` in `web/.env` must point at the backend (default `http://127.0.0.1:4000`).
+
+> Local filesystem features (browsing real files, moving them, etc.) only work **inside the
+> desktop shell**. In a plain browser the app still runs, but the local filesystem provider is
+> unavailable.
+
+### 4. AI provider (required — the backend will not boot without one)
+
+At startup the backend composes its AI provider chain and **fails loudly** if the configured
+provider requires a credential and none is set. The default provider is **Grok**, so leaving
+`.env` untouched means the server will **not** start.
+
+**Easiest option — local Ollama, no API key:**
+
+```sh
+ollama pull qwen3            # pull any tool-capable model you have space for
+```
+
+```ini
+# backend/.env
+AI_PROVIDER=ollama
+OLLAMA_MODEL=qwen3
+```
+
+**Or a hosted provider** (put real keys **only** in `backend/.env` — never commit them):
+
+```ini
+# backend/.env
+AI_PROVIDER=grok
+GROK_API_KEY=your-key-here
+# GROK_MODEL defaults to grok-3
+```
+
+Other supported providers: `groq`, `gemini`, `openrouter` (each needs its key, and
+`openrouter` also needs `OPENROUTER_MODEL`). Use `AI_PROVIDER_FALLBACK` (comma-separated) to set
+the order tried on a rotation-eligible failure. See `backend/.env.example` for every variable.
+
+### 5. Desktop app (optional — not needed for the backend or web app)
+
+Install the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS first,
+then:
+
+```sh
+cd desktop
+pnpm install
+pnpm dev            # tauri dev: compiles Rust, starts the web dev server on :5174
+```
+
+The desktop shell loads the **same** `web/` app: `desktop/tauri.conf.json` points `frontendDist`
+at `../web/dist` and its dev URL at `http://localhost:5174`.
+
+### Ports
+
+| Port | Used by |
+|---|---|
+| `4000` | Backend API (`backend/.env` `PORT`) |
+| `5173` | Web dev server (standalone) |
+| `5174` | Web dev server when launched by Tauri (`desktop/tauri.conf.json`) |
+| `8443` | Figma Make preview server (this environment; already allow-listed in CORS) |
+| `11434` | Local Ollama API (only if you use Ollama) |
+
+### Environment variables
+
+**Backend** — copy `backend/.env.example` to `backend/.env`. Full annotated list lives there;
+the essentials are:
+
+| Variable | Default | Required | Purpose |
+|---|---|---|---|
+| `DATABASE_URL` | — | ✅ | PostgreSQL connection string (Prisma + runtime) |
+| `AI_PROVIDER` | `grok` | ✅* | Primary AI provider id (`grok`/`groq`/`gemini`/`openrouter`/`ollama`) |
+| `AI_PROVIDER_FALLBACK` | `AI_PROVIDER` | — | Comma-separated order tried on failure |
+| `GROK_API_KEY` | — | if Grok used | xAI credential |
+| `GROQ_API_KEY` | — | if Groq used | Groq credential |
+| `GEMINI_API_KEY` | — | if Gemini used | Google AI credential |
+| `OPENROUTER_API_KEY` | — | if OpenRouter used | OpenRouter credential |
+| `OPENROUTER_MODEL` | — | if OpenRouter used | Model slug (e.g. `anthropic/claude-sonnet-4`) |
+| `OLLAMA_MODEL` | — | if Ollama used | Local model name (e.g. `qwen3`) |
+| `PORT` | `4000` | — | HTTP port |
+| `HOST` | `127.0.0.1` | — | Bind address (loopback only by default) |
+| `CORS_ORIGINS` | local dev + Tauri origins | — | Comma-separated allowed browser origins |
+| `SESSION_TTL_HOURS` | `12` | — | Auth session lifetime |
+| `PROVIDER_COOLDOWN_MS` | `5000` | — | Cooldown after a provider credential fails |
+
+\* At least one usable provider must be configured, or startup fails.
+
+**Web** — copy `web/.env.example` to `web/.env`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VITE_API_BASE_URL` | `http://127.0.0.1:4000` | Backend API base URL |
+| `VITE_DEV_PORT` | `5173` | Vite dev-server port (Tauri overrides to `5174`) |
+
+> `VITE_*` values are embedded into the browser bundle at build time and are **public by nature**.
+> Never put secrets in `web/.env`.
+
+### Commands per project
+
+There is no root script runner — run these inside the relevant folder.
+
+| Command | `backend/` | `web/` | `desktop/` |
+|---|---|---|---|
+| `pnpm install` | ✅ | ✅ | ✅ |
+| `pnpm dev` | ✅ API on `:4000` | ✅ Vite on `:5173` | ✅ `tauri dev` |
+| `pnpm test` | ✅ Vitest | ✅ Vitest | — |
+| `pnpm typecheck` | ✅ `tsc --noEmit` | ✅ `tsc --noEmit` | `cargo check` |
+| `pnpm build` | ✅ `tsc` → `dist/` | ✅ `vite build` → `dist/` | ✅ `tauri build` |
+| `pnpm start` | ✅ `node dist/index.js` | — | — |
+| `pnpm format` | — | ✅ `oxfmt` | — |
+| Prisma | `pnpm db:generate` / `db:validate` / `db:migrate` / `db:studio` | — | — |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `DATABASE_URL is not configured` | Copy `backend/.env.example` to `backend/.env` and set `DATABASE_URL` |
+| Cannot find module `.../generated/prisma/client` | Run `pnpm db:generate` in `backend/` |
+| Backend exits with `provider-composition/missing-credentials` | Configure a provider (step 4) |
+| Web app cannot reach the backend | Ensure the backend runs on `http://127.0.0.1:4000`; if you use another port, add it to `CORS_ORIGINS` |
+| Prisma migrate cannot connect | Make sure PostgreSQL is running and `DATABASE_URL` is correct, then re-run `pnpm db:migrate` |
+| `tauri dev` / `tauri build` fails | Install Rust and the [Tauri OS prerequisites](https://v2.tauri.app/start/prerequisites/) |
 
 ---
 
