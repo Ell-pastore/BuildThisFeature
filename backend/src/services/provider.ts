@@ -63,6 +63,33 @@ export interface AgentProviderRequest {
    * context — the provider has no execution capability of its own.
    */
   toolResults?: AgentToolResult[];
+  /**
+   * Prior-conversation transcript (context continuity). An ordered list of
+   * the turns already completed on a RESUMED conversation: user
+   * instructions, assistant replies, and any assistant tool calls paired
+   * with their structured results. Omitted on fresh single-turn requests;
+   * when present, providers prepend it AFTER the system message and BEFORE
+   * the current `message`. Additive and provider-neutral.
+   */
+  history?: readonly AgentHistoryMessage[];
+}
+
+/**
+ * One prior turn of a resumed conversation, provider-agnostically. A user
+ * instruction carries `text`; an assistant tool round carries `toolCalls`
+ * (paired with the round's `toolResults`); an assistant reply carries
+ * `text`. Exactly what the bounded loop persists per message row, so it is
+ * reconstructible verbatim from stored conversation data.
+ */
+export interface AgentHistoryMessage {
+  /** The speaker of this prior turn. */
+  role: "user" | "assistant";
+  /** Text content: the user's instruction or an assistant reply. */
+  text?: string;
+  /** Tool-call intents from a prior assistant round (with `toolResults`). */
+  toolCalls?: readonly AgentToolCall[];
+  /** Structured results of the round's tool calls, in execution order. */
+  toolResults?: readonly AgentToolResult[];
 }
 
 /**
@@ -78,6 +105,20 @@ export interface AgentResponse {
    * routed by the agent layer — never executed by the provider.
    */
   toolCalls?: AgentToolCall[];
+}
+
+/**
+ * Serialize one structured tool result to the plain string the adapters
+ * embed in their wire messages. Locally executed failures carry a real
+ * `ToolError` (whose `message` is used); persisted history results may carry
+ * a restored plain error object, which is embedded as-is rather than lost.
+ */
+export function agentToolResultToContent(result: AgentToolResult): string {
+  if (result.ok) return JSON.stringify(result.data);
+  const error = result.error as { message?: string };
+  return JSON.stringify({
+    error: typeof error?.message === "string" && error.message.length > 0 ? error.message : result.error,
+  });
 }
 
 /**

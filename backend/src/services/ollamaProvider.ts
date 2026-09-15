@@ -79,6 +79,7 @@ import type {
   AgentResponse,
 } from "./provider.js";
 import {
+  agentToolResultToContent,
   ProviderError,
   ProviderErrorCode,
 } from "./provider.js";
@@ -246,12 +247,15 @@ function toOllamaTools(
 
 /**
  * Convert the request's messages into the Ollama message array in
- * conversation order. Prior tool results (from earlier loop rounds) are
- * threaded in Ollama's own format: one synthetic `assistant` message with
+ * conversation order. Prior conversation history is placed between the
+ * system message and the current user instruction, with each assistant tool
+ * round threaded in Ollama's own format: one `assistant` message with
  * `tool_calls` followed by one `tool` message per result. The original
- * function names are never reconstructed (the stateless loop only knows the
- * correlation `callId`), so the placeholder name "unknown" is used on both
- * sides — exactly as the Grok/OpenRouter adapters do for the same reason.
+ * function names are never reconstructed for current-turn results (the
+ * stateless loop only knows the correlation `callId`), so the placeholder
+ * name "unknown" is used on that side — exactly as the Grok/OpenRouter
+ * adapters do for the same reason. History entries carry the REAL registered
+ * tool names.
  */
 function toOllamaMessages(request: AgentProviderRequest): OllamaMessage[] {
   const messages: OllamaMessage[] = [
@@ -261,8 +265,37 @@ function toOllamaMessages(request: AgentProviderRequest): OllamaMessage[] {
         "You are an assistant that helps the user manage files. You may " +
         "call the provided tools when they help with the task.",
     },
-    { role: "user", content: request.message },
   ];
+
+  if (request.history !== undefined && request.history.length > 0) {
+    for (const entry of request.history) {
+      if (entry.role === "user") {
+        messages.push({ role: "user", content: entry.text ?? "" });
+        continue;
+      }
+      if (entry.toolCalls !== undefined && entry.toolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: entry.text ?? "",
+          tool_calls: entry.toolCalls.map((call, index) => ({
+            type: "function",
+            function: {
+              index,
+              name: call.toolName,
+              arguments: call.input ?? {},
+            },
+          })),
+        });
+        for (const result of entry.toolResults ?? []) {
+          messages.push({ role: "tool", content: agentToolResultToContent(result) });
+        }
+        continue;
+      }
+      messages.push({ role: "assistant", content: entry.text ?? "" });
+    }
+  }
+
+  messages.push({ role: "user", content: request.message });
 
   if (request.toolResults !== undefined && request.toolResults.length > 0) {
     messages.push({

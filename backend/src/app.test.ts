@@ -116,6 +116,7 @@ const mocks = vi.hoisted(() => ({
   updateSessionLastUsedAt: vi.fn(),
   databaseNow: vi.fn(),
   loadAgentConversationState: vi.fn(),
+  loadAgentConversationMessages: vi.fn(),
   persistAgentTurn: vi.fn(),
   beginAgentTurn: vi.fn(),
   appendAgentTurnRoundMessage: vi.fn(),
@@ -136,6 +137,7 @@ vi.mock("./database/client.js", () => ({
 
 vi.mock("./database/repositories/agentConversations.js", () => ({
   loadAgentConversationState: mocks.loadAgentConversationState,
+  loadAgentConversationMessages: mocks.loadAgentConversationMessages,
   persistAgentTurn: mocks.persistAgentTurn,
   beginAgentTurn: mocks.beginAgentTurn,
   appendAgentTurnRoundMessage: mocks.appendAgentTurnRoundMessage,

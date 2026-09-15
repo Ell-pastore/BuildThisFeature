@@ -55,6 +55,7 @@ import type {
   AgentResponse,
 } from "./provider.js";
 import {
+  agentToolResultToContent,
   ProviderError,
   ProviderErrorCode,
 } from "./provider.js";
@@ -110,9 +111,10 @@ export interface GeminiFetchResponse {
 // Gemini wire shapes (v1beta generateContent REST contract)
 // ---------------------------------------------------------------------------
 
-/** A single content message sent to the API. `role` allows "user" only here. */
+/** A single content message sent to the API. The model's prior turns are
+ *  `role: "model"`; user instructions and tool-result summaries are `user`. */
 type GeminiContentWire = {
-  role: "user";
+  role: "user" | "model";
   parts: GeminiPartWire[];
 };
 
@@ -225,15 +227,52 @@ function toGeminiTools(
 }
 
 /**
- * Convert the request into the `contents` array: the user message first, then
- * (from the second provider turn onward) any prior tool results as structured
- * user context. See the module doc for why results are embedded as text rather
+ * Convert the request into the `contents` array: prior conversation history
+ * first (as `user` / `model` content), then the user message, then (from the
+ * second provider turn onward) any prior tool results as structured user
+ * context. See the module doc for why results are embedded as text rather
  * than `functionResponse` parts.
  */
 function toGeminiContents(request: AgentProviderRequest): GeminiContentWire[] {
-  const contents: GeminiContentWire[] = [
-    { role: "user", parts: [{ text: request.message }] },
-  ];
+  const contents: GeminiContentWire[] = [];
+
+  if (request.history !== undefined && request.history.length > 0) {
+    for (const entry of request.history) {
+      if (entry.role === "user") {
+        contents.push({ role: "user", parts: [{ text: entry.text ?? "" }] });
+        continue;
+      }
+      if (entry.toolCalls !== undefined && entry.toolCalls.length > 0) {
+        const requested = entry.toolCalls
+          .map((call) => `- ${call.toolName}(${JSON.stringify(call.input ?? {})})`)
+          .join("\n");
+        const modelText = [entry.text, `Assistant tool calls from a previous turn:\n${requested}`]
+          .filter((part) => part !== undefined && part.length > 0)
+          .join("\n\n");
+        contents.push({ role: "model", parts: [{ text: modelText }] });
+        const results = entry.toolResults ?? [];
+        if (results.length > 0) {
+          const lines = results.map((result) => `- ${result.callId}: ${agentToolResultToContent(result)}`);
+          contents.push({
+            role: "user",
+            parts: [
+              {
+                text:
+                  "Tool results from the previous turn " +
+                  "(callId: data, or {error} on failure):\n" +
+                  lines.join("\n"),
+              },
+            ],
+          });
+        }
+        continue;
+      }
+      contents.push({ role: "model", parts: [{ text: entry.text ?? "" }] });
+    }
+  }
+
+  contents.push({ role: "user", parts: [{ text: request.message }] });
+
   if (request.toolResults !== undefined && request.toolResults.length > 0) {
     const lines = request.toolResults.map((result) => {
       const payload = result.ok

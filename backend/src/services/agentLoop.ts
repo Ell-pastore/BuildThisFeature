@@ -38,7 +38,7 @@
  *     same authenticated, policy-gated path a single turn uses.
  */
 import type { AgentToolCall, AgentToolResult } from "./agent.js";
-import type { AgentProviderRequest, AgentResponse } from "./provider.js";
+import type { AgentHistoryMessage, AgentProviderRequest, AgentResponse } from "./provider.js";
 import { routeAgentResponse } from "./provider.js";
 import type { OrchestratedTurnOptions } from "./orchestrator.js";
 import type { AgentTurnContext, HostExecutionRequestInfo } from "./tools.js";
@@ -121,6 +121,14 @@ export interface AgentLoopOptions extends OrchestratedTurnOptions {
    * first provider request. Defaults to zero.
    */
   initialToolRounds?: number;
+  /**
+   * Optional prior-conversation transcript (context continuity). Additive
+   * and optional: the loop attaches it to EVERY provider request so a
+   * resumed turn keeps the full conversation in context, alongside (not
+   * instead of) any current-turn `toolResults`. Omitted for fresh
+   * single-turn loops, which are unchanged.
+   */
+  initialHistory?: readonly AgentHistoryMessage[];
 }
 
 /** What one executed tool round looked like, for observers. */
@@ -213,6 +221,7 @@ export async function runAgentLoop(
     const request: AgentProviderRequest = {
       message: instruction,
       tools: options.tools,
+      ...(options.initialHistory !== undefined ? { history: options.initialHistory } : {}),
       ...(toolResults.length > 0 ? { toolResults } : {}),
     };
 

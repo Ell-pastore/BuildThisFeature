@@ -688,6 +688,32 @@ export async function loadAgentConversationState(
   return reconstructConversationState(conversation.maxToolRounds, stored);
 }
 
+/**
+ * Load a user-owned conversation's RAW persisted transcript rows
+ * (chronological `(created_at, id)` order), or `null` when the conversation
+ * does not exist for `userId` (ownership enforced — indistinguishable from
+ * missing). Unlike `loadAgentConversationState`, which replays the rows into
+ * the LAST turn's `ConversationState`, this returns EVERY stored row so a
+ * caller can reconstruct the FULL multi-turn conversation as prior model
+ * context.
+ */
+export async function loadAgentConversationMessages(
+  userId: string,
+  conversationId: string,
+): Promise<readonly StoredMessage[] | null> {
+  const db = getDatabase();
+  const conversation = await db.aiConversation.findFirst({
+    where: { id: conversationId, userId },
+    select: { id: true },
+  });
+  if (conversation === null) return null;
+  const stored = await db.aiMessage.findMany({
+    where: { conversationId },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  return stored.map(toStoredMessage);
+}
+
 // ---------------------------------------------------------------------------
 // List / read history (Phase 10.23)
 // ---------------------------------------------------------------------------

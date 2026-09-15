@@ -228,6 +228,7 @@ vi.mock("../database/repositories/aiToolApprovals.js", () => ({
 
 const conversationMocks = vi.hoisted(() => ({
   loadAgentConversationState: vi.fn(),
+  loadAgentConversationMessages: vi.fn(),
   persistAgentTurn: vi.fn(),
   beginAgentTurn: vi.fn(),
   appendAgentTurnRoundMessage: vi.fn(),
@@ -237,6 +238,7 @@ const conversationMocks = vi.hoisted(() => ({
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
   loadAgentConversationState: conversationMocks.loadAgentConversationState,
+  loadAgentConversationMessages: conversationMocks.loadAgentConversationMessages,
   persistAgentTurn: conversationMocks.persistAgentTurn,
   beginAgentTurn: conversationMocks.beginAgentTurn,
   appendAgentTurnRoundMessage: conversationMocks.appendAgentTurnRoundMessage,
@@ -470,6 +472,7 @@ beforeEach(() => {
   approvalRepo.reset();
   vi.clearAllMocks();
   conversationMocks.loadAgentConversationState.mockReset();
+  conversationMocks.loadAgentConversationMessages.mockReset();
   conversationMocks.persistAgentTurn
     .mockReset()
     .mockResolvedValue({ id: CONVERSATION_ID, created: true });

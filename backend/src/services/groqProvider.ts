@@ -44,6 +44,7 @@ import type {
   AgentResponse,
 } from "./provider.js";
 import {
+  agentToolResultToContent,
   ProviderError,
   ProviderErrorCode,
 } from "./provider.js";
@@ -204,8 +205,9 @@ function toGroqTools(tools: readonly ToolDefinition[]): GroqToolWire[] | undefin
 }
 
 /**
- * Convert the request's messages (system context, user prompt, and any prior
- * tool results) into the Groq message array in conversation order.
+ * Convert the request's messages (system context, prior conversation history,
+ * user prompt, and any prior tool results) into the Groq message array in
+ * conversation order.
  */
 function toGroqMessages(request: AgentProviderRequest): GroqMessage[] {
   const messages: GroqMessage[] = [
@@ -215,8 +217,41 @@ function toGroqMessages(request: AgentProviderRequest): GroqMessage[] {
         "You are an assistant that helps the user manage files. You may " +
         "call the provided tools when they help with the task.",
     },
-    { role: "user", content: request.message },
   ];
+
+  if (request.history !== undefined && request.history.length > 0) {
+    for (const entry of request.history) {
+      if (entry.role === "user") {
+        messages.push({ role: "user", content: entry.text ?? "" });
+        continue;
+      }
+      if (entry.toolCalls !== undefined && entry.toolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: entry.text ?? null,
+          tool_calls: entry.toolCalls.map((call) => ({
+            id: call.id,
+            type: "function",
+            function: {
+              name: call.toolName,
+              arguments: JSON.stringify(call.input ?? {}),
+            },
+          })),
+        });
+        for (const result of entry.toolResults ?? []) {
+          messages.push({
+            role: "tool",
+            tool_call_id: result.callId,
+            content: agentToolResultToContent(result),
+          });
+        }
+        continue;
+      }
+      messages.push({ role: "assistant", content: entry.text ?? null });
+    }
+  }
+
+  messages.push({ role: "user", content: request.message });
 
   if (request.toolResults !== undefined && request.toolResults.length > 0) {
     const asAssistant: GroqMessage = {

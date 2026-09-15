@@ -28,6 +28,7 @@ import {
   ProviderErrorCode,
 } from "./provider.js";
 import type {
+  AgentHistoryMessage,
   AgentProviderRequest,
   AgentResponse,
 } from "./provider.js";
@@ -264,6 +265,63 @@ describe("createGeminiProvider — request construction", () => {
     ).text;
     expect(resultText).toContain("- a: {\"items\":[]}");
     expect(resultText).toContain("- b: {\"error\":\"denied\"}");
+  });
+
+  it("buffers prior-conversation history between system and the current user message", async () => {
+    const { provider, calls } = makeProvider(candidateResponse([{ text: "Moving it now." }]));
+    const history: AgentHistoryMessage[] = [
+      { role: "user", text: "Find cross.jpg in Testing" },
+      {
+        role: "assistant" as const,
+        toolCalls: [
+          { id: "c1", toolName: "search_files", input: { query: "cross.jpg" } },
+        ],
+        toolResults: [
+          {
+            ok: true,
+            callId: "c1",
+            toolName: "search_files",
+            toolInput: { query: "cross.jpg" },
+            data: [{ path: "/Users/apple/Testing/cross.jpg" }],
+          },
+        ],
+      },
+      { role: "assistant" as const, text: "Found it." },
+    ];
+    await provider.generate({
+      ...baseRequest(),
+      message: "Move cross to desktop folder",
+      history,
+    });
+
+    const call = calls[0];
+    if (!call) return;
+    const body = expectGeminiBody(call.init);
+    const contents = body.contents as Array<{ role: string; parts?: Array<{ text?: string }> }>;
+    const roles = contents.map((c) => c.role);
+    // history user → model tool intent → results user → assistant final →
+    // current instruction. Gemini requires strict user/model alternation, so
+    // the tool round becomes model(calls)+user(results) and the assistant's
+    // final text a model turn.
+    expect(roles).toEqual(["user", "model", "user", "model", "user"]);
+    expect(contents[0]?.parts?.[0]?.text).toBe("Find cross.jpg in Testing");
+    expect(contents[1]?.parts?.[0]?.text).toContain("Assistant tool calls from a previous turn");
+    expect(contents[1]?.parts?.[0]?.text).toContain("search_files");
+    expect(contents[2]?.parts?.[0]?.text).toContain("Tool results from the previous turn");
+    expect(contents[3]?.parts?.[0]?.text).toBe("Found it.");
+    expect(contents[4]?.parts?.[0]?.text).toBe("Move cross to desktop folder");
+  });
+
+  it("omits prior history when the request carries no history", async () => {
+    const { provider, calls } = makeProvider(candidateResponse([{ text: "ok" }]));
+    await provider.generate(baseRequest());
+
+    const call = calls[0];
+    if (!call) return;
+    const body = expectGeminiBody(call.init);
+    const contents = body.contents as Array<Record<string, unknown>>;
+    expect(contents).toHaveLength(1);
+    expect(contents[0]?.role).toBe("user");
   });
 });
 

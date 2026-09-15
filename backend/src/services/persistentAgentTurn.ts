@@ -79,7 +79,7 @@
  *     access; it goes through the Phase 10.7 repository functions.
  */
 import { AppError } from "../core/errors.js";
-import type { AgentProvider } from "./provider.js";
+import type { AgentHistoryMessage, AgentProvider } from "./provider.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { ToolError, type ToolErrorCategory } from "../tools/errors.js";
 import type { FilesystemExecutor } from "../tools/executor.js";
@@ -126,9 +126,11 @@ import {
   beginAgentTurn,
   cancelAgentTurn,
   completeAgentTurn,
+  loadAgentConversationMessages,
   loadAgentConversationState,
   persistAgentTurn,
   type AgentTurnRecord,
+  type StoredMessage,
 } from "../database/repositories/agentConversations.js";
 
 // ---------------------------------------------------------------------------
@@ -270,6 +272,54 @@ function toTurnRecord(round: AgentLoopRound): AgentTurnRecord {
     toolCalls: round.toolCalls,
     toolResults: round.results,
   };
+}
+
+/**
+ * Reconstruct the provider-visible prior-conversation transcript from the
+ * RAW persisted rows, in stored order: a user instruction, an assistant tool
+ * round (text, tool calls, and the round's results), and an assistant final
+ * reply. System rows are non-transcript noise and are skipped. Returns an
+ * empty array when the conversation has no prior content.
+ */
+function toAgentHistory(messages: readonly StoredMessage[]): readonly AgentHistoryMessage[] {
+  const history: AgentHistoryMessage[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      history.push({ role: "user", text: message.content });
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    if (message.isFinal) {
+      history.push({ role: "assistant", text: message.content });
+      continue;
+    }
+    history.push({
+      role: "assistant",
+      ...(message.content.length > 0 ? { text: message.content } : {}),
+      ...(message.toolCalls !== undefined
+        ? { toolCalls: message.toolCalls as readonly AgentToolCall[] }
+        : {}),
+      ...(message.toolResults !== undefined
+        ? { toolResults: message.toolResults as readonly AgentToolResult[] }
+        : {}),
+    });
+  }
+  return history;
+}
+
+/**
+ * Load a user-owned conversation's raw transcript and shape it into prior
+ * model history. Returns `undefined` when the conversation is missing, has
+ * no prior messages, or the loader is unavailable — callers treat that as
+ * no history (fresh-turn behavior), never as an error.
+ */
+async function loadConversationHistory(
+  userId: string,
+  conversationId: string,
+): Promise<readonly AgentHistoryMessage[] | undefined> {
+  const stored = await loadAgentConversationMessages(userId, conversationId);
+  if (stored === null || stored === undefined || stored.length === 0) return undefined;
+  return toAgentHistory(stored);
 }
 
 /** The narrow pending-execution view a paused turn exposes to the caller (§6.9). */
@@ -449,6 +499,7 @@ export async function runPersistentTurn(
   let bound: number | undefined;
   let resumeRecord: ToolApprovalRecord | undefined;
   let hostResume: ResolvedHostResume | undefined;
+  let history: readonly AgentHistoryMessage[] | undefined;
   if (input.resumeApprovalId !== undefined) {
     const record = await getToolApproval(userId, input.resumeApprovalId);
     if (record === null) {
@@ -463,6 +514,7 @@ export async function runPersistentTurn(
       throw new ToolApprovalNotFoundError();
     }
     bound = resumedConversation.maxToolRounds;
+    history = await loadConversationHistory(userId, record.conversationId);
     resumeRecord = record;
   } else if (input.resumeHostExecutions !== undefined && input.resumeHostExecutions.length > 0) {
     // Phase 10.39: resume the PAUSED turn. Every submitted execution is
@@ -486,6 +538,7 @@ export async function runPersistentTurn(
       throw new AgentConversationNotFoundError();
     }
     bound = resumedConversation.maxToolRounds;
+    history = await loadConversationHistory(userId, resolved.conversationId);
     hostResume = resolved;
     // The executions' own conversation is authoritative for the resumed
     // turn — the caller need not repeat it (but may, and it must match).
@@ -496,6 +549,7 @@ export async function runPersistentTurn(
       throw new AgentConversationNotFoundError();
     }
     bound = loaded.maxToolRounds;
+    history = await loadConversationHistory(userId, input.conversationId);
   }
   const maxToolRounds = bound ?? options.maxToolRounds ?? 1;
 
@@ -674,6 +728,7 @@ export async function runPersistentTurn(
       filesystem: options.filesystem,
       ...(options.policy !== undefined ? { policy: options.policy } : {}),
       maxToolRounds,
+      ...(history !== undefined ? { initialHistory: history } : {}),
       ...(resumeSeeded !== undefined
         ? { initialToolResults: [resumeSeeded.toolResult], initialToolRounds: 1 }
         : {}),

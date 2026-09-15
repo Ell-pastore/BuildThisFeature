@@ -55,6 +55,7 @@ import {
 
 const mocks = vi.hoisted(() => ({
   loadAgentConversationState: vi.fn(),
+  loadAgentConversationMessages: vi.fn(),
   persistAgentTurn: vi.fn(),
   beginAgentTurn: vi.fn(),
   appendAgentTurnRoundMessage: vi.fn(),
@@ -64,6 +65,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
   loadAgentConversationState: mocks.loadAgentConversationState,
+  loadAgentConversationMessages: mocks.loadAgentConversationMessages,
   persistAgentTurn: mocks.persistAgentTurn,
   beginAgentTurn: mocks.beginAgentTurn,
   appendAgentTurnRoundMessage: mocks.appendAgentTurnRoundMessage,
@@ -84,6 +86,7 @@ vi.mock("../database/repositories/agentConversations.js", () => ({
  */
 function resetPersistenceMocks(): void {
   mocks.loadAgentConversationState.mockReset();
+  mocks.loadAgentConversationMessages.mockReset();
   mocks.persistAgentTurn.mockReset().mockResolvedValue({ id: "conv-stack", created: true });
   mocks.beginAgentTurn.mockReset().mockResolvedValue({
     conversationId: "conv-stack",

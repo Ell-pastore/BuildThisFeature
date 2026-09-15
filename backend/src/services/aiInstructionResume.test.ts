@@ -404,6 +404,7 @@ vi.mock("./aiHostExecutions.js", async (importOriginal) => {
 
 const conversationMocks = vi.hoisted(() => ({
   loadAgentConversationState: vi.fn(),
+  loadAgentConversationMessages: vi.fn(),
   persistAgentTurn: vi.fn(),
   beginAgentTurn: vi.fn(),
   appendAgentTurnRoundMessage: vi.fn(),
@@ -413,6 +414,7 @@ const conversationMocks = vi.hoisted(() => ({
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
   loadAgentConversationState: conversationMocks.loadAgentConversationState,
+  loadAgentConversationMessages: conversationMocks.loadAgentConversationMessages,
   persistAgentTurn: conversationMocks.persistAgentTurn,
   beginAgentTurn: conversationMocks.beginAgentTurn,
   appendAgentTurnRoundMessage: conversationMocks.appendAgentTurnRoundMessage,
@@ -602,6 +604,7 @@ beforeEach(() => {
   conversationMocks.loadAgentConversationState
     .mockReset()
     .mockResolvedValue(ownedConversationState());
+  conversationMocks.loadAgentConversationMessages.mockReset().mockResolvedValue([]);
   conversationMocks.persistAgentTurn
     .mockReset()
     .mockResolvedValue({ id: CONVERSATION_ID, created: true });
@@ -1154,5 +1157,107 @@ describe("instruction flow — approved host write (move_file) defers to the hos
     });
     expect(hostStore.rows[0]?.status).toBe("executed");
     expect(generate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Cross-turn context: loadAgentConversationMessages is called and its
+//    output reaches the provider as history
+// ---------------------------------------------------------------------------
+
+describe("instruction flow — cross-turn history", () => {
+  function storedMessages(): Array<{
+    role: string;
+    content: string;
+    toolCalls?: unknown;
+    toolResults?: unknown;
+    isFinal: boolean;
+    createdAt: Date;
+  }> {
+    const t = new Date("2026-01-01T00:00:00Z");
+    return [
+      { role: "user", content: "Find cross.jpg", isFinal: false, createdAt: t },
+      {
+        role: "assistant",
+        content: "",
+        isFinal: false,
+        createdAt: t,
+        toolCalls: [
+          { id: "t1", toolName: "search_files", input: { query: "cross.jpg" } },
+        ],
+        toolResults: [
+          {
+            ok: true,
+            callId: "t1",
+            toolName: "search_files",
+            toolInput: { query: "cross.jpg" },
+            data: [{ path: "/Users/apple/Testing/cross.jpg" }],
+          },
+        ],
+      },
+      { role: "assistant", content: "Found it.", isFinal: true, createdAt: t },
+    ];
+  }
+
+  it("loads and forwards the full conversation history to the provider as initialHistory", async () => {
+    conversationMocks.loadAgentConversationMessages.mockResolvedValue(storedMessages());
+
+    const { generate, requests } = scriptedProvider([{ text: "Moving it now." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }));
+
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Move cross to desktop folder",
+      conversationId: CONVERSATION_ID,
+    });
+
+    // The repository was asked for the conversation's full transcript.
+    expect(conversationMocks.loadAgentConversationMessages).toHaveBeenCalledWith(
+      USER_ID,
+      CONVERSATION_ID,
+    );
+
+    // The provider saw initialHistory on its first request.
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(requests[0]).toBeDefined();
+    if (!requests[0]) return;
+    expect(requests[0].message).toBe("Move cross to desktop folder");
+    expect(requests[0].history).toEqual([
+      { role: "user", text: "Find cross.jpg" },
+      {
+        role: "assistant",
+        toolCalls: [
+          { id: "t1", toolName: "search_files", input: { query: "cross.jpg" } },
+        ],
+        toolResults: [
+          {
+            ok: true,
+            callId: "t1",
+            toolName: "search_files",
+            toolInput: { query: "cross.jpg" },
+            data: [{ path: "/Users/apple/Testing/cross.jpg" }],
+          },
+        ],
+      },
+      { role: "assistant", text: "Found it." },
+    ]);
+
+    expect(response.conversationId).toBe(CONVERSATION_ID);
+    expect(response.turn.finalText).toBe("Moving it now.");
+  });
+
+  it("omits history when the conversation has no prior messages", async () => {
+    conversationMocks.loadAgentConversationMessages.mockResolvedValue([]);
+
+    const { generate, requests } = scriptedProvider([{ text: "Fresh." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }));
+
+    await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Start fresh",
+      conversationId: CONVERSATION_ID,
+    });
+
+    expect(requests[0]).toBeDefined();
+    if (!requests[0]) return;
+    expect(requests[0].history).toBeUndefined();
   });
 });

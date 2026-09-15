@@ -30,6 +30,7 @@ import {
   ProviderErrorCode,
 } from "./provider.js";
 import type {
+  AgentHistoryMessage,
   AgentProviderRequest,
   AgentResponse,
 } from "./provider.js";
@@ -291,6 +292,73 @@ describe("createOllamaProvider — request construction", () => {
     if (!call) return;
     const body = expectOllamaBody(call.init);
     expect(body.tools).toBeUndefined();
+  });
+
+  it("buffers prior-conversation history between system and the current user message", async () => {
+    const { provider, calls } = makeProvider({
+      message: { role: "assistant", content: "Moving it now." },
+    });
+    const history: AgentHistoryMessage[] = [
+      { role: "user", text: "Find cross.jpg in Testing" },
+      {
+        role: "assistant" as const,
+        toolCalls: [
+          { id: "c1", toolName: "search_files", input: { query: "cross.jpg" } },
+        ],
+        toolResults: [
+          {
+            ok: true,
+            callId: "c1",
+            toolName: "search_files",
+            toolInput: { query: "cross.jpg" },
+            data: [{ path: "/Users/apple/Testing/cross.jpg" }],
+          },
+        ],
+      },
+      { role: "assistant" as const, text: "Found it." },
+    ];
+    await provider.generate({
+      ...baseRequest(),
+      message: "Move cross to desktop folder",
+      history,
+    });
+
+    const call = calls[0];
+    if (!call) return;
+    const body = expectOllamaBody(call.init);
+    const messages = body.messages as Array<{
+      role: string;
+      content?: string;
+      tool_calls?: unknown;
+    }>;
+    const roles = messages.map((m) => m.role);
+    expect(roles).toEqual([
+      "system",
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "user",
+    ]);
+    expect(messages[1]?.content).toBe("Find cross.jpg in Testing");
+    expect(messages[2]).toMatchObject({ role: "assistant" });
+    expect(messages[3]).toMatchObject({ role: "tool" });
+    expect(messages[4]?.content).toBe("Found it.");
+    expect(messages[5]?.content).toBe("Move cross to desktop folder");
+  });
+
+  it("omits prior history when the request carries no history", async () => {
+    const { provider, calls } = makeProvider({
+      message: { role: "assistant", content: "ok" },
+    });
+    await provider.generate(baseRequest());
+
+    const call = calls[0];
+    if (!call) return;
+    const body = expectOllamaBody(call.init);
+    const messages = body.messages as Array<{ role: string }>;
+    const roles = messages.map((m) => m.role);
+    expect(roles).toEqual(["system", "user"]);
   });
 });
 

@@ -56,6 +56,7 @@ import type {
   AgentResponse,
 } from "./provider.js";
 import {
+  agentToolResultToContent,
   ProviderError,
   ProviderErrorCode,
 } from "./provider.js";
@@ -221,10 +222,11 @@ function toOpenRouterTools(
 }
 
 /**
- * Convert the request's messages (system context, user prompt, and any prior
- * tool results) into the OpenRouter message array in conversation order. Prior
- * results are threaded as the OpenAI `tool`-message shape (synthetic assistant
- * `tool_calls` + matching `tool` replies) so multi-turn tool loops stay valid.
+ * Convert the request's messages (system context, prior conversation history,
+ * user prompt, and any prior tool results) into the OpenRouter message array
+ * in conversation order. Prior results are threaded as the OpenAI `tool`-
+ * message shape (synthetic assistant `tool_calls` + matching `tool` replies)
+ * so multi-turn tool loops stay valid.
  */
 function toOpenRouterMessages(request: AgentProviderRequest): OpenRouterMessage[] {
   const messages: OpenRouterMessage[] = [
@@ -234,8 +236,41 @@ function toOpenRouterMessages(request: AgentProviderRequest): OpenRouterMessage[
         "You are an assistant that helps the user manage files. You may " +
         "call the provided tools when they help with the task.",
     },
-    { role: "user", content: request.message },
   ];
+
+  if (request.history !== undefined && request.history.length > 0) {
+    for (const entry of request.history) {
+      if (entry.role === "user") {
+        messages.push({ role: "user", content: entry.text ?? "" });
+        continue;
+      }
+      if (entry.toolCalls !== undefined && entry.toolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: entry.text ?? null,
+          tool_calls: entry.toolCalls.map((call) => ({
+            id: call.id,
+            type: "function",
+            function: {
+              name: call.toolName,
+              arguments: JSON.stringify(call.input ?? {}),
+            },
+          })),
+        });
+        for (const result of entry.toolResults ?? []) {
+          messages.push({
+            role: "tool",
+            tool_call_id: result.callId,
+            content: agentToolResultToContent(result),
+          });
+        }
+        continue;
+      }
+      messages.push({ role: "assistant", content: entry.text ?? null });
+    }
+  }
+
+  messages.push({ role: "user", content: request.message });
 
   if (request.toolResults !== undefined && request.toolResults.length > 0) {
     const asAssistant: OpenRouterMessage = {

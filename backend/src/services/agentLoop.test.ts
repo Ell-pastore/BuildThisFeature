@@ -123,7 +123,12 @@ function makeOptions(
   override?: Partial<
     Pick<
       AgentLoopOptions,
-      "registry" | "filesystem" | "maxToolRounds" | "initialToolResults" | "initialToolRounds"
+      | "registry"
+      | "filesystem"
+      | "maxToolRounds"
+      | "initialToolResults"
+      | "initialToolRounds"
+      | "initialHistory"
     >
   >,
 ): AgentLoopOptions {
@@ -138,6 +143,9 @@ function makeOptions(
       : {}),
     ...(override?.initialToolRounds !== undefined
       ? { initialToolRounds: override.initialToolRounds }
+      : {}),
+    ...(override?.initialHistory !== undefined
+      ? { initialHistory: override.initialHistory }
       : {}),
   };
 }
@@ -614,6 +622,67 @@ describe("runAgentLoop — seeded initial context (Phase 10.30)", () => {
         }),
       ),
     ).rejects.toThrow(TypeError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runAgentLoop — prior-conversation history
+// ---------------------------------------------------------------------------
+
+describe("runAgentLoop — prior-conversation history", () => {
+  it("serves initialHistory to the provider on the first request", async () => {
+    const { generate, requests } = scriptedProvider([{ text: "ok" }]);
+    const history = [
+      { role: "user" as const, text: "Find cross.jpg" },
+      { role: "assistant" as const, text: "Found it." },
+    ];
+
+    await runAgentLoop(
+      sessionContext(ACTIVE_USER),
+      "Move cross to desktop folder",
+      makeOptions(generate, { initialHistory: history }),
+    );
+
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(requests[0]).toBeDefined();
+    if (!requests[0]) return;
+    expect(requests[0].message).toBe("Move cross to desktop folder");
+    expect(requests[0].history).toEqual(history);
+  });
+
+  it("omits the history field entirely on a fresh turn", async () => {
+    const { generate, requests } = scriptedProvider([{ text: "ok" }]);
+
+    await runAgentLoop(sessionContext(ACTIVE_USER), "Fresh instruction", makeOptions(generate));
+
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(requests[0]).toBeDefined();
+    if (!requests[0]) return;
+    expect(requests[0].history).toBeUndefined();
+  });
+
+  it("keeps history present on later tool rounds after the current instruction", async () => {
+    const { generate, requests } = scriptedProvider([
+      { toolCalls: [call("r1", "list_directory", { path: "/home" })] },
+      { text: "done" },
+    ]);
+    const history = [
+      { role: "user" as const, text: "Find cross.jpg" },
+      { role: "assistant" as const, text: "Found it." },
+    ];
+
+    await runAgentLoop(
+      sessionContext(ACTIVE_USER),
+      "List and finish",
+      makeOptions(generate, { initialHistory: history }),
+    );
+
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(requests[1]).toBeDefined();
+    if (!requests[1]) return;
+    // History precedes the accumulated tool results on the second round too.
+    expect(requests[1].history).toEqual(history);
+    expect(requests[1].toolResults).toHaveLength(1);
   });
 });
 
