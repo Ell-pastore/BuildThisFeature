@@ -538,6 +538,11 @@ describe("Provider fallback — classification policy", () => {
         ProviderError.transient(ProviderErrorCode.Timeout, "x"),
       ),
     ).toBe("rotate-credential");
+    expect(
+      classifyProviderFailure(
+        ProviderError.transient(ProviderErrorCode.ContextLengthExceeded, "x"),
+      ),
+    ).toBe("rotate-credential");
   });
 
   it("stops for anything else", () => {

@@ -49,6 +49,12 @@ import {
   validateMoveFileInput,
   type MoveFileResult,
 } from "./moveFile.js";
+import {
+  copyFileHandler,
+  validateCopyFileInput,
+  type CopyFileResult,
+} from "./copyFile.js";
+import { planIntentHandler, type FileIntentPlan } from "./planIntent.js";
 
 /**
  * Map of tool name → handler. Typed as an object literal (not a Record)
@@ -70,6 +76,10 @@ export const handlers = Object.freeze({
   }>,
   move_file: ((input, ctx) =>
     runHandler(moveFileHandler, input, ctx)) as ToolHandler<MoveFileResult>,
+  copy_file: ((input, ctx) =>
+    runHandler(copyFileHandler, input, ctx)) as ToolHandler<CopyFileResult>,
+  plan_intent: ((input, ctx) =>
+    runHandler(planIntentHandler, input, ctx)) as ToolHandler<FileIntentPlan>,
 });
 
 /** Names of tools that have a registered handler. */
@@ -102,6 +112,7 @@ type ToolPreflight = (
 export const toolPreflights: Readonly<Record<string, ToolPreflight>> =
   Object.freeze({
     move_file: (input, filesystem) => validateMoveFileInput(input, filesystem),
+    copy_file: (input, filesystem) => validateCopyFileInput(input, filesystem),
   });
 
 /**

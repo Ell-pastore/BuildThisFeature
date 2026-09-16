@@ -89,6 +89,7 @@ export {
  */
 export const HOST_DELEGATED_APPROVED_WRITE_TOOLS: ReadonlySet<string> = new Set([
   "move_file",
+  "copy_file",
 ]);
 
 /** Thrown when a request cannot form a valid host execution. */

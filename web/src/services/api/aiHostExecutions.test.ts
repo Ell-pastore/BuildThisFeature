@@ -210,6 +210,60 @@ describe("host-execution driver (Phase 10.39)", () => {
     expect(submission.ok).toBe(false);
   });
 
+  it("executes an approved copy_file into the destination DIRECTORY and reports the kept source name", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    provider.copyItem.mockResolvedValue(undefined);
+
+    const submission = await buildHostExecutionSubmission(
+      execution({
+        toolName: "copy_file",
+        arguments: {
+          sourcePath: "/home/receipt.pdf",
+          destDirPath: "/home/docs",
+        },
+      }),
+    );
+
+    // The EXACT approved directory ran — the driver never appends a name; the
+    // host copy keeps the source's own name.
+    expect(provider.copyItem).toHaveBeenCalledWith("/home/receipt.pdf", "/home/docs");
+    expect(submission).toEqual({
+      executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      ok: true,
+      result: { copiedFrom: "/home/receipt.pdf", copiedTo: "/home/docs/receipt.pdf" },
+    });
+  });
+
+  it("submits a categorized failure when the approved copy_file cannot be executed", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    provider.copyItem.mockRejectedValue(new Error("destination exists"));
+
+    const submission = await buildHostExecutionSubmission(
+      execution({
+        toolName: "copy_file",
+        arguments: { sourcePath: "/home/receipt.pdf", destDirPath: "/home/docs" },
+      }),
+    );
+
+    expect(provider.copyItem).toHaveBeenCalledTimes(1);
+    expect(submission.ok).toBe(false);
+    expect(submission).toEqual({
+      executionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      ok: false,
+      error: { code: "tools/host-execution-failed", category: "tools" },
+    });
+  });
+
+  it("submits a failure for missing copy_file paths (nothing executed)", async () => {
+    desktopEnv.isTauriEnv.mockReturnValue(true);
+    const submission = await buildHostExecutionSubmission(
+      execution({ toolName: "copy_file", arguments: { sourcePath: "" } }),
+    );
+
+    expect(provider.copyItem).not.toHaveBeenCalled();
+    expect(submission.ok).toBe(false);
+  });
+
   it("submits a categorized failure when the local operation cannot be executed", async () => {
     desktopEnv.isTauriEnv.mockReturnValue(true);
     provider.listDirectory.mockRejectedValue(new Error("permission denied"));

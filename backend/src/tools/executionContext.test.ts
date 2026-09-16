@@ -107,6 +107,9 @@ function makeFilesystem(): FilesystemExecutor & {
     async moveFile() {
       calls.push("moveFile");
     },
+    async copyFile() {
+      calls.push("copyFile");
+    },
   };
   return fake;
 }

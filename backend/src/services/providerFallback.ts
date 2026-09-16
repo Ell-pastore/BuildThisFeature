@@ -65,7 +65,8 @@ export type ProviderFailureAction = "rotate-credential" | "stop";
  * safely attributable to the current credential or to provider unavailability
  * ever justify rotating; everything else stops the run immediately.
  *
- *   rotate-credential: Authentication, RateLimited, Unavailable, Timeout
+ *   rotate-credential: Authentication, RateLimited, Unavailable, Timeout,
+ *                     ContextLengthExceeded
  *   stop:              InvalidResponse, Internal, non-ProviderError, ...
  */
 export function classifyProviderFailure(error: unknown): ProviderFailureAction {
@@ -75,6 +76,10 @@ export function classifyProviderFailure(error: unknown): ProviderFailureAction {
       case ProviderErrorCode.RateLimited:
       case ProviderErrorCode.Unavailable:
       case ProviderErrorCode.Timeout:
+      // Chapter 10.12: a request that outgrew THIS provider's context window is
+      // the same class as a rate limit — rotate so a provider with a larger
+      // context (e.g. Gemini) can still answer instead of failing the turn.
+      case ProviderErrorCode.ContextLengthExceeded:
         return "rotate-credential";
       default:
         return "stop";

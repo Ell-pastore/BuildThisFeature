@@ -326,6 +326,9 @@ function makeFilesystem(): FilesystemExecutor & { calls: string[] } {
     async moveFile() {
       throw new Error("not used in this test");
     },
+    async copyFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 
@@ -403,6 +406,10 @@ function makeSpiedDelegatedExecutor(): FilesystemExecutor & {
     moveFile(source: string, destinationPath: string) {
       calls.push(`moveFile:${source}->${destinationPath}`);
       return base.moveFile(source, destinationPath);
+    },
+    copyFile(source: string, destDirPath: string) {
+      calls.push(`copyFile:${source}->${destDirPath}`);
+      return base.copyFile(source, destDirPath);
     },
   };
 }

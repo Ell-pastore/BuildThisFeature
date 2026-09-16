@@ -410,6 +410,7 @@ const conversationMocks = vi.hoisted(() => ({
   appendAgentTurnRoundMessage: vi.fn(),
   completeAgentTurn: vi.fn(),
   cancelAgentTurn: vi.fn(),
+  attachAgentMessageToolResult: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
@@ -420,6 +421,7 @@ vi.mock("../database/repositories/agentConversations.js", () => ({
   appendAgentTurnRoundMessage: conversationMocks.appendAgentTurnRoundMessage,
   completeAgentTurn: conversationMocks.completeAgentTurn,
   cancelAgentTurn: conversationMocks.cancelAgentTurn,
+  attachAgentMessageToolResult: conversationMocks.attachAgentMessageToolResult,
   AgentConversationNotFoundError: class AgentConversationNotFoundError extends Error {
     constructor() {
       super("Agent conversation not found for this user.");
@@ -510,6 +512,9 @@ function makeFilesystem(): FilesystemExecutor & { calls: string[] } {
       throw new Error("not used in this test");
     },
     async moveFile() {
+      throw new Error("not used in this test");
+    },
+    async copyFile() {
       throw new Error("not used in this test");
     },
   };
@@ -619,6 +624,7 @@ beforeEach(() => {
   });
   conversationMocks.completeAgentTurn.mockReset().mockResolvedValue(undefined);
   conversationMocks.cancelAgentTurn.mockReset().mockResolvedValue(undefined);
+  conversationMocks.attachAgentMessageToolResult.mockReset().mockResolvedValue(undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -991,6 +997,9 @@ describe("instruction flow — approved host write (move_file) defers to the hos
     );
     expect(conversationMocks.completeAgentTurn).not.toHaveBeenCalled();
     expect(conversationMocks.cancelAgentTurn).not.toHaveBeenCalled();
+    // The result is NOT attached at pause time — persistence happens on the
+    // host-execution RESUME, after the execution seals.
+    expect(conversationMocks.attachAgentMessageToolResult).not.toHaveBeenCalled();
     // The approval is NOT consumed at defer time — it stays decidable until
     // the execution actually SEALS on the host-execution resume.
     expect(approvalRepo.rows[0]?.status).toBe("approved");
@@ -1035,6 +1044,20 @@ describe("instruction flow — approved host write (move_file) defers to the hos
         data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
       },
     ]);
+    // The completed result was PERSISTED onto the deferred round's message
+    // (Phase A): a later turn reconstructs the actual result, not a bare call.
+    expect(conversationMocks.attachAgentMessageToolResult).toHaveBeenCalledWith({
+      userId: USER_ID,
+      conversationId: CONVERSATION_ID,
+      messageId: MESSAGE_ID,
+      toolResult: {
+        ok: true,
+        callId: approvalId,
+        toolName: "move_file",
+        toolInput: MOVED_ARGS,
+        data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+      },
+    });
     expect(response.turn.finalText).toBe("Moved.");
     expect(response.turn.pendingExecutions).toEqual([]);
     // The approval was consumed ONLY AFTER successful sealing.
@@ -1089,6 +1112,19 @@ describe("instruction flow — approved host write (move_file) defers to the hos
         data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
       },
     ]);
+    // The desktop-driver payload persists the completed result too (Phase A).
+    expect(conversationMocks.attachAgentMessageToolResult).toHaveBeenCalledWith({
+      userId: USER_ID,
+      conversationId: CONVERSATION_ID,
+      messageId: MESSAGE_ID,
+      toolResult: {
+        ok: true,
+        callId: approvalId,
+        toolName: "move_file",
+        toolInput: MOVED_ARGS,
+        data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+      },
+    });
 
     // The turn produced the expected final result.
     expect(response.conversationId).toBe(CONVERSATION_ID);
@@ -1157,6 +1193,83 @@ describe("instruction flow — approved host write (move_file) defers to the hos
     });
     expect(hostStore.rows[0]?.status).toBe("executed");
     expect(generate).toHaveBeenCalledTimes(1);
+    // Persisted EXACTLY once — the rejected re-submission never re-attaches.
+    expect(conversationMocks.attachAgentMessageToolResult).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes the persisted host-execution result part of a LATER turn's history (not a bare tool-call)", async () => {
+    const approvalId = await seedApprovedMoveFileApproval();
+    const filesystem = makeFilesystem();
+    const { generate, requests } = scriptedProvider([{ text: "Moved." }, { text: "Done." }]);
+    const runtime = makeInstructionRuntime(makeRuntimeOptions({ generate }, { filesystem }));
+
+    // 1. The approved move pauses; the host executes it; the resume persists
+    //    the completed result onto the deferred round's message (Phase A).
+    const paused = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after approval.",
+      approvalId,
+    });
+    const executionId = paused.turn.pendingExecutions[0]!.executionId;
+    await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Continue after the requested operations have been executed.",
+      resumeExecutions: [
+        {
+          executionId,
+          ok: true,
+          result: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+        },
+      ],
+    });
+    expect(conversationMocks.attachAgentMessageToolResult).toHaveBeenCalledTimes(1);
+
+    // 2. A LATER turn loads the conversation transcript — the deferred round
+    //    now carries its persisted actual result.
+    const t = new Date("2026-01-01T00:00:00Z");
+    conversationMocks.loadAgentConversationMessages.mockResolvedValue([
+      { role: "user", content: "Continue after approval.", isFinal: false, createdAt: t },
+      {
+        role: "assistant",
+        content: "",
+        isFinal: false,
+        createdAt: new Date(t.getTime() + 1000),
+        toolCalls: [{ id: approvalId, toolName: "move_file", input: MOVED_ARGS }],
+        toolResults: [
+          {
+            ok: true,
+            callId: approvalId,
+            toolName: "move_file",
+            toolInput: MOVED_ARGS,
+            data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+          },
+        ],
+      },
+    ]);
+
+    const response = await runAiInstructionWithRuntime(runtime, sessionContext(ALICE), {
+      instruction: "Update the user.",
+      conversationId: CONVERSATION_ID,
+    });
+
+    // The provider reconstructed the ACTUAL completed result for the deferred
+    // round — exactly the same history shape `toAgentHistory` serves from the
+    // stored `tool_results` — instead of a bare tool-call intent.
+    expect(requests[1]?.history).toEqual([
+      { role: "user", text: "Continue after approval." },
+      {
+        role: "assistant",
+        toolCalls: [{ id: approvalId, toolName: "move_file", input: MOVED_ARGS }],
+        toolResults: [
+          {
+            ok: true,
+            callId: approvalId,
+            toolName: "move_file",
+            toolInput: MOVED_ARGS,
+            data: { movedFrom: MOVED_ARGS.sourcePath, movedTo: MOVED_ARGS.destinationPath },
+          },
+        ],
+      },
+    ]);
+    expect(response.turn.finalText).toBe("Done.");
   });
 });
 

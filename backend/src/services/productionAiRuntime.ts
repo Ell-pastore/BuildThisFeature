@@ -54,13 +54,18 @@ import {
   type PersistentAgentTurnRuntime,
 } from "./persistentAgentTurn.js";
 import { bindAiInstructionRuntime } from "./aiInstructions.js";
+import { bindAiIntentPlanner } from "./aiIntentPlans.js";
+import {
+  bindAiPlanExecutionRuntime,
+  createPlanExecutionRuntime,
+} from "./aiPlanExecutions.js";
 
 /**
  * The loop bound applied to NEW conversations created through the production
  * runtime. Kept identical to the existing lazy-default cap so the
  * conversation-round semantics are unchanged.
  */
-export const PRODUCTION_AI_MAX_TOOL_ROUNDS = 3;
+export const PRODUCTION_AI_MAX_TOOL_ROUNDS = 5;
 
 /**
  * Injectable construction inputs for the production runtime. Every field is
@@ -210,6 +215,24 @@ export function composeProductionAiRuntime(
   const filesystem =
     options.filesystem ??
     tauriFilesystemExecutor(invoke ?? unavailableTauriInvoke());
+  // Bind the plan boundary to the SAME composed provider so fallback /
+  // rotation / cooldown state is shared with the instruction runtime.
+  bindAiIntentPlanner(stack.provider);
+  // Bind the plan EXECUTION runtime to the same registry, tools, filesystem,
+  // and per-request resolvers as the instruction runtime. Its provider is
+  // deterministic and per-request, so no stack is bound here.
+  bindAiPlanExecutionRuntime(
+    createPlanExecutionRuntime({
+      tools,
+      registry,
+      filesystem,
+      resolveFilesystem: options.resolveFilesystem ?? productionResolveFilesystem,
+      resolveMaxToolRounds:
+        options.resolveMaxToolRounds ??
+        productionResolveMaxToolRounds,
+      maxToolRounds: options.maxToolRounds ?? PRODUCTION_AI_MAX_TOOL_ROUNDS,
+    }),
+  );
   return createPersistentTurnRuntime({
     stack,
     tools,

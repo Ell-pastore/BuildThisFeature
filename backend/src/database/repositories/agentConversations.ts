@@ -599,6 +599,71 @@ export async function completeAgentTurn(
   });
 }
 
+export interface AttachAgentMessageToolResultInput {
+  /** Owning (authenticated) user. */
+  userId: string;
+  /** Owned conversation whose message carries the result. */
+  conversationId: string;
+  /** The persisted assistant/tool-call message to attach the result to. */
+  messageId: string;
+  /** The structured result to attach (validated before any write). */
+  toolResult: AgentToolResult;
+}
+
+/**
+ * Attach ONE tool result to an existing assistant/tool-call message row
+ * (Phase 10.39 host-execution persistence). Used when a paused turn's host
+ * execution SEALS on resume: the deferred round's eager message gets its
+ * actual completed result, so a later turn's history reconstructs what ran
+ * instead of a bare tool-call intent.
+ *
+ * Merge semantics are idempotent per `callId`: a result already attached for
+ * the same call replaces the stored value (a re-submitted execution cannot
+ * duplicate), and results for OTHER callIds on the same message are kept (a
+ * single paused round may defer several host executions, each submitted on
+ * its own resume). Ownership is verified inside the same transaction that
+ * writes; a conversation or message that no longer exists is a safe no-op —
+ * it is indistinguishable from a raced delete and the resume fails on the
+ * conversation load anyway.
+ *
+ * @throws `TypeError` on an invalid tool result (validated before any write).
+ * @throws `AgentConversationCorruptError` when the message already holds a
+ *         non-array `tool_results` value.
+ */
+export async function attachAgentMessageToolResult(
+  input: AttachAgentMessageToolResultInput,
+): Promise<void> {
+  const toolResult = validateToolResults([input.toolResult])[0]!;
+  const db = getDatabase();
+  await db.$transaction(async (tx) => {
+    const owned = await tx.aiConversation.findFirst({
+      where: { id: input.conversationId, userId: input.userId },
+      select: { id: true },
+    });
+    if (owned === null) return;
+    const message = await tx.aiMessage.findFirst({
+      where: { id: input.messageId, conversationId: input.conversationId },
+      select: { toolResults: true },
+    });
+    if (message === null) return;
+    if (message.toolResults !== null && !Array.isArray(message.toolResults)) {
+      throw new AgentConversationCorruptError("Stored tool results must be an array.");
+    }
+    const existing = Array.isArray(message.toolResults)
+      ? (message.toolResults as unknown as AgentToolResult[])
+      : [];
+    const existingIndex = existing.findIndex((result) => result.callId === toolResult.callId);
+    const merged: AgentToolResult[] =
+      existingIndex === -1
+        ? [...existing, toolResult]
+        : existing.map((result, index) => (index === existingIndex ? toolResult : result));
+    await tx.aiMessage.update({
+      where: { id: input.messageId },
+      data: { toolResults: asJson(merged) },
+    });
+  });
+}
+
 export interface CancelAgentTurnInput {
   /** Owning (authenticated) user. */
   userId: string;

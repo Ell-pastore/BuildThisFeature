@@ -30,9 +30,12 @@ import type {
   AgentResponse,
   AgentTurn,
 } from "./provider.js";
-import type { AgentToolCall } from "./agent.js";
+import type { AgentToolCall, AgentToolResult } from "./agent.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
+  agentToolResultToContent,
   isProviderError,
+  MAX_PROVIDER_TOOL_RESULT_CHARS,
   ProviderError,
   ProviderErrorCode,
   runAgentTurn,
@@ -81,6 +84,9 @@ function makeFilesystem(): FilesystemExecutor & { calls: string[] } {
       throw new Error("not used in this test");
     },
     async moveFile() {
+      throw new Error("not used in this test");
+    },
+    async copyFile() {
       throw new Error("not used in this test");
     },
   };
@@ -418,6 +424,130 @@ describe("AgentProvider — policy preserved", () => {
     if (outcome.ok) return;
     expect(outcome.error.category).toBe("security");
     expect(filesystem.calls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Tool-result serialization budget (provider input safety)
+// ---------------------------------------------------------------------------
+
+describe("AGENT_SYSTEM_INSTRUCTION — the shared single system prompt", () => {
+  it("keeps the safety rules (never invent/fabricate, don't bypass gates)", () => {
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Never invent paths, file names, or directory structures that were " +
+        "not returned by a tool",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain("never fabricate tool results");
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Never try to bypass approval requirements or filesystem allowlists",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "never claim an operation succeeded that the tools did not confirm",
+    );
+  });
+
+  it("treats user-supplied absolute paths as authoritative input", () => {
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Absolute filesystem paths provided verbatim by the user are " +
+        "authoritative input",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "do not call search, list, or metadata tools merely to verify a path " +
+        "the user explicitly supplied",
+    );
+  });
+
+  it("demands minimal, non-redundant tool usage", () => {
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Do not repeat information that is already available",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Use the fewest tool calls necessary to complete the assignment",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "Do not perform redundant discovery or verification",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "When the required information is already known, execute the " +
+        "appropriate operation directly",
+    );
+    expect(AGENT_SYSTEM_INSTRUCTION).toContain(
+      "use any returned error to decide the next action rather than " +
+        "proactively repeating validation",
+    );
+  });
+});
+
+describe("agentToolResultToContent — provider input size budget", () => {
+  it("passes a small read_file result through EXACTLY as before", () => {
+    const result = {
+      ok: true,
+      callId: "a",
+      data: { encoding: "base64", data: "aGVsbG8=" },
+    } as AgentToolResult;
+    expect(agentToolResultToContent(result)).toBe(
+      JSON.stringify({ encoding: "base64", data: "aGVsbG8=" }),
+    );
+  });
+
+  it("preserves the unchanged failure serialization", () => {
+    const result = {
+      ok: false,
+      callId: "b",
+      error: new Error("denied"),
+    } as unknown as AgentToolResult;
+    expect(agentToolResultToContent(result)).toBe(
+      JSON.stringify({ error: "denied" }),
+    );
+  });
+
+  it("bounds an oversized result (large read_file) with truncation metadata", () => {
+    const big = "x".repeat(MAX_PROVIDER_TOOL_RESULT_CHARS * 2);
+    const result: AgentToolResult = {
+      ok: true,
+      callId: "c",
+      data: { encoding: "base64", data: big },
+    };
+
+    const content = agentToolResultToContent(result);
+
+    // Fails closed: the provider-facing content stays far under the budget.
+    expect(content.length).toBeLessThan(MAX_PROVIDER_TOOL_RESULT_CHARS);
+
+    const original = JSON.stringify(result.data);
+    const parsed = JSON.parse(content) as {
+      truncated: boolean;
+      reason: string;
+      maxChars: number;
+      originalChars: number;
+      preview: string;
+    };
+    expect(parsed.truncated).toBe(true);
+    expect(parsed.maxChars).toBe(MAX_PROVIDER_TOOL_RESULT_CHARS);
+    expect(parsed.originalChars).toBe(original.length);
+    // The preview is a genuine prefix of the real content — never fabricated.
+    expect(original.startsWith(parsed.preview)).toBe(true);
+    expect(parsed.preview.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the envelope bounded regardless of how large the input grows", () => {
+    const slight = "y".repeat(MAX_PROVIDER_TOOL_RESULT_CHARS + 100);
+    const massive = "z".repeat(MAX_PROVIDER_TOOL_RESULT_CHARS * 100);
+    const a = agentToolResultToContent({
+      ok: true,
+      callId: "a",
+      data: { data: slight },
+    } as AgentToolResult);
+    const b = agentToolResultToContent({
+      ok: true,
+      callId: "b",
+      data: { data: massive },
+    } as AgentToolResult);
+    expect(a.length).toBeLessThan(MAX_PROVIDER_TOOL_RESULT_CHARS);
+    expect(b.length).toBeLessThan(MAX_PROVIDER_TOOL_RESULT_CHARS);
+    // A ~800x larger input yields only the digit-width difference in
+    // `originalChars`, never an unbounded payload.
+    expect(Math.abs(a.length - b.length)).toBeLessThan(4);
   });
 });
 

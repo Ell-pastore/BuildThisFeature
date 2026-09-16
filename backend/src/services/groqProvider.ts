@@ -44,6 +44,7 @@ import type {
   AgentResponse,
 } from "./provider.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
   agentToolResultToContent,
   ProviderError,
   ProviderErrorCode,
@@ -213,21 +214,7 @@ function toGroqMessages(request: AgentProviderRequest): GroqMessage[] {
   const messages: GroqMessage[] = [
     {
       role: "system",
-      content:
-        "You are an assistant that helps the user manage files. You may " +
-        "call the provided tools when they help with the task.\n\n" +
-        "Before asking the user anything, use the information already " +
-        "present in this conversation — earlier instructions and the " +
-        "results of tools you have already run — to understand the " +
-        "request. Resolve references the user makes (such as files or " +
-        "folders named earlier, or common named locations like the " +
-        "user's home or Desktop) by discovering the actual paths with " +
-        "the provided tools — list_directory, search_files, or " +
-        "get_file_metadata — rather than assuming or guessing. Never " +
-        "invent paths, file names, or directory structures that were " +
-        "not returned by a tool. Only ask the user for clarification " +
-        "when a reference is genuinely ambiguous or cannot be safely " +
-        "discovered.",
+      content: AGENT_SYSTEM_INSTRUCTION,
     },
   ];
 
@@ -283,9 +270,7 @@ function toGroqMessages(request: AgentProviderRequest): GroqMessage[] {
       messages.push({
         role: "tool",
         tool_call_id: result.callId,
-        content: result.ok
-          ? JSON.stringify(result.data)
-          : JSON.stringify({ error: result.error.message }),
+        content: agentToolResultToContent(result),
       });
     }
   }
@@ -434,7 +419,7 @@ export function createGroqProvider(
     }
 
     if (!response.ok) {
-      throw mapHttpError(response.status);
+      throw await mapHttpError(response);
     }
 
     let body: unknown;
@@ -451,9 +436,35 @@ export function createGroqProvider(
 }
 
 /**
- * Map a non-OK HTTP status from Groq into a `ProviderError`.
+ * Read the provider's machine-readable `error.code` from a rejected response
+ * body, when one is present. Best-effort and non-throwing: the error mapping
+ * must still produce a typed `ProviderError` even on a malformed body.
  */
-function mapHttpError(status: number): ProviderError {
+async function readProviderErrorCode(
+  response: GroqFetchResponse,
+): Promise<string | undefined> {
+  try {
+    const body = await response.json();
+    if (typeof body === "object" && body !== null && !Array.isArray(body)) {
+      const code = (body as { error?: { code?: unknown } }).error?.code;
+      return typeof code === "string" && code.length > 0 ? code : undefined;
+    }
+  } catch {
+    // Non-JSON rejection body — no code to read; the status mapping applies.
+  }
+  return undefined;
+}
+
+/**
+ * Map a non-OK HTTP response from Groq into a `ProviderError`.
+ *
+ * A 4xx whose body reports `context_length_exceeded` is NOT a malformed
+ * response: the request is simply too large for THIS model's context window.
+ * It is surfaced as a retryable `ContextLengthExceeded` so the fallback
+ * orchestrator rotates to the next configured provider instead of stopping.
+ */
+async function mapHttpError(response: GroqFetchResponse): Promise<ProviderError> {
+  const status = response.status;
   if (status === 401 || status === 403) {
     return ProviderError.permanent(
       ProviderErrorCode.Authentication,
@@ -467,6 +478,13 @@ function mapHttpError(status: number): ProviderError {
     );
   }
   if (status >= 400 && status < 500) {
+    const providerCode = await readProviderErrorCode(response);
+    if (providerCode === "context_length_exceeded") {
+      return ProviderError.transient(
+        ProviderErrorCode.ContextLengthExceeded,
+        "Groq rejected the request: the input exceeds the model's context length (HTTP 400).",
+      );
+    }
     return ProviderError.permanent(
       ProviderErrorCode.InvalidResponse,
       `Groq rejected the request (HTTP ${status}).`,

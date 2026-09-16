@@ -76,6 +76,9 @@ function makeRecordingExecutor(): FilesystemExecutor & { calls: ExecutorCalls } 
     async moveFile(source, destination) {
       calls.moveFile.push({ source, destination });
     },
+    async copyFile(source, destDirPath) {
+      calls.moveFile.push({ source, destination: destDirPath });
+    },
   };
 }
 
@@ -102,9 +105,11 @@ describe("no arbitrary command/code execution path", () => {
   it("the handler surface is a closed frozen map of exactly the known tools", () => {
     expect(Object.isFrozen(handlers)).toBe(true);
     expect([...handledToolNames].sort()).toEqual([
+      "copy_file",
       "get_file_metadata",
       "list_directory",
       "move_file",
+      "plan_intent",
       "read_file",
       "search_files",
     ]);

@@ -22,6 +22,7 @@ import {
   type GrokFetchInit,
 } from "./grokProvider.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
   isProviderError,
   ProviderError,
   ProviderErrorCode,
@@ -216,6 +217,22 @@ describe("createGrokProvider — request construction", () => {
     if (!call) return;
     const body = expectGrokBody(call.init);
     expect(body.tools).toBeUndefined();
+  });
+
+  it("sends the shared AGENT_SYSTEM_INSTRUCTION as the system message", async () => {
+    const { provider, calls } = makeProvider({
+      choices: [{ message: { content: "done" } }],
+    });
+    await provider.generate(baseRequest());
+
+    const call = calls[0];
+    if (!call) return;
+    const messages = expectGrokBody(call.init)
+      .messages as Array<Record<string, unknown>>;
+    expect(messages[0]).toEqual({
+      role: "system",
+      content: AGENT_SYSTEM_INSTRUCTION,
+    });
   });
 
   it("supplies prior tool results as xAI tool messages in order", async () => {

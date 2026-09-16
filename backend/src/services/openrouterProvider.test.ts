@@ -26,6 +26,7 @@ import {
   type OpenRouterFetchInit,
 } from "./openrouterProvider.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
   isProviderError,
   ProviderError,
   ProviderErrorCode,
@@ -228,6 +229,22 @@ describe("createOpenRouterProvider — request construction", () => {
     expect(messages[2]?.tool_calls).toHaveLength(2);
     expect(messages[3]).toMatchObject({ role: "tool", tool_call_id: "a" });
     expect(messages[4]).toMatchObject({ role: "tool", tool_call_id: "b" });
+  });
+
+  it("sends the shared AGENT_SYSTEM_INSTRUCTION as the system message", async () => {
+    const { provider, calls } = makeProvider({
+      choices: [{ message: { content: "done" } }],
+    });
+    await provider.generate(baseRequest());
+
+    const call = calls[0];
+    if (!call) return;
+    const messages = expectOpenRouterBody(call.init)
+      .messages as Array<Record<string, unknown>>;
+    expect(messages[0]).toEqual({
+      role: "system",
+      content: AGENT_SYSTEM_INSTRUCTION,
+    });
   });
 
   it("buffers prior-conversation history between system and the current user message", async () => {

@@ -25,6 +25,7 @@ import {
   appendAgentTurn,
   appendAgentTurnRoundMessage,
   archiveAgentConversation,
+  attachAgentMessageToolResult,
   beginAgentTurn,
   cancelAgentTurn,
   completeAgentTurn,
@@ -185,6 +186,17 @@ function createFakeDb() {
         };
         messages.push(row);
         return row;
+      }),
+      findFirst: vi.fn(async ({ where = {} }: { where?: AnyRecord }) => {
+        const idEq = where?.id;
+        const conversationId =
+          where?.conversationId === undefined ? undefined : (where.conversationId as string);
+        const row = messages.find(
+          (m) =>
+            (idEq === undefined || m.id === idEq) &&
+            (conversationId === undefined || m.conversationId === conversationId),
+        );
+        return row ?? null;
       }),
       findMany: vi.fn(
         async ({ where, orderBy }: { where?: AnyRecord; orderBy?: AnyRecord[] }) => {
@@ -1501,6 +1513,156 @@ describe("agentConversations repository", () => {
       expect(loaded.messages.every((m) => m.kind === "provider")).toBe(true);
       expect(loaded.finalText).toBeUndefined();
       expect(loaded.toolRounds).toBe(0);
+    });
+
+    it("attachAgentMessageToolResult attaches a completed result to the round's eager message", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Move cross.jpg to Testing.",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "move_file", input: { sourcePath: "/a.jpg", destinationPath: "/b.jpg" } }],
+      });
+      expect(db.messages.find((m) => m.id === begun.messageId)?.toolResults).toBeNull();
+
+      await attachAgentMessageToolResult({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        messageId: begun.messageId,
+        toolResult: {
+          ok: true,
+          callId: "c1",
+          toolName: "move_file",
+          toolInput: { sourcePath: "/a.jpg", destinationPath: "/b.jpg" },
+          data: { movedFrom: "/a.jpg", movedTo: "/b.jpg" },
+        },
+      });
+
+      const round = db.messages.find((m) => m.id === begun.messageId);
+      expect(round?.toolResults).toEqual([
+        {
+          ok: true,
+          callId: "c1",
+          toolName: "move_file",
+          toolInput: { sourcePath: "/a.jpg", destinationPath: "/b.jpg" },
+          data: { movedFrom: "/a.jpg", movedTo: "/b.jpg" },
+        },
+      ]);
+    });
+
+    it("attachAgentMessageToolResult MERGES per callId: keeps other results, replaces the same callId (no duplicates)", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Move two files.",
+        maxToolRounds: 2,
+        toolCalls: [
+          { id: "c1", toolName: "move_file", input: { sourcePath: "/a.jpg", destinationPath: "/b.jpg" } },
+          { id: "c2", toolName: "move_file", input: { sourcePath: "/c.jpg", destinationPath: "/d.jpg" } },
+        ],
+      });
+      await attachAgentMessageToolResult({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        messageId: begun.messageId,
+        toolResult: { ok: true, callId: "c1", data: { movedFrom: "/a.jpg", movedTo: "/b.jpg" } },
+      });
+      await attachAgentMessageToolResult({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        messageId: begun.messageId,
+        toolResult: { ok: true, callId: "c2", data: { movedFrom: "/c.jpg", movedTo: "/d.jpg" } },
+      });
+      // Re-submitting the same callId replaces, never duplicates.
+      await attachAgentMessageToolResult({
+        userId: ALICE,
+        conversationId: begun.conversationId,
+        messageId: begun.messageId,
+        toolResult: { ok: true, callId: "c1", data: { movedFrom: "/a.jpg", movedTo: "/e.jpg" } },
+      });
+
+      const round = db.messages.find((m) => m.id === begun.messageId);
+      expect(round?.toolResults).toEqual([
+        { ok: true, callId: "c1", data: { movedFrom: "/a.jpg", movedTo: "/e.jpg" } },
+        { ok: true, callId: "c2", data: { movedFrom: "/c.jpg", movedTo: "/d.jpg" } },
+      ]);
+    });
+
+    it("attachAgentMessageToolResult is a safe no-op for a foreign or missing conversation/message", async () => {
+      const created = await createAgentConversation({
+        userId: ALICE,
+        instruction: "Private",
+        maxToolRounds: 1,
+      });
+      const rounds = db.messages.map((m) => ({ ...m }));
+      const beforeMessages = db.messages.length;
+
+      await expect(
+        attachAgentMessageToolResult({
+          userId: BOB,
+          conversationId: created.id,
+          messageId: "msg-1",
+          toolResult: { ok: true, callId: "c1", data: null },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(
+        attachAgentMessageToolResult({
+          userId: ALICE,
+          conversationId: "conv-ghost",
+          messageId: "msg-1",
+          toolResult: { ok: true, callId: "c1", data: null },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(
+        attachAgentMessageToolResult({
+          userId: ALICE,
+          conversationId: created.id,
+          messageId: "msg-ghost",
+          toolResult: { ok: true, callId: "c1", data: null },
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(db.messages).toHaveLength(beforeMessages);
+      expect(db.messages.map((m) => ({ ...m }))).toEqual(rounds);
+    });
+
+    it("attachAgentMessageToolResult validates the tool result before writing", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      const before = db.messages.find((m) => m.id === begun.messageId)?.toolResults;
+
+      await expect(
+        attachAgentMessageToolResult({
+          userId: ALICE,
+          conversationId: begun.conversationId,
+          messageId: begun.messageId,
+          toolResult: { callId: 42 } as unknown as AgentToolResult,
+        }),
+      ).rejects.toThrow(TypeError);
+      expect(db.messages.find((m) => m.id === begun.messageId)?.toolResults).toEqual(before);
+    });
+
+    it("attachAgentMessageToolResult rejects corrupt existing tool results", async () => {
+      const begun = await beginAgentTurn({
+        userId: ALICE,
+        instruction: "Go",
+        maxToolRounds: 2,
+        toolCalls: [{ id: "c1", toolName: "list_directory", input: {} }],
+      });
+      const row = db.messages.find((m) => m.id === begun.messageId);
+      if (!row) throw new Error("expected a round message");
+      row.toolResults = "not-an-array" as unknown;
+
+      await expect(
+        attachAgentMessageToolResult({
+          userId: ALICE,
+          conversationId: begun.conversationId,
+          messageId: begun.messageId,
+          toolResult: { ok: true, callId: "c1", data: null },
+        }),
+      ).rejects.toThrow(AgentConversationCorruptError);
     });
   });
 

@@ -139,6 +139,9 @@ function makeFilesystem(): FilesystemExecutor {
     async moveFile() {
       throw new Error("not used in this test");
     },
+    async copyFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 
@@ -311,10 +314,13 @@ describe("production runtime — per-request AI Quality bound (Phase 10.40)", ()
       instruction: VALID_INSTRUCTION,
     });
 
-    expect(result.state.maxToolRounds).toBe(PRODUCTION_AI_MAX_TOOL_ROUNDS);
+    // The no-override default is 5 tool rounds (Phase B regression lock):
+    // a raised default must not fall back to the previous cap of 3.
+    expect(PRODUCTION_AI_MAX_TOOL_ROUNDS).toBe(5);
+    expect(result.state.maxToolRounds).toBe(5);
     expect(repoMocks.persistAgentTurn).toHaveBeenCalledWith(
       expect.objectContaining({
-        maxToolRounds: PRODUCTION_AI_MAX_TOOL_ROUNDS,
+        maxToolRounds: 5,
       }),
     );
   });

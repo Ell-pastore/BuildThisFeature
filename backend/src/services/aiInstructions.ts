@@ -79,7 +79,7 @@ const BODY_FIELDS = new Set(["conversationId", "instruction", "approvalId", "res
 const MAX_RESUME_EXECUTIONS = 16;
 
 /** Tool-loop bound applied when the host has not pre-bound a runtime. */
-const MAX_TOOL_ROUNDS = 3;
+const MAX_TOOL_ROUNDS = 5;
 
 // ---------------------------------------------------------------------------
 // Typed request / response
@@ -91,7 +91,8 @@ export interface AiHostExecutionSubmissionInput {
   executionId: string;
   /** Whether the host's execution succeeded. */
   ok: boolean;
-  /** The host's execution payload when it succeeded (never persisted). */
+  /** The host's execution payload when it succeeded (persisted as the
+   *  deferred round's tool result on resume). */
   result?: unknown;
   /** The categorized tool error when the host's execution failed. */
   error?: { code: string; category: string };
@@ -113,8 +114,8 @@ export interface AiInstructionBody {
    * Resume after a PAUSED host-execution round (Phase 10.39): the desktop
    * host's submissions for the pending executions it executed locally. Each
    * owned record is sealed exactly once and this turn continues the bounded
-   * loop. Result payloads are transient provider context — never persisted.
-   * Optional.
+   * loop. Each submission's result is persisted onto its deferred round's
+   * transcript message before the record seals. Optional.
    */
   resumeExecutions?: readonly AiHostExecutionSubmissionInput[];
 }
@@ -354,6 +355,13 @@ export function mapAgentTurnError(error: unknown): unknown {
     return AppError.notFound("Agent conversation");
   }
   if (isProviderError(error)) {
+    // Preserve the UNDERLYING failure for server-side diagnostics while the
+    // client still receives the safe, provider-agnostic 503 envelope. Provider
+    // messages are contractually secret-free (never a credential or path), so
+    // logging the code + message is safe here.
+    console.error(
+      `[ai] provider failure (${error.code}) mapped to 503 ai/provider-unavailable: ${error.message}`,
+    );
     return new AppError(
       503,
       "ai/provider-unavailable",

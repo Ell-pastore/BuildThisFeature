@@ -60,7 +60,10 @@ export const HOST_EXECUTABLE_READ_TOOLS: ReadonlySet<string> = new Set([
  * backend only defers it under an executable, single-use approval, so
  * arriving here means the OPERATION was already user-approved.
  */
-export const HOST_EXECUTABLE_APPROVED_WRITE_TOOLS: ReadonlySet<string> = new Set(["move_file"]);
+export const HOST_EXECUTABLE_APPROVED_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  "move_file",
+  "copy_file",
+]);
 
 /** Every tool the driver actually executes; anything else is a categorized failure. */
 export const HOST_EXECUTABLE_TOOLS: ReadonlySet<string> = new Set([
@@ -132,6 +135,13 @@ export async function executeHostExecution(
       const destinationPath = requireArgumentString(execution.arguments, "destinationPath");
       await provider.moveFile(sourcePath, destinationPath);
       return { movedFrom: sourcePath, movedTo: destinationPath };
+    }
+    case "copy_file": {
+      const sourcePath = requireArgumentString(execution.arguments, "sourcePath");
+      const destDirPath = requireArgumentString(execution.arguments, "destDirPath");
+      await provider.copyItem(sourcePath, destDirPath);
+      const name = sourcePath.split(/[\\/]/).pop() ?? "";
+      return { copiedFrom: sourcePath, copiedTo: destDirPath + "/" + name };
     }
     default:
       throw new Error(`Unsupported host-execution tool "${execution.toolName}".`);

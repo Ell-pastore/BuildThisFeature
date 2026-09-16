@@ -132,6 +132,9 @@ function makeFilesystem(): FilesystemExecutor {
     async moveFile() {
       throw new Error("not used in this test");
     },
+    async copyFile() {
+      throw new Error("not used in this test");
+    },
   };
 }
 

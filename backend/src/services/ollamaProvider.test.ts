@@ -25,6 +25,7 @@ import {
   type OllamaFetchInit,
 } from "./ollamaProvider.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
   isProviderError,
   ProviderError,
   ProviderErrorCode,
@@ -182,7 +183,7 @@ describe("createOllamaProvider — request construction", () => {
     const messages = body.messages as Array<{ role: string; content: string }>;
     expect(messages).toHaveLength(2);
     expect(messages[0]?.role).toBe("system");
-    expect(typeof messages[0]?.content).toBe("string");
+    expect(messages[0]?.content).toBe(AGENT_SYSTEM_INSTRUCTION);
     expect(messages[1]?.role).toBe("user");
     expect(messages[1]?.content).toBe("List my home directory");
   });

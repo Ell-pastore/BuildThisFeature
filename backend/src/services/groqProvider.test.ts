@@ -23,6 +23,8 @@ import {
 } from "./groqProvider.js";
 import {
   isProviderError,
+  AGENT_SYSTEM_INSTRUCTION,
+  MAX_PROVIDER_TOOL_RESULT_CHARS,
   ProviderError,
   ProviderErrorCode,
 } from "./provider.js";
@@ -240,6 +242,69 @@ describe("createGroqProvider — request construction", () => {
     expect(messages[3]).toMatchObject({ role: "tool", tool_call_id: "a" });
     expect(messages[4]).toMatchObject({ role: "tool", tool_call_id: "b" });
   });
+
+  it("keeps small tool results verbatim in the outgoing tool message", async () => {
+    const results: AgentToolResult[] = [
+      { ok: true, callId: "a", data: { items: [] } },
+    ];
+    const { provider, calls } = makeProvider({
+      choices: [{ message: { content: "done" } }],
+    });
+    await provider.generate({ ...baseRequest(), toolResults: results });
+
+    const call = calls[0];
+    if (!call) return;
+    const messages = expectGroqBody(call.init)
+      .messages as Array<Record<string, unknown>>;
+    const toolMessage = messages[messages.length - 1] as {
+      role?: string;
+      content?: unknown;
+    };
+    expect(toolMessage.role).toBe("tool");
+    expect(toolMessage.content).toBe(JSON.stringify({ items: [] }));
+  });
+
+  it("bounds an oversized read_file result before it reaches the provider", async () => {
+    const big = "A".repeat(MAX_PROVIDER_TOOL_RESULT_CHARS * 2);
+    const results: AgentToolResult[] = [
+      { ok: true, callId: "big", data: { encoding: "base64", data: big } },
+    ];
+    const { provider, calls } = makeProvider({
+      choices: [{ message: { content: "done" } }],
+    });
+    await provider.generate({ ...baseRequest(), toolResults: results });
+
+    const call = calls[0];
+    if (!call) return;
+    const messages = expectGroqBody(call.init)
+      .messages as Array<Record<string, unknown>>;
+    const toolMessage = messages[messages.length - 1] as {
+      role?: string;
+      content?: unknown;
+    };
+    expect(toolMessage.role).toBe("tool");
+    const content = toolMessage.content as string;
+    expect(content.length).toBeLessThan(MAX_PROVIDER_TOOL_RESULT_CHARS);
+    expect(JSON.parse(content)).toMatchObject({ truncated: true });
+    // The full original payload must NOT be in the wire body.
+    expect(String(call.init.body).includes(big)).toBe(false);
+  });
+  it("sends the shared AGENT_SYSTEM_INSTRUCTION as the system message", async () => {
+    const { provider, calls } = makeProvider({
+      choices: [{ message: { content: "done" } }],
+    });
+    await provider.generate(baseRequest());
+
+    const call = calls[0];
+    if (!call) return;
+    const messages = expectGroqBody(call.init)
+      .messages as Array<Record<string, unknown>>;
+    expect(messages[0]).toEqual({
+      role: "system",
+      content: AGENT_SYSTEM_INSTRUCTION,
+    });
+  });
+
   it("buffers prior-conversation history between system and the current user message", async () => {
     const { provider, calls } = makeProvider({
       choices: [{ message: { content: "Moving it now." } }],
@@ -527,6 +592,27 @@ describe("createGroqProvider — HTTP and transport error mapping", () => {
 
   it("maps HTTP 400 to a permanent InvalidResponse error", async () => {
     await expect(generateProvider({ error: "bad" }, 400)).rejects.toMatchObject({
+      code: ProviderErrorCode.InvalidResponse,
+      retryable: false,
+    });
+  });
+
+  it("maps HTTP 400 context_length_exceeded to a transient, fallback-eligible ContextLengthExceeded error", async () => {
+    await expect(
+      generateProvider(
+        { error: { code: "context_length_exceeded", message: "Please reduce the length of the messages or completion." } },
+        400,
+      ),
+    ).rejects.toMatchObject({
+      code: ProviderErrorCode.ContextLengthExceeded,
+      retryable: true,
+    });
+  });
+
+  it("stays InvalidResponse for other 400 bodies even when a body code is absent", async () => {
+    await expect(
+      generateProvider({ error: { code: "some_other_error" } }, 400),
+    ).rejects.toMatchObject({
       code: ProviderErrorCode.InvalidResponse,
       retryable: false,
     });

@@ -4,6 +4,9 @@
  *
  * `GET  /api/ai/status`                     — safe provider capability status.
  * `POST /api/ai/instructions`               — submit one instruction to the agent runtime.
+ * `POST /api/ai/plans`                       — plan one instruction into a structured FileIntentPlan (no execution).
+ * `POST /api/ai/plans/execute`               — execute a FileIntentPlan through the EXISTING approval-gated move_file
+ *                                              pipeline with a DETERMINISTIC (no-LLM) provider.
  * `GET  /api/ai/conversations`              — list the user's conversations, newest-first.
  *                                              Optional `?q=` searches the user's own
  *                                              non-archived conversations by title (case-
@@ -71,6 +74,9 @@ import type { AppVariables } from "../core/auth.js";
 import { AppError } from "../core/errors.js";
 import { getAiRuntimeStatus } from "../services/aiStatus.js";
 import { runAiInstruction } from "../services/aiInstructions.js";
+import { runAiIntentPlan } from "../services/aiIntentPlans.js";
+import { isPlanExecutionError } from "../services/aiPlanExecutions.js";
+import { runAiPlanExecution } from "../services/aiPlanExecutions.js";
 import { isAiQuality } from "../services/aiQuality.js";
 import {
   archiveAiConversation,
@@ -112,6 +118,17 @@ function mapApprovalError(error: unknown): AppError {
   throw error;
 }
 
+/**
+ * Map a `PlanExecutionError` (plan validation / reference resolution) to its
+ * 400 HTTP envelope with a stable, machine-readable code
+ * (`ai/plan-execution/<code>`). Anything unexpected is rethrown so the HTTP
+ * layer's generic `internal/error` envelope protects internals.
+ */
+function mapPlanExecutionHttpError(error: unknown): AppError {
+  if (!isPlanExecutionError(error)) throw error;
+  return new AppError(400, `ai/plan-execution/${error.code}`, error.message);
+}
+
 export const aiRoutes = new Hono<AppVariables>()
   .get("/status", requireAuth, (c) => {
     // The authenticated identity is required (defense in depth on top of
@@ -151,6 +168,58 @@ export const aiRoutes = new Hono<AppVariables>()
     }
 
     return c.json(await runAiInstruction(c, raw), 200);
+  })
+  .post("/plans", requireAuth, async (c) => {
+    // The authenticated identity is required and CONSULTED ONLY via the
+    // session — a body-supplied user id is rejected by the service's strict
+    // parser and is never passed to the planning provider.
+    getCurrentUser(c);
+
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw AppError.badRequest("Request body must be valid JSON.");
+    }
+
+    // Phase 11.1: the planning boundary returns a structured FileIntentPlan
+    // and NEVER executes anything. The service routes exactly one bounded
+    // turn against the read-only plan_intent tool through the unchanged
+    // agent pipeline; provider failures map to 503 and malformed plans to
+    // 400. Malformed JSON is rejected here before any agent work.
+    return c.json(await runAiIntentPlan(c, raw), 200);
+  })
+  .post("/plans/execute", requireAuth, async (c) => {
+    // The authenticated identity is required and CONSULTED ONLY via the
+    // session — a body-supplied user id is rejected by the service's strict
+    // parser and is never passed to the runtime.
+    getCurrentUser(c);
+
+    // Phase 11.2: the same desktop-host + AI-quality header handling as
+    // /instructions, so plan-execution turns honor host-delegation and the
+    // NEW-conversation tool-round bound exactly like instruction turns.
+    c.set("desktopHost", c.req.header("x-desktop-host") === "1");
+    const aiQuality = c.req.header("x-ai-quality");
+    if (aiQuality !== undefined && isAiQuality(aiQuality)) {
+      c.set("aiQuality", aiQuality);
+    }
+
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw AppError.badRequest("Request body must be valid JSON.");
+    }
+
+    try {
+      return c.json(await runAiPlanExecution(c, raw), 200);
+    } catch (error) {
+      // Plan validation / reference resolution failures are 400 with a
+      // stable `ai/plan-execution/<code>` envelope; everything else (agent
+      // turn failures, provider 503s, loop-bound 502s, 404s) propagates
+      // through the service's own mapping.
+      throw mapPlanExecutionHttpError(error);
+    }
   })
   .get("/conversations", requireAuth, async (c) => {
     // Identity comes EXCLUSIVELY from the authenticated session. The list

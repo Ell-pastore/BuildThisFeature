@@ -52,6 +52,15 @@ export interface FilesystemExecutor {
    * outside the configured `AllowList`. Resolves to nothing on success.
    */
   moveFile(source: string, destinationPath: string): Promise<void>;
+  /**
+   * Copy a file INTO an existing destination directory, keeping its original
+   * name. The Rust `copy_item` command rejects folders, missing sources,
+   * missing/non-folder destination directories, an existing destination item,
+   * and any path outside the configured `AllowList`. Resolves to nothing on
+   * success. Note the contract difference from `moveFile`: the destination is
+   * a DIRECTORY, never an exact path — the copy keeps the source's name.
+   */
+  copyFile(source: string, destDirPath: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +111,12 @@ export function tauriFilesystemExecutor(
       return invoke<void>("move_file", {
         source,
         destination: destinationPath,
+      });
+    },
+    copyFile(source, destDirPath) {
+      return invoke<void>("copy_item", {
+        source,
+        destDir: destDirPath,
       });
     },
   };
@@ -168,6 +183,7 @@ export function hostDelegatedFilesystemExecutor(): HostDelegatedFilesystemExecut
     getFileMetadata: deferred,
     readFile: deferred,
     moveFile: deferred,
+    copyFile: deferred,
   };
 }
 

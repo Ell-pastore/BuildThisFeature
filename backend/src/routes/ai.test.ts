@@ -32,6 +32,13 @@ import { aiRoutes } from "./ai.js";
 import type { AiRuntimeStatus } from "../services/aiStatus.js";
 import type { AiInstructionResponse } from "../services/aiInstructions.js";
 import { parseAiInstructionInput } from "../services/aiInstructions.js";
+import type { AiIntentPlanResponse } from "../services/aiIntentPlans.js";
+import { parseAiIntentPlanInput } from "../services/aiIntentPlans.js";
+import { parseAiPlanExecutionInput } from "../services/aiPlanExecutions.js";
+import {
+  PlanExecutionError,
+  PlanExecutionErrorCode,
+} from "../services/aiPlanExecutions.js";
 import type {
   AiConversationArchiveResult,
   AiConversationDeletionResult,
@@ -51,6 +58,8 @@ const mocks = vi.hoisted(() => ({
   databaseNow: vi.fn(),
   getAiRuntimeStatus: vi.fn(),
   runAiInstruction: vi.fn(),
+  runAiIntentPlan: vi.fn(),
+  runAiPlanExecution: vi.fn(),
   listAiConversations: vi.fn(),
   getAiConversation: vi.fn(),
   deleteAiConversation: vi.fn(),
@@ -81,6 +90,27 @@ vi.mock("../services/aiInstructions.js", async (importOriginal) => {
     // The production entry is replaced; the REAL strict parser stays in the
     // pipeline so validation behavior is exercised end-to-end.
     runAiInstruction: mocks.runAiInstruction,
+  };
+});
+
+vi.mock("../services/aiIntentPlans.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/aiIntentPlans.js")>();
+  return {
+    ...actual,
+    // The production entry is replaced; the REAL strict plan parser stays in the
+    // pipeline so plan-body validation behavior is exercised end-to-end.
+    runAiIntentPlan: mocks.runAiIntentPlan,
+  };
+});
+
+vi.mock("../services/aiPlanExecutions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/aiPlanExecutions.js")>();
+  return {
+    ...actual,
+    // The production entry is replaced; the REAL strict plan-execution parser
+    // and the PlanExecutionError class stay in the pipeline so validation and
+    // mapping behavior is exercised end-to-end.
+    runAiPlanExecution: mocks.runAiPlanExecution,
   };
 });
 
@@ -162,6 +192,24 @@ const CANNED_STATUS: AiRuntimeStatus = {
 
 const HISTORY_CONVERSATION_ID = "55555555-5555-5555-5555-555555555555";
 
+const CANNED_PLAN: AiIntentPlanResponse["plan"] = {
+  intent: "MOVE",
+  source: {
+    reference: "semantic",
+    kind: "folder",
+    name: "sound",
+    location: "Downloads",
+  },
+  destination: {
+    reference: "semantic",
+    kind: "folder",
+    name: "Desktop",
+  },
+  operation: {},
+  requiresApproval: true,
+  supported: true,
+};
+
 const CANNED_SUMMARY: AiConversationSummary = {
   id: HISTORY_CONVERSATION_ID,
   title: "Invoice review",
@@ -218,6 +266,34 @@ beforeEach(() => {
           finalText: "Everything listed.",
           toolRounds: 0,
           maxToolRounds: 3,
+          toolResults: [],
+          pendingApprovals: [],
+          pendingExecutions: [],
+        },
+      };
+    },
+  );
+  mocks.runAiIntentPlan.mockImplementation(
+    async (_c, raw): Promise<AiIntentPlanResponse> => {
+      // The real strict plan parser runs; the plan result itself is canned.
+      const input = parseAiIntentPlanInput(raw);
+      void input.instruction;
+      return { plan: CANNED_PLAN };
+    },
+  );
+  mocks.runAiPlanExecution.mockImplementation(
+    async (c: { get: (key: string) => unknown }, raw: unknown): Promise<AiInstructionResponse> => {
+      // The real strict plan-execution parser runs; the turn result is canned.
+      const input = parseAiPlanExecutionInput(raw);
+      return {
+        conversationId: input.conversationId ?? "22222222-2222-2222-2222-222222222222",
+        turn: {
+          created: input.conversationId === undefined,
+          instruction: input.instruction,
+          messages: [],
+          finalText: "Moved the file.",
+          toolRounds: 1,
+          maxToolRounds: 5,
           toolResults: [],
           pendingApprovals: [],
           pendingExecutions: [],
@@ -659,6 +735,242 @@ describe("POST /api/ai/instructions — generic 500 without leaks", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/ai/plans/execute — Phase 11.2
+// ---------------------------------------------------------------------------
+
+describe("POST /api/ai/plans/execute — authenticated", () => {
+  async function postPlanExecute(app: Hono, body: unknown, token = "valid-token"): Promise<Response> {
+    return app.request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(token),
+        "content-type": "application/json",
+      },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+
+  it("returns 200 with the stable typed envelope for an authenticated user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await postPlanExecute(makeApp(), {
+      instruction: "Move project files to my Desktop.",
+      plan: CANNED_PLAN,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as AiInstructionResponse;
+    expect(Object.keys(body).sort()).toEqual(["conversationId", "turn"]);
+    expect(body.turn.instruction).toBe("Move project files to my Desktop.");
+    expect(body.conversationId).toBe("22222222-2222-2222-2222-222222222222");
+    expect(mocks.runAiPlanExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes the conversation when a valid conversationId is supplied", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    const conversationId = "55555555-5555-5555-5555-555555555555";
+
+    const body = (await (
+      await postPlanExecute(makeApp(), {
+        conversationId,
+        instruction: "Move again.",
+        plan: CANNED_PLAN,
+      })
+    ).json()) as AiInstructionResponse;
+
+    expect(body.conversationId).toBe(conversationId);
+    expect(body.turn.created).toBe(false);
+  });
+
+  it("surfaces whitelisted desktop-host and ai-quality headers on the request context", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiPlanExecution.mockImplementationOnce(
+      async (c: { get: (key: string) => unknown }, raw: unknown) => {
+        expect(c.get("desktopHost")).toBe(true);
+        expect(c.get("aiQuality")).toBe("high");
+        const input = parseAiPlanExecutionInput(raw);
+        return {
+          conversationId: "22222222-2222-2222-2222-222222222222",
+          turn: {
+            created: true,
+            instruction: input.instruction,
+            messages: [],
+            finalText: "Moved.",
+            toolRounds: 0,
+            maxToolRounds: 8,
+            toolResults: [],
+            pendingApprovals: [],
+            pendingExecutions: [],
+          },
+        };
+      },
+    );
+
+    const res = await makeApp().request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(),
+        "content-type": "application/json",
+        "x-desktop-host": "1",
+        "x-ai-quality": "high",
+      },
+      body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("leaves aiQuality unset for an unknown or absent x-ai-quality value", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiPlanExecution.mockImplementation(
+      async (c: { get: (key: string) => unknown }, raw: unknown) => {
+        expect(c.get("aiQuality")).toBeUndefined();
+        const input = parseAiPlanExecutionInput(raw);
+        return {
+          conversationId: "22222222-2222-2222-2222-222222222222",
+          turn: {
+            created: true,
+            instruction: input.instruction,
+            messages: [],
+            finalText: "Moved.",
+            toolRounds: 0,
+            maxToolRounds: 3,
+            toolResults: [],
+            pendingApprovals: [],
+            pendingExecutions: [],
+          },
+        };
+      },
+    );
+
+    const unknown = await makeApp().request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(),
+        "content-type": "application/json",
+        "x-ai-quality": "super",
+      },
+      body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+    });
+    expect(unknown.status).toBe(200);
+
+    const absent = await makeApp().request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: { ...authorizedHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+    });
+    expect(absent.status).toBe(200);
+  });
+
+  it("rejects a body that tries to supply its own identity (400 common/bad-request)", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await postPlanExecute(makeApp(), {
+      instruction: "Move it.",
+      plan: CANNED_PLAN,
+      userId: "99999999-9999-9999-9999-999999999999",
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: { code: "common/bad-request" },
+    });
+  });
+
+  it("returns 400 ai/plan-execution/<code> for a plan that fails validation", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiPlanExecution.mockImplementationOnce(
+      async (_c, raw) => {
+        parseAiPlanExecutionInput(raw);
+        throw new PlanExecutionError(
+          PlanExecutionErrorCode.Unsupported,
+          "Folder sources are not supported.",
+        );
+      },
+    );
+
+    const res = await postPlanExecute(makeApp(), {
+      instruction: "Move it.",
+      plan: CANNED_PLAN,
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: {
+        code: "ai/plan-execution/unsupported",
+        message: "Folder sources are not supported.",
+      },
+    });
+  });
+
+  it("returns 400 common/bad-request for malformed JSON before any agent work", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await postPlanExecute(makeApp(), "{ this is not json ");
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Request body must be valid JSON." },
+    });
+    expect(mocks.runAiPlanExecution).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/ai/plans/execute — generic 500 without leaks", () => {
+  it("reduces an unexpected service error to the generic internal/error envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiPlanExecution.mockRejectedValueOnce(
+      new Error("SECRET plan-execution key sk-LIVE-leak inside backend internal path"),
+    );
+
+    const res = await (
+      await makeApp().request("/api/ai/plans/execute", {
+        method: "POST",
+        headers: { ...authorizedHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+      })
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("SECRET");
+    expect(JSON.stringify(res)).not.toContain("sk-LIVE");
+  });
+});
+
+describe("POST /api/ai/plans/execute — authentication failures", () => {
+  it("returns the existing generic 401 for a missing token", async () => {
+    const res = await makeApp().request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+    });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "auth/unauthorized", message: "Invalid email or password." },
+    });
+    expect(mocks.runAiPlanExecution).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing generic 401 for an inactive user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(PENDING_USER));
+
+    const res = await makeApp().request("/api/ai/plans/execute", {
+      method: "POST",
+      headers: { ...authorizedHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "Move it.", plan: CANNED_PLAN }),
+    });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    expect(mocks.runAiPlanExecution).not.toHaveBeenCalled();
+  });
+});
+
 describe("POST /api/ai/instructions — authentication failures (unchanged)", () => {
   it("returns the existing generic 401 for a missing token", async () => {
     const res = await makeApp().request("/api/ai/instructions", {
@@ -724,6 +1036,184 @@ describe("POST /api/ai/instructions — no network", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
     expect((res as AiInstructionResponse).turn.instruction).toBe("List my home directory.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7b. POST /api/ai/plans — planning boundary (Phase 11.1)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/ai/plans — authenticated", () => {
+  async function postPlan(app: Hono, body: unknown, token = "valid-token"): Promise<Response> {
+    return app.request("/api/ai/plans", {
+      method: "POST",
+      headers: {
+        ...authorizedHeaders(token),
+        "content-type": "application/json",
+      },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+
+  it("returns 200 with the stable typed plan envelope for an authenticated user", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiIntentPlan.mockImplementationOnce(
+      async (c: { get: (key: string) => unknown }, raw: unknown) => {
+        // The REAL strict plan parser stays authoritative IN the route path.
+        expect((c.get("user") as { id: string }).id).toBe(ACTIVE_USER.id);
+        const input = parseAiIntentPlanInput(raw);
+        return {
+          plan: {
+            intent: "MOVE",
+            source: {
+              reference: "semantic",
+              kind: "folder",
+              name: "sound",
+              location: "Downloads",
+            },
+            destination: {
+              reference: "semantic",
+              kind: "folder",
+              name: "Desktop",
+            },
+            operation: {},
+            requiresApproval: true,
+            supported: true,
+          },
+          instruction: input.instruction,
+        };
+      },
+    );
+
+    const res = await postPlan(makeApp(), {
+      instruction: 'Move the "sound" folder from Downloads to Desktop.',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as AiIntentPlanResponse & { instruction: string };
+    expect(body.plan).toMatchObject({
+      intent: "MOVE",
+      requiresApproval: true,
+      supported: true,
+    });
+    expect(body.instruction).toBe('Move the "sound" folder from Downloads to Desktop.');
+    expect(mocks.runAiIntentPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a body that tries to supply its own identity (400 common/bad-request)", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await postPlan(makeApp(), {
+      instruction: "Move notes.",
+      userId: "99999999-9999-9999-9999-999999999999",
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: { code: "common/bad-request" },
+    });
+  });
+
+  it("returns 400 common/bad-request for malformed JSON before any agent work", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+
+    const res = await postPlan(makeApp(), "{ this is not json ");
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "common/bad-request", message: "Request body must be valid JSON." },
+    });
+    expect(mocks.runAiIntentPlan).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/ai/plans — generic 500 without leaks", () => {
+  it("reduces an unexpected service error to the generic internal/error envelope", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiIntentPlan.mockRejectedValueOnce(
+      new Error("SECRET provider key sk-LIVE-leak inside backend internal path"),
+    );
+
+    const res = await (
+      await makeApp().request("/api/ai/plans", {
+        method: "POST",
+        headers: { ...authorizedHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({ instruction: "Move notes." }),
+      })
+    ).json();
+
+    expect(res).toEqual({
+      error: { code: "internal/error", message: "Internal server error." },
+    });
+    expect(JSON.stringify(res)).not.toContain("SECRET");
+    expect(JSON.stringify(res)).not.toContain("sk-LIVE");
+  });
+});
+
+describe("POST /api/ai/plans — authentication failures (unchanged)", () => {
+  it("returns the existing generic 401 for a missing token", async () => {
+    const res = await makeApp().request("/api/ai/plans", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "Move notes." }),
+    });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({
+      error: { code: "auth/unauthorized", message: "Invalid email or password." },
+    });
+    expect(mocks.runAiIntentPlan).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing generic 401 for a malformed bearer header", async () => {
+    const app = makeApp();
+
+    for (const headers of [{ authorization: "Bearer" }, { authorization: "Bearer one two" }]) {
+      const res = await app.request("/api/ai/plans", {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ instruction: "Move notes." }),
+      });
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    }
+
+    expect(mocks.runAiIntentPlan).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing generic 401 for an unknown token", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(null);
+
+    const res = await makeApp().request("/api/ai/plans", {
+      method: "POST",
+      headers: { ...authorizedHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ instruction: "Move notes." }),
+    });
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({ error: { code: "auth/unauthorized" } });
+    expect(mocks.runAiIntentPlan).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/ai/plans — no network", () => {
+  it("performs no network request while planning", async () => {
+    mocks.findSessionByTokenHash.mockResolvedValue(sessionFor(ACTIVE_USER));
+    mocks.runAiIntentPlan.mockResolvedValue({ plan: null, finalText: "ok" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const res = await (
+      await makeApp().request("/api/ai/plans", {
+        method: "POST",
+        headers: { ...authorizedHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({ instruction: "Move notes." }),
+      })
+    ).json();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+    expect((res as AiIntentPlanResponse).plan).toBeNull();
   });
 });
 

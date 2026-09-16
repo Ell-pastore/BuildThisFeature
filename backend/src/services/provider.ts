@@ -108,16 +108,116 @@ export interface AgentResponse {
 }
 
 /**
+ * Hard per-result budget for tool results serialized into provider
+ * conversation context (system prompt, history, and in-turn tool messages).
+ *
+ * A single `read_file` result can carry the ENTIRE contents of a file as
+ * base64; embedding arbitrarily large results verbatim lets a request exceed
+ * a provider's context window ("context_length_exceeded" → permanent
+ * `InvalidResponse` in most adapters). To keep prompts bounded, any
+ * serialized result longer than this constant is replaced by a fixed-shape,
+ * short JSON envelope that keeps the truncation metadata and a real content
+ * preview — never the unbounded payload.
+ */
+export const MAX_PROVIDER_TOOL_RESULT_CHARS = 8000;
+
+/**
+ * Length of the genuine content preview embedded in a truncated tool result.
+ * Kept far below `MAX_PROVIDER_TOOL_RESULT_CHARS` so the whole envelope stays
+ * comfortably bounded while still giving the model evidence the tool ran and
+ * what it returned.
+ */
+const TRUNCATION_PREVIEW_CHARS = 600;
+
+/**
+ * The SINGLE shared system instruction every AI provider adapter sends.
+ *
+ * One constant instead of five per-adapter duplicates, so Groq, Gemini,
+ * OpenRouter, Grok, and Ollama are all governed by the same behavior
+ * contract. It preserves the original safety rules (never invent paths,
+ * never fabricate tool results, discover genuinely unknown references,
+ * only ask when ambiguous) and adds the minimality rules that stop the
+ * agent from re-verifying information it already has:
+ *
+ *   - absolute filesystem paths the USER supplies verbatim are
+ *     authoritative input and must be used directly — no "verify the
+ *     user's own path" rediscovery with search/list/metadata tools;
+ *   - before calling a tool, use what the conversation and earlier tool
+ *     results already contain; do not repeat available information;
+ *   - use the fewest tool calls necessary; no redundant discovery or
+ *     verification;
+ *   - the execution layer (policy → handler → executor → Tauri/Rust)
+ *     validates inputs and enforces approval + allowlist gates locally, so
+ *     execute directly when the arguments are known and use any returned
+ *     error to decide the next action rather than re-validating up front;
+ *   - never bypass approval requirements or filesystem allowlists, and
+ *     never claim an operation succeeded that the tools did not confirm.
+ */
+export const AGENT_SYSTEM_INSTRUCTION =
+  "You are an assistant that helps the user manage files. You may call " +
+  "the provided tools to inspect and change the filesystem, but you never " +
+  "execute tools yourself — every call is gated by the application's " +
+  "approval, policy, and filesystem-allowlist controls.\n\n" +
+  "Understand the request before acting. Use the information already " +
+  "present in this conversation — earlier messages and the results of " +
+  "tools you have already run — before asking the user or calling a tool.\n\n" +
+  "Paths and references:\n" +
+  "- Absolute filesystem paths provided verbatim by the user are " +
+  "authoritative input. Use them directly; do not call search, list, or " +
+  "metadata tools merely to verify a path the user explicitly supplied.\n" +
+  "- When a path is not given verbatim, resolve the reference (files or " +
+  "folders named earlier, or common named locations like the home or " +
+  "Desktop) by discovering the actual path with list_directory, " +
+  "search_files, or get_file_metadata. Never invent paths, file names, or " +
+  "directory structures that were not returned by a tool, and never " +
+  "fabricate tool results.\n" +
+  "- Only ask the user for clarification when a reference is genuinely " +
+  "ambiguous or cannot be safely discovered.\n\n" +
+  "Efficiency:\n" +
+  "- Before calling any tool, inspect the current user message and " +
+  "previous tool results. Do not repeat information that is already " +
+  "available.\n" +
+  "- Use the fewest tool calls necessary to complete the assignment. Do " +
+  "not perform redundant discovery or verification.\n" +
+  "- Tools and the execution layer validate their own inputs (existence, " +
+  "scope, allowlist, overwrite safety) and return errors when a condition " +
+  "fails. When the required information is already known, execute the " +
+  "appropriate operation directly, and use any returned error to decide " +
+  "the next action rather than proactively repeating validation.\n" +
+  "- Never try to bypass approval requirements or filesystem allowlists, " +
+  "and never claim an operation succeeded that the tools did not confirm.";
+
+/**
  * Serialize one structured tool result to the plain string the adapters
  * embed in their wire messages. Locally executed failures carry a real
  * `ToolError` (whose `message` is used); persisted history results may carry
  * a restored plain error object, which is embedded as-is rather than lost.
+ *
+ * Successful results are bounded: a result whose serialized length fits
+ * `MAX_PROVIDER_TOOL_RESULT_CHARS` is passed through EXACTLY as before;
+ * anything larger fails closed into a short `{ truncated, reason, maxChars,
+ * originalChars, preview }` envelope (preview is real JSON-prefix content,
+ * never fabricated) so no provider request ever carries an unbounded tool
+ * result.
  */
 export function agentToolResultToContent(result: AgentToolResult): string {
-  if (result.ok) return JSON.stringify(result.data);
-  const error = result.error as { message?: string };
+  if (!result.ok) {
+    const error = result.error as { message?: string };
+    return JSON.stringify({
+      error: typeof error?.message === "string" && error.message.length > 0 ? error.message : result.error,
+    });
+  }
+  const serialized = JSON.stringify(result.data);
+  if (serialized.length <= MAX_PROVIDER_TOOL_RESULT_CHARS) {
+    return serialized;
+  }
   return JSON.stringify({
-    error: typeof error?.message === "string" && error.message.length > 0 ? error.message : result.error,
+    truncated: true,
+    reason:
+      "Tool result exceeded the provider input budget and was truncated before insertion into model context.",
+    maxChars: MAX_PROVIDER_TOOL_RESULT_CHARS,
+    originalChars: serialized.length,
+    preview: serialized.slice(0, TRUNCATION_PREVIEW_CHARS),
   });
 }
 
@@ -148,6 +248,10 @@ export const ProviderErrorCode = {
   Unavailable: "provider/unavailable",
   /** The provider returned something the adapter could not parse/use. */
   InvalidResponse: "provider/invalid-response",
+  /** The request input exceeded the provider's context/token window. A
+   *  different provider with a larger context may still succeed, so the
+   *  fallback orchestrator treats this as rotate-eligible. */
+  ContextLengthExceeded: "provider/context-length-exceeded",
   /** Any other provider-side failure. */
   Internal: "provider/internal",
 } as const;

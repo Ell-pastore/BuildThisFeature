@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => ({
   appendAgentTurnRoundMessage: vi.fn(),
   completeAgentTurn: vi.fn(),
   cancelAgentTurn: vi.fn(),
+  attachAgentMessageToolResult: vi.fn(),
 }));
 
 vi.mock("../database/repositories/agentConversations.js", () => ({
@@ -76,6 +77,7 @@ vi.mock("../database/repositories/agentConversations.js", () => ({
   appendAgentTurnRoundMessage: mocks.appendAgentTurnRoundMessage,
   completeAgentTurn: mocks.completeAgentTurn,
   cancelAgentTurn: mocks.cancelAgentTurn,
+  attachAgentMessageToolResult: mocks.attachAgentMessageToolResult,
   AgentConversationNotFoundError: class AgentConversationNotFoundError extends Error {
     readonly code = "agent-conversation/not-found-or-not-owned";
     constructor() {
@@ -145,6 +147,9 @@ function makeFilesystem(events?: string[]): FilesystemExecutor {
       throw new Error("not used in this test");
     },
     async moveFile() {
+      throw new Error("not used in this test");
+    },
+    async copyFile() {
       throw new Error("not used in this test");
     },
   };
@@ -223,6 +228,7 @@ function resetPersistenceMocks(): void {
   mocks.appendAgentTurnRoundMessage.mockReset().mockResolvedValue({ messageId: "msg-r2" });
   mocks.completeAgentTurn.mockReset().mockResolvedValue(undefined);
   mocks.cancelAgentTurn.mockReset().mockResolvedValue(undefined);
+  mocks.attachAgentMessageToolResult.mockReset().mockResolvedValue(undefined);
 }
 // ---------------------------------------------------------------------------
 // 1. Create a new conversation
@@ -807,6 +813,8 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
     expect(mocks.beginAgentTurn).toHaveBeenCalledTimes(1);
     expect(mocks.completeAgentTurn).not.toHaveBeenCalled();
     expect(mocks.cancelAgentTurn).not.toHaveBeenCalled();
+    // Nothing is persisted at PAUSE time — the result attaches on resume.
+    expect(mocks.attachAgentMessageToolResult).not.toHaveBeenCalled();
     // The provider saw exactly one round.
     expect(generate).toHaveBeenCalledTimes(1);
   });
@@ -840,6 +848,20 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
       record.id,
       expect.any(Date),
     );
+    // The completed result was PERSISTED onto the deferred round's message
+    // (Phase A) so a later turn reconstructs the actual result.
+    expect(mocks.attachAgentMessageToolResult).toHaveBeenCalledWith({
+      userId: USER_ID,
+      conversationId: "conv-9",
+      messageId: "msg-r1",
+      toolResult: {
+        ok: true,
+        callId: "c1",
+        toolName: "list_directory",
+        toolInput: { path: "/home" },
+        data: homeListing(),
+      },
+    });
     // The seeded result was shown to the provider as already-executed context
     // WITH the real tool name and arguments (not unknown({})).
     expect(requests[0]?.toolResults).toEqual([
@@ -932,6 +954,19 @@ describe("runPersistentTurn — host-execution pause + resume (Phase 10.39)", ()
 
     // The first execution was sealed.
     expect(hostMocks.submitHostExecution).toHaveBeenCalledWith(USER_ID, record.id, expect.any(Date));
+    // And its result was persisted onto the deferred round's message (Phase A).
+    expect(mocks.attachAgentMessageToolResult).toHaveBeenCalledWith({
+      userId: USER_ID,
+      conversationId: "conv-9",
+      messageId: "msg-r1",
+      toolResult: {
+        ok: true,
+        callId: "c1",
+        toolName: "list_directory",
+        toolInput: { path: "/home" },
+        data: homeListing(),
+      },
+    });
   });
 });
 

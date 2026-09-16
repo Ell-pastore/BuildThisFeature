@@ -123,6 +123,7 @@ import {
 import {
   AgentConversationNotFoundError,
   appendAgentTurnRoundMessage,
+  attachAgentMessageToolResult,
   beginAgentTurn,
   cancelAgentTurn,
   completeAgentTurn,
@@ -149,7 +150,8 @@ export interface HostExecutionSubmission {
   executionId: string;
   /** Whether the desktop host's execution succeeded. */
   ok: boolean;
-  /** The host's execution payload when it succeeded. Never persisted. */
+  /** The host's execution payload when it succeeded. Persisted as the
+   *  deferred round's tool result on resume. */
   result?: unknown;
   /** The categorized tool error when the host execution failed. */
   error?: { code: string; category: string };
@@ -180,8 +182,10 @@ export interface PersistentTurnInput {
    * with each submission seeded as an already-executed tool round
    * (`initialToolRounds` = the highest recorded round, bound from the
    * conversation's persisted `maxToolRounds`). All submissions must share one
-   * conversation, matching an optional supplied `conversationId`. The result
-   * payloads are transient provider context only — they are never persisted.
+   * conversation, matching an optional supplied `conversationId`. Each
+   * submission's result is persisted onto its deferred round's transcript
+   * message BEFORE the record seals, and seeded into the loop as
+   * already-executed context.
    */
   resumeHostExecutions?: readonly HostExecutionSubmission[];
 }
@@ -351,20 +355,22 @@ function toHostExecutionRequestInfo(record: HostExecutionRecord): HostExecutionR
 interface ResolvedHostResume {
   /** The ONE conversation all submitted executions belong to. */
   conversationId: string;
-  /** Seeded per-submission tool results (transient provider context). */
+  /** Seeded per-submission tool results (loop context for the resumed turn). */
   seeds: readonly AgentToolResult[];
   /** The highest recorded round across the submitted executions. */
   initialRounds: number;
 }
 
 /**
- * Phase 10.39 resume: validate + SEAL each submitted host execution exactly
- * once (a sealed record can never be replayed), then shape the seeds for the
- * resumed loop. Sealing happens here, BEFORE the loop runs; a failure in this
- * phase leaves every record unsealed and untouched.
- *
- * The submission payloads are used ONLY as transient provider context — they
- * are never persisted anywhere.
+ * Phase 10.39 resume: persist each submitted host-execution result into its
+ * deferred round's transcript row, then validate + SEAL each submission
+ * exactly once (a sealed record can never be replayed), then shape the seeds
+ * for the resumed loop. Persistence happens FIRST — before the single-use
+ * seal — so a DB failure here leaves every record unsealed and the resume
+ * safely retryable. The shapes are the same per-submission `AgentToolResult`s
+ * the resumed loop consumes, so the deferred round's persisted message gains
+ * the ACTUAL completed tool result and a later turn's history reconstructs it
+ * (instead of the bare tool-call intent).
  */
 async function resolveHostExecutionsResume(
   userId: string,
@@ -388,28 +394,10 @@ async function resolveHostExecutionsResume(
     throw AppError.badRequest("The submitted host executions span multiple conversations.");
   }
   const conversationId = resolved[0]?.record.conversationId ?? "";
-  // Phase 2 — seal EVERY record exactly once (single-use; cannot be replayed).
-  for (const { record } of resolved) {
-    await submitHostExecution(userId, record.id, now);
-  }
-  // §6.9 — BEST-EFFORT approval consumption AFTER successful submission/sealing.
-  // Only an APPROVAL-LINKED execution (an approved host write, today move_file)
-  // consumes an approval, and it does so exactly here. The seal is the true
-  // single-use guarantee: a failed consume cannot un-seal the execution, and a
-  // later submit of the same execution is rejected as `already-executed`. This
-  // is the same single-request semantics caveat the Phase 10.30 approval
-  // execution path documents (consume is bookkeeping for the approval card).
-  for (const { record } of resolved) {
-    if (record.approvalId !== null) {
-      try {
-        await consumeToolApproval(userId, record.approvalId, now);
-      } catch {
-        // The approved operation already ran exactly once; never mask the
-        // executed turn with a bookkeeping failure.
-      }
-    }
-  }
-  const seeds: AgentToolResult[] = resolved.map(({ record, submission }) => {
+  // Phase 1.5 — shape each submission into its tool result and persist it onto
+  // the deferred round's eager message (idempotent per callId) BEFORE sealing,
+  // so a persistence failure leaves every record unsealed and retryable.
+  const toolResults: AgentToolResult[] = resolved.map(({ record, submission }) => {
     if (!submission.ok) {
       return {
         ok: false,
@@ -431,11 +419,42 @@ async function resolveHostExecutionsResume(
       data: submission.result,
     };
   });
+  for (const [index, { record }] of resolved.entries()) {
+    const toolResult = toolResults[index];
+    if (toolResult === undefined) continue;
+    await attachAgentMessageToolResult({
+      userId,
+      conversationId,
+      messageId: record.messageId,
+      toolResult,
+    });
+  }
+  // Phase 2 — seal EVERY record exactly once (single-use; cannot be replayed).
+  for (const { record } of resolved) {
+    await submitHostExecution(userId, record.id, now);
+  }
+  // §6.9 — BEST-EFFORT approval consumption AFTER successful submission/sealing.
+  // Only an APPROVAL-LINKED execution (an approved host write, today move_file)
+  // consumes an approval, and it does so exactly here. The seal is the true
+  // single-use guarantee: a failed consume cannot un-seal the execution, and a
+  // later submit of the same execution is rejected as `already-executed`. This
+  // is the same single-request semantics caveat the Phase 10.30 approval
+  // execution path documents (consume is bookkeeping for the approval card).
+  for (const { record } of resolved) {
+    if (record.approvalId !== null) {
+      try {
+        await consumeToolApproval(userId, record.approvalId, now);
+      } catch {
+        // The approved operation already ran exactly once; never mask the
+        // executed turn with a bookkeeping failure.
+      }
+    }
+  }
   const initialRounds = resolved.reduce(
     (highest, s) => Math.max(highest, s.record.round),
     0,
   );
-  return { conversationId, seeds, initialRounds };
+  return { conversationId, seeds: toolResults, initialRounds };
 }
 
 // ---------------------------------------------------------------------------

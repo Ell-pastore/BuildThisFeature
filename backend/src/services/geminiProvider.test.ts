@@ -23,6 +23,7 @@ import {
   type GeminiFetchInit,
 } from "./geminiProvider.js";
 import {
+  AGENT_SYSTEM_INSTRUCTION,
   isProviderError,
   ProviderError,
   ProviderErrorCode,
@@ -209,7 +210,7 @@ describe("createGeminiProvider — request construction", () => {
     expect(parts[0]?.text).toBe("Hello there");
     const systemInstruction = body.systemInstruction as Record<string, unknown>;
     const systemParts = systemInstruction.parts as Array<Record<string, unknown>>;
-    expect(systemParts[0]?.text).toContain("assistant");
+    expect(systemParts[0]?.text).toBe(AGENT_SYSTEM_INSTRUCTION);
   });
 
   it("maps tool metadata into Gemini functionDeclarations", async () => {
